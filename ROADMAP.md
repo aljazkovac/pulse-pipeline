@@ -66,12 +66,12 @@ Establish the monorepo layout, local development tooling, quality gates, and cus
 - [x] Initialize `.gitignore` and project `README.md`
 - [x] Create monorepo directory structure (`backend/`, `web/`, `mcp/`, `infra/`, `docs/`)
 - [x] Set up `Taskfile.yml` / `Makefile` and `docker-compose.yml` (local PostgreSQL 17, Flipt, Prometheus, Grafana)
-- [ ] Design and configure Agentic SDLC workflows & gatekeepers:
-  - [ ] **Architect Agent:** Reviews schema changes, interfaces, and ADRs
-  - [ ] **Designer Agent:** Guides responsive UI/UX and dashboard layout specs
-  - [ ] **Coder Agent:** Implements features following Go and TypeScript conventions
-  - [ ] **QA / Spec Agent:** Authors test specifications and Playwright E2E scenarios
-  - [ ] **PR Reviewer / Gatekeeper Agent:** Enforces code quality, security, and test coverage
+- [x] Design and configure Agentic SDLC workflows & gatekeepers:
+  - [x] **Architect Agent:** Reviews schema changes, interfaces, and ADRs
+  - [x] **Designer Agent:** Guides responsive UI/UX and dashboard layout specs
+  - [x] **Coder Agent:** Implements features following Go and TypeScript conventions
+  - [x] **QA / Spec Agent:** Authors test specifications and Playwright E2E scenarios
+  - [x] **PR Reviewer / Gatekeeper Agent:** Enforces code quality, security, and test coverage
 - [ ] Configure GitHub Actions CI pipeline (linting, type-checking, unit/integration test gates)
 
 ---
