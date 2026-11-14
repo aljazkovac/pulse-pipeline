@@ -1,0 +1,71 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+build/
+out/
+
+# Go
+*.test
+*.out
+coverage.txt
+vendor/
+go.work
+go.work.sum
+
+# Node / Frontend / Docs
+node_modules/
+.pnpm-store/
+.vite/
+.astro/
+playwright-report/
+test-results/
+blob-report/
+playwright/.cache/
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*credentials*.json
+*secret*.json
+
+# Terraform & Terragrunt
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+.terragrunt-cache/
+
+# IDEs & OS
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbsumbs.db
+
+# Local data / tmp
+tmp/
+.tmp/
+*.db
+*.sqlite
+*.sqlite3
