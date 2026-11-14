@@ -4,35 +4,42 @@ description: >-
   Acts as the PR Reviewer & Quality Gatekeeper for Pulse Pipeline. Use this skill
   before opening or merging a Pull Request to audit code diffs for security,
   multi-tenant user_id isolation, Go/TypeScript best practices, and test coverage,
-  including running the parallel multi-agent gatekeeper workflow.
+  including running the gatekeeper script and the per-dimension reviews.
 ---
 
 # Pulse Pipeline — PR Reviewer & Gatekeeper Skill
 
-Use this skill to perform a rigorous pre-PR or pre-merge audit of staged/branch changes.
+Use this skill to perform a rigorous pre-PR or pre-merge audit of all changes on the
+current branch — committed, staged, unstaged, and untracked — against `main`.
 
-## 1. Gatekeeping Dimensions
+## 1. Run the Gatekeeper Script
 
-Every PR is evaluated across three non-negotiable dimensions:
+From the repository root:
 
-1. **Security & Multi-Tenant Isolation (`Security Reviewer`):**
-   - Are all SQL queries and API/MCP handlers strictly scoped by `user_id`?
-   - Are OAuth tokens, secrets, `.env` files, or credentials excluded from the diff and logs?
-   - Are inputs validated and SQL parameters strictly bound?
-2. **Architecture, Go & TypeScript Idioms (`Code Quality Reviewer`):**
-   - Does the diff respect package boundaries (`domain` vs `provider` vs `store`)?
-   - Are Go errors wrapped with context and `context.Context` propagated properly?
-   - Are TypeScript types strict (`no-explicit-any`) and UI components responsive for both desktop and mobile PWA viewports?
-3. **Testing & Spec Verification (`QA Gatekeeper`):**
-   - Are unit/integration/E2E tests included for new behavior and edge cases?
-   - Do `make test` and `make lint` pass cleanly?
+```bash
+python3 .agents/skills/pr-reviewer/scripts/pr_gatekeeper.py
+```
 
-## 2. Running the Parallel Multi-Agent Gatekeeper Workflow
+The script ([pr_gatekeeper.py](./scripts/pr_gatekeeper.py)) uses only the Python standard
+library and works in any agent runtime or CI. It:
 
-For non-trivial PRs, run the automated gatekeeper workflow script using the `run_workflow` tool:
+- fetches `origin/main` and reviews everything since the merge-base, including uncommitted work;
+- blocks on forbidden files (`.env`, keys, credential JSON) among the changes;
+- runs `make test` and `make lint` (and `make e2e` once `web/` exists);
+- prints the changed files, the exact `git diff` command to review, and the review dimensions.
 
-- **Script Path:** [pr_gatekeeper.py](./scripts/pr_gatekeeper.py)
-- **How to invoke:**
-  Call `run_workflow` with `ScriptPath` set to the absolute path of `.agents/skills/pr-reviewer/scripts/pr_gatekeeper.py` and `Description="Run parallel PR Gatekeeper review"`.
-- **What it does:**
-  Spawns three specialized review agents in parallel (`Security & Multi-Tenancy`, `Architecture & Code Quality`, `QA & Test Coverage`) to inspect the current branch diff against `main`, and aggregates their findings into a `PASS` or `BLOCK` verdict.
+Exit code `1` (BLOCK) or `2` (could not run) stops the review: fix the cause and re-run.
+
+## 2. Review Each Dimension
+
+The dimensions are defined only in [references/dimensions.md](./references/dimensions.md).
+Review the diff printed by the script against each dimension separately. If your runtime
+supports sub-agents, run one reviewer per dimension in parallel; otherwise review them in sequence.
+
+Each dimension returns `PASS` or `BLOCK` with specific file/line issues.
+
+## 3. Verdict
+
+The overall verdict is `PASS` only if the script exits `0` **and** every dimension returns
+`PASS`. A reviewer that fails, times out, or returns no verdict counts as `BLOCK` — re-run
+that dimension rather than skipping it. Report all dimensions' findings, not only the first `BLOCK`.

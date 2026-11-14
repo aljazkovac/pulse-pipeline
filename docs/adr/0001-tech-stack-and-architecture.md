@@ -17,7 +17,7 @@ Although initially single-user, the system must be designed so that it can scale
 
 2. **Database — Standard PostgreSQL 17 (`pgx` + `sqlc` + `golang-migrate`):**
    - We choose standard **PostgreSQL 17** over specialized time-series forks or NoSQL stores.
-   - With composite indexing on `(user_id, metric_type, recorded_at DESC)` and idempotent `ON CONFLICT DO UPDATE` upserts, standard PostgreSQL easily handles millions of intraday rows while remaining 100% portable across local Docker and managed cloud databases (DigitalOcean Managed PostgreSQL).
+   - With composite unique keys such as `(user_id, provider, metric_type, recorded_at)` that serve both dashboard reads and idempotent `ON CONFLICT DO UPDATE` upserts, standard PostgreSQL easily handles millions of intraday rows while remaining 100% portable across local Docker and managed cloud databases (DigitalOcean Managed PostgreSQL).
 
 3. **Desktop + Phone App Strategy — Responsive React/TypeScript Web App + PWA:**
    - We build a single responsive web application (`web/`) using **React**, **TypeScript**, **Vite**, and **Tailwind CSS**, configured with a **Progressive Web App (PWA)** manifest and service worker.

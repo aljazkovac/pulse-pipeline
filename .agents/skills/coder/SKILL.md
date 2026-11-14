@@ -40,3 +40,4 @@ Use this skill during feature implementation across `backend/`, `mcp/`, and `web
 Before marking an implementation task complete:
 1. Run `make build` to verify all binaries/bundles compile cleanly.
 2. Run `make test` and `make lint` to verify zero test regressions or linter warnings.
+3. If `web/` changed, run `make e2e` to verify the Playwright desktop + mobile specs.
