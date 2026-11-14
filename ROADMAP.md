@@ -64,8 +64,8 @@ Establish the monorepo layout, local development tooling, quality gates, and cus
 
 - [x] Revise initial requirements into a structured architecture & phased roadmap (`ROADMAP.md`)
 - [x] Initialize `.gitignore` and project `README.md`
-- [ ] Create monorepo directory structure (`backend/`, `web/`, `mcp/`, `infra/`, `docs/`)
-- [ ] Set up `Taskfile.yml` / `Makefile` and `docker-compose.yml` (local PostgreSQL 17, Flipt, Prometheus, Grafana)
+- [x] Create monorepo directory structure (`backend/`, `web/`, `mcp/`, `infra/`, `docs/`)
+- [x] Set up `Taskfile.yml` / `Makefile` and `docker-compose.yml` (local PostgreSQL 17, Flipt, Prometheus, Grafana)
 - [ ] Design and configure Agentic SDLC workflows & gatekeepers:
   - [ ] **Architect Agent:** Reviews schema changes, interfaces, and ADRs
   - [ ] **Designer Agent:** Guides responsive UI/UX and dashboard layout specs
