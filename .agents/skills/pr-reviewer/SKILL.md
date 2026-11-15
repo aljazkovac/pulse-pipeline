@@ -24,7 +24,7 @@ The script ([pr_gatekeeper.py](./scripts/pr_gatekeeper.py)) uses only the Python
 library and works in any agent runtime or CI. It:
 
 - fetches `origin/main` and reviews everything since the merge-base, including uncommitted work;
-- blocks on forbidden files (`.env`, keys, credential JSON) among the changes;
+- blocks on forbidden files (`.env`, keys, credential JSON) added in any commit on the branch — even if a later commit removed them — or in the index/working tree;
 - runs `make test` and `make lint` (and `make e2e` once `web/` exists);
 - prints the changed files, the exact `git diff` command to review, and the review dimensions.
 

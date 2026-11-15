@@ -15,6 +15,8 @@ class ChangedFilesTests(unittest.TestCase):
         git(self.repo, "init")
         git(self.repo, "config", "user.name", "Gatekeeper Test")
         git(self.repo, "config", "user.email", "test@example.invalid")
+        git(self.repo, "config", "commit.gpgsign", "false")
+        git(self.repo, "config", "core.hooksPath", "/dev/null")
         git(self.repo, "commit", "--allow-empty", "-m", "Base")
         self.base = git(self.repo, "rev-parse", "HEAD")
 
@@ -30,6 +32,30 @@ class ChangedFilesTests(unittest.TestCase):
                 files = changed_files(self.repo, self.base)
                 self.assertIn("credentials.json", files)
                 self.assertFalse(check_forbidden_files(files).passed)
+
+    def test_secret_removed_in_later_commit_still_blocks(self):
+        (self.repo / "credentials.json").write_text("{}", encoding="utf-8")
+        git(self.repo, "add", "credentials.json")
+        git(self.repo, "commit", "-m", "Add secret")
+        git(self.repo, "rm", "credentials.json")
+        git(self.repo, "commit", "-m", "Remove secret")
+        files = changed_files(self.repo, self.base)
+        self.assertIn("credentials.json", files)
+        self.assertFalse(check_forbidden_files(files).passed)
+
+    def test_deleting_secret_from_base_does_not_block(self):
+        (self.repo / ".env").write_text("TOKEN=placeholder", encoding="utf-8")
+        git(self.repo, "add", ".env")
+        git(self.repo, "commit", "-m", "Secret on base")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "rm", ".env")
+        files = changed_files(self.repo, self.base)
+        self.assertNotIn(".env", files)
+        self.assertTrue(check_forbidden_files(files).passed)
+        git(self.repo, "commit", "-m", "Remove secret")
+        files = changed_files(self.repo, self.base)
+        self.assertNotIn(".env", files)
+        self.assertTrue(check_forbidden_files(files).passed)
 
     def test_all_change_states_are_collected_once(self):
         for name in ("committed.txt", "staged.txt", "unstaged.txt"):

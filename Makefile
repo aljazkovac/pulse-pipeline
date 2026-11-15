@@ -43,9 +43,10 @@ ifneq ($(WEB_PACKAGE),)
 	cd web && $(WEB_PM) run build
 endif
 
-test: ## Run unit tests across backend, MCP (and web/ Vitest when present)
+test: ## Run unit tests across backend, MCP, gatekeeper script (and web/ Vitest when present)
 	cd backend && go test -v -race ./...
 	cd mcp && go test -v -race ./...
+	python3 -m unittest discover -s .agents/skills/pr-reviewer/scripts
 ifneq ($(WEB_PACKAGE),)
 	cd web && $(WEB_PM) run test
 endif

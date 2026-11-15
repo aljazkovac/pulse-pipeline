@@ -9,8 +9,9 @@ runtime or in CI:
 
 Steps:
   1. Fetch the base branch (best effort) and compute the merge-base.
-  2. Collect every change since the merge-base: committed, staged, unstaged,
-     and untracked files.
+  2. Collect every file added or modified since the merge-base: in any commit
+     on the branch (even if a later commit removed it), staged, unstaged, or
+     untracked. Deletions are ignored so removing a secret never blocks.
   3. Block on forbidden files (secrets, .env, keys) among those changes.
   4. Run `make test` and `make lint` (plus `make e2e` once web/ exists).
   5. Print the changed files, the diff command, and the review dimensions from
@@ -77,12 +78,18 @@ def resolve_base(repo: Path, remote: str, base: str, fetch: bool) -> tuple[str, 
 
 
 def changed_files(repo: Path, merge_base: str) -> list[str]:
-    """Files changed since merge_base, including staged, unstaged and untracked."""
-    committed = git(repo, "diff", "--name-only", merge_base, "HEAD").splitlines()
-    staged = git(repo, "diff", "--cached", "--name-only").splitlines()
-    unstaged = git(repo, "diff", "--name-only").splitlines()
+    """Files added or modified since merge_base, in history, index, or working tree.
+
+    Each commit is inspected separately so a file added in one commit and
+    removed in a later one is still reported: it remains in the pushed history.
+    """
+    history = git(
+        repo, "log", "--name-only", "--format=", "--diff-filter=d", f"{merge_base}..HEAD"
+    ).splitlines()
+    staged = git(repo, "diff", "--cached", "--name-only", "--diff-filter=d").splitlines()
+    unstaged = git(repo, "diff", "--name-only", "--diff-filter=d").splitlines()
     untracked = git(repo, "ls-files", "--others", "--exclude-standard").splitlines()
-    return sorted(set(filter(None, committed + staged + unstaged + untracked)))
+    return sorted(set(filter(None, history + staged + unstaged + untracked)))
 
 
 def check_forbidden_files(files: list[str]) -> CheckResult:
