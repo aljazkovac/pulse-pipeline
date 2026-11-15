@@ -78,9 +78,11 @@ def resolve_base(repo: Path, remote: str, base: str, fetch: bool) -> tuple[str, 
 
 def changed_files(repo: Path, merge_base: str) -> list[str]:
     """Files changed since merge_base, including staged, unstaged and untracked."""
-    tracked = git(repo, "diff", "--name-only", merge_base).splitlines()
+    committed = git(repo, "diff", "--name-only", merge_base, "HEAD").splitlines()
+    staged = git(repo, "diff", "--cached", "--name-only").splitlines()
+    unstaged = git(repo, "diff", "--name-only").splitlines()
     untracked = git(repo, "ls-files", "--others", "--exclude-standard").splitlines()
-    return sorted(set(filter(None, tracked + untracked)))
+    return sorted(set(filter(None, committed + staged + unstaged + untracked)))
 
 
 def check_forbidden_files(files: list[str]) -> CheckResult:
@@ -144,7 +146,10 @@ def main() -> int:
     for warning in warnings:
         print(f"WARNING: {warning}")
     print(f"Base: {args.remote}/{args.base} (merge-base {merge_base[:12]})")
-    print(f"Review diff: git diff {merge_base}  (plus untracked files below)\n")
+    print("Review diffs (plus untracked files below):")
+    print(f"  Committed: git diff {merge_base} HEAD")
+    print("  Staged: git diff --cached")
+    print("  Unstaged: git diff\n")
 
     print("## Deterministic checks\n")
     for result in results:
