@@ -6,6 +6,18 @@ Go service containing:
 - `internal/`: Domain models, provider adapters, `sqlc` database repositories, and OpenTelemetry / OpenFeature integration.
 - `migrations/`: PostgreSQL schema migrations (`golang-migrate`).
 
+## Health Providers
+
+`internal/provider/mock` is a deterministic synthetic `HealthProvider` for local development
+and tests: the same seed, user and local day always yield the same data, whatever range is
+requested. Daily summaries equal the aggregates of the intraday series for that local day, data
+stops at the injected `Now`, and some days have realistic gaps (watch off all day, a charging
+gap, no SpO2/HRV). Use it wherever code needs provider data without Google credentials:
+
+```go
+p := mock.New(mock.Options{Seed: 1, Now: func() time.Time { return fixedNow }})
+```
+
 ## Database Workflow
 
 The schema and its rationale are in [ADR-0002](../docs/adr/0002-health-data-schema.md).

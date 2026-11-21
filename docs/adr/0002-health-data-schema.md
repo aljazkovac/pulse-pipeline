@@ -121,7 +121,8 @@ This ADR records decisions; it is delivered across several PRs.
 | §1 Tables, §2 Indexes, §4 System-context query, §6 Migrations | Implemented (migration `000001`, `store`, Testcontainers tests). |
 | §5 `domain` types + `HealthProvider` interface, `store` package | Implemented. |
 | §3 Token storage | Columns only. AES-256-GCM cipher, `TOKEN_ENCRYPTION_KEY`, and the token read/write queries land with `GoogleHealthProvider`. |
-| §5 `provider/mock`, `provider/googlehealth`, `sync` | Pending (next Phase 1 PRs). Migrations will be applied by the worker at startup then. |
+| §5 `provider/mock` | Implemented: deterministic synthetic data keyed by (seed, user, local day); daily summaries aggregate the intraday series; a Testcontainers test ingests it twice and round-trips it. |
+| §5 `provider/googlehealth`, `sync` | Pending (next Phase 1 PRs). Migrations will be applied by the worker at startup then. |
 
 ## Consequences
 
