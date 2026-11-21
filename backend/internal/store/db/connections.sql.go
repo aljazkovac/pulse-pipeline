@@ -183,6 +183,26 @@ func (q *Queries) MarkConnectionSynced(ctx context.Context, arg MarkConnectionSy
 	return result.RowsAffected(), nil
 }
 
+const rescheduleConnection = `-- name: RescheduleConnection :execrows
+UPDATE provider_connections
+SET next_sync_at = $1, updated_at = now()
+WHERE id = $2 AND user_id = $3
+`
+
+type RescheduleConnectionParams struct {
+	NextSyncAt time.Time
+	ID         uuid.UUID
+	UserID     uuid.UUID
+}
+
+func (q *Queries) RescheduleConnection(ctx context.Context, arg RescheduleConnectionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, rescheduleConnection, arg.NextSyncAt, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setConnectionStatus = `-- name: SetConnectionStatus :execrows
 UPDATE provider_connections
 SET status = $1, updated_at = now()

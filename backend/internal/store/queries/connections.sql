@@ -24,6 +24,11 @@ SET last_synced_at = @last_synced_at,
     updated_at     = now()
 WHERE id = @id AND user_id = @user_id;
 
+-- name: RescheduleConnection :execrows
+UPDATE provider_connections
+SET next_sync_at = @next_sync_at, updated_at = now()
+WHERE id = @id AND user_id = @user_id;
+
 -- name: SetConnectionStatus :execrows
 UPDATE provider_connections
 SET status = @status, updated_at = now()

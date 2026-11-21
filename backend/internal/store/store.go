@@ -24,6 +24,10 @@ import (
 // ErrNotFound is returned when a requested row does not exist for the user.
 var ErrNotFound = errors.New("store: not found")
 
+// ErrSyncInProgress is returned by StartSyncRun when the user already has a
+// running sync for the provider (ADR-0003).
+var ErrSyncInProgress = errors.New("store: sync already in progress")
+
 // intradayBatchSize caps the rows sent in one upsert statement.
 const intradayBatchSize = 5000
 
@@ -131,6 +135,20 @@ func (s *Store) MarkConnectionSynced(ctx context.Context, userID, connectionID u
 	}
 	if n == 0 {
 		return fmt.Errorf("marking connection %s synced: %w", connectionID, ErrNotFound)
+	}
+	return nil
+}
+
+// RescheduleConnection moves the connection's next scheduled sync without
+// recording a sync (used after a failed run). It returns ErrNotFound if the
+// connection does not belong to the user.
+func (s *Store) RescheduleConnection(ctx context.Context, userID, connectionID uuid.UUID, nextSyncAt time.Time) error {
+	n, err := s.q.RescheduleConnection(ctx, db.RescheduleConnectionParams{NextSyncAt: nextSyncAt.UTC(), ID: connectionID, UserID: userID})
+	if err != nil {
+		return fmt.Errorf("rescheduling connection %s: %w", connectionID, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("rescheduling connection %s: %w", connectionID, ErrNotFound)
 	}
 	return nil
 }
@@ -425,7 +443,8 @@ func (s *Store) ListSleepSessions(ctx context.Context, userID uuid.UUID, provide
 // Sync runs
 // ---------------------------------------------------------------------------
 
-// StartSyncRun records the start of an ingestion job.
+// StartSyncRun records the start of an ingestion job. It returns
+// ErrSyncInProgress if the user already has a running sync for provider.
 func (s *Store) StartSyncRun(ctx context.Context, userID uuid.UUID, provider domain.Provider, trigger domain.SyncTrigger, r domain.DateRange) (domain.SyncRun, error) {
 	if err := r.Validate(); err != nil {
 		return domain.SyncRun{}, fmt.Errorf("starting sync run: %w", err)
@@ -434,10 +453,44 @@ func (s *Store) StartSyncRun(ctx context.Context, userID uuid.UUID, provider dom
 		UserID: userID, Provider: string(provider), Trigger: string(trigger),
 		RangeStart: pgDate(r.Start), RangeEnd: pgDate(r.End),
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = ErrSyncInProgress
+	}
 	if err != nil {
 		return domain.SyncRun{}, fmt.Errorf("starting %s sync run for user %s: %w", provider, userID, err)
 	}
 	return syncRun(row), nil
+}
+
+// AbandonStaleSyncRuns marks the user's runs for provider whose last
+// heartbeat (or start) is older than olderThan, by the database clock, as
+// failed, so a crashed worker cannot block syncing forever. It returns how
+// many it abandoned.
+func (s *Store) AbandonStaleSyncRuns(ctx context.Context, userID uuid.UUID, provider domain.Provider, olderThan time.Duration) (int64, error) {
+	if olderThan <= 0 {
+		return 0, errors.New("abandoning stale sync runs: olderThan must be positive")
+	}
+	n, err := s.q.AbandonStaleSyncRuns(ctx, db.AbandonStaleSyncRunsParams{
+		UserID: userID, Provider: string(provider), OlderThanSeconds: olderThan.Seconds(),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("abandoning stale %s sync runs for user %s: %w", provider, userID, err)
+	}
+	return n, nil
+}
+
+// TouchSyncRun records that a running job is still making progress. It
+// returns ErrNotFound if the run does not belong to the user or is no longer
+// running (for example, another worker abandoned it as stale).
+func (s *Store) TouchSyncRun(ctx context.Context, userID, runID uuid.UUID) error {
+	n, err := s.q.TouchSyncRun(ctx, db.TouchSyncRunParams{ID: runID, UserID: userID})
+	if err != nil {
+		return fmt.Errorf("touching sync run %s: %w", runID, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("touching sync run %s: %w", runID, ErrNotFound)
+	}
+	return nil
 }
 
 // FinishSyncRun records a running job's outcome. It returns ErrNotFound if the

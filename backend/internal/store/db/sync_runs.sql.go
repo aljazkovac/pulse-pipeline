@@ -12,11 +12,39 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const abandonStaleSyncRuns = `-- name: AbandonStaleSyncRuns :execrows
+UPDATE sync_runs
+SET status        = 'failed',
+    error_message = 'abandoned: worker stopped before the run finished',
+    finished_at   = now()
+WHERE user_id = $1 AND provider = $2
+  AND status = 'running'
+  AND coalesce(heartbeat_at, started_at) < now() - make_interval(secs => $3::double precision)
+`
+
+type AbandonStaleSyncRunsParams struct {
+	UserID           uuid.UUID
+	Provider         string
+	OlderThanSeconds float64
+}
+
+// Fails runs a crashed worker left 'running', so they stop blocking new syncs.
+// Age is the time since the run's last heartbeat (or its start), measured on
+// the database clock, the same clock that set both.
+func (q *Queries) AbandonStaleSyncRuns(ctx context.Context, arg AbandonStaleSyncRunsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, abandonStaleSyncRuns, arg.UserID, arg.Provider, arg.OlderThanSeconds)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const createSyncRun = `-- name: CreateSyncRun :one
 INSERT INTO sync_runs (user_id, provider, trigger, range_start, range_end)
 VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (user_id, provider) WHERE status = 'running' DO NOTHING
 RETURNING id, user_id, provider, trigger, status, range_start, range_end,
-          records_ingested, error_message, started_at, finished_at
+          records_ingested, error_message, started_at, finished_at, heartbeat_at
 `
 
 type CreateSyncRunParams struct {
@@ -27,6 +55,8 @@ type CreateSyncRunParams struct {
 	RangeEnd   pgtype.Date
 }
 
+// Returns no row when the user already has a running sync for the provider
+// (partial unique index sync_runs_one_running_idx, ADR-0003).
 func (q *Queries) CreateSyncRun(ctx context.Context, arg CreateSyncRunParams) (SyncRun, error) {
 	row := q.db.QueryRow(ctx, createSyncRun,
 		arg.UserID,
@@ -48,6 +78,7 @@ func (q *Queries) CreateSyncRun(ctx context.Context, arg CreateSyncRunParams) (S
 		&i.ErrorMessage,
 		&i.StartedAt,
 		&i.FinishedAt,
+		&i.HeartbeatAt,
 	)
 	return i, err
 }
@@ -60,7 +91,7 @@ SET status           = $1,
     finished_at      = now()
 WHERE id = $4 AND user_id = $5 AND status = 'running'
 RETURNING id, user_id, provider, trigger, status, range_start, range_end,
-          records_ingested, error_message, started_at, finished_at
+          records_ingested, error_message, started_at, finished_at, heartbeat_at
 `
 
 type FinishSyncRunParams struct {
@@ -92,13 +123,14 @@ func (q *Queries) FinishSyncRun(ctx context.Context, arg FinishSyncRunParams) (S
 		&i.ErrorMessage,
 		&i.StartedAt,
 		&i.FinishedAt,
+		&i.HeartbeatAt,
 	)
 	return i, err
 }
 
 const listSyncRuns = `-- name: ListSyncRuns :many
 SELECT id, user_id, provider, trigger, status, range_start, range_end,
-       records_ingested, error_message, started_at, finished_at
+       records_ingested, error_message, started_at, finished_at, heartbeat_at
 FROM sync_runs
 WHERE user_id = $1 AND provider = $2
 ORDER BY started_at DESC
@@ -132,6 +164,7 @@ func (q *Queries) ListSyncRuns(ctx context.Context, arg ListSyncRunsParams) ([]S
 			&i.ErrorMessage,
 			&i.StartedAt,
 			&i.FinishedAt,
+			&i.HeartbeatAt,
 		); err != nil {
 			return nil, err
 		}
@@ -141,4 +174,24 @@ func (q *Queries) ListSyncRuns(ctx context.Context, arg ListSyncRunsParams) ([]S
 		return nil, err
 	}
 	return items, nil
+}
+
+const touchSyncRun = `-- name: TouchSyncRun :execrows
+UPDATE sync_runs
+SET heartbeat_at = now()
+WHERE id = $1 AND user_id = $2 AND status = 'running'
+`
+
+type TouchSyncRunParams struct {
+	ID     uuid.UUID
+	UserID uuid.UUID
+}
+
+// Returns 0 rows when the run is no longer running (finished or abandoned).
+func (q *Queries) TouchSyncRun(ctx context.Context, arg TouchSyncRunParams) (int64, error) {
+	result, err := q.db.Exec(ctx, touchSyncRun, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

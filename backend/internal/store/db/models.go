@@ -84,6 +84,7 @@ type SyncRun struct {
 	ErrorMessage    pgtype.Text
 	StartedAt       time.Time
 	FinishedAt      *time.Time
+	HeartbeatAt     *time.Time
 }
 
 type User struct {

@@ -90,7 +90,7 @@ Build the multi-user, multi-provider data foundation and nightly ingestion servi
 - [x] Define the `HealthProvider` adapter interface (`FetchDailySummaries`, `FetchIntradayMetrics`, `FetchSleepSessions`, `RefreshAuth`)
 - [x] Implement a deterministic `MockHealthProvider` generating realistic synthetic health data for local dev and automated testing
 - [ ] Implement the `GoogleHealthProvider` (Google OAuth 2.0 flow + Google Health API client for Fitbit Air data, AES-256-GCM token encryption per ADR-0002 §3)
-- [ ] Build the nightly sync worker (idempotent upserts, retry/backoff, backfill support, manual trigger endpoint)
+- [x] Build the nightly sync worker (idempotent upserts, retry/backoff, backfill support, manual/backfill CLI — see ADR-0003; the HTTP manual trigger moves to Phase 2 with API auth)
 - [ ] Write Go unit tests and Testcontainers-based PostgreSQL integration tests
 
 ---
@@ -105,7 +105,7 @@ Create the responsive frontend accessible on desktop browsers and installable as
   - [ ] **Overview Dashboard:** Daily readiness/pulse summary, step goal ring, sleep duration, resting HR
   - [ ] **Heart Rate & HRV View:** Intraday heart rate timeline and 7/30/90-day resting HR & HRV trends
   - [ ] **Sleep Analytics View:** Sleep stages breakdown (Deep, REM, Light, Awake) and consistency trends
-  - [ ] **Sync & Connections View:** Google Health OAuth connect button, last sync status, manual sync trigger
+  - [ ] **Sync & Connections View:** Google Health OAuth connect button, last sync status, manual sync trigger (authenticated `POST` endpoint calling `Syncer.SyncConnection`, ADR-0003 §5)
 - [ ] Configure Progressive Web App (PWA) manifest, icons, and service worker for mobile home-screen installation
 - [ ] Write frontend unit/component tests (Vitest + Testing Library)
 - [ ] Create E2E specifications and automate desktop + mobile viewport verification using **Playwright agents**
