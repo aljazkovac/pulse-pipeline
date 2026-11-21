@@ -1,6 +1,6 @@
 # ADR 0002: Canonical Health Data Schema, Store Layer & `HealthProvider` Contract
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-11-21
 
 ## Context
