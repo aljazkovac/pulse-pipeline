@@ -34,7 +34,7 @@ type baseline struct {
 // dayPlan is everything decided once per local day. Times are absolute.
 type dayPlan struct {
 	date       domain.Date
-	start, end time.Time // local midnight to next local midnight (23–25h around DST)
+	start, end time.Time // first instants of this date and the next
 	offWrist   bool
 	weekend    bool
 	restingHR  float64
@@ -114,6 +114,30 @@ func (g *generator) localTime(d domain.Date, minutes float64) time.Time {
 	return time.Date(d.Year, d.Month, d.Day, 0, int(minutes), 0, 0, g.loc)
 }
 
+func (g *generator) localDayStart(d domain.Date) time.Time {
+	resolved := g.localTime(d, 0)
+	start, end := resolved.ZoneBounds()
+	// time.Date can resolve a skipped midnight into the preceding day.
+	if domain.DateOf(resolved).Before(d) {
+		return end.UTC()
+	}
+
+	wallMidnight := d.Time()
+	_, offset := resolved.Zone()
+	midnight := wallMidnight.Add(-time.Duration(offset) * time.Second)
+	if start.IsZero() || midnight.After(start) {
+		return midnight
+	}
+	// At the transition, check whether midnight also occurred under the
+	// previous offset. If neither offset reaches midnight, the day starts here.
+	_, previousOffset := start.Add(-time.Nanosecond).Zone()
+	previousMidnight := wallMidnight.Add(-time.Duration(previousOffset) * time.Second)
+	if previousMidnight.Before(start) {
+		return previousMidnight
+	}
+	return start.UTC()
+}
+
 func (g *generator) offWrist(d domain.Date) bool {
 	return g.rng(d, "wear").Float64() < offWristChance
 }
@@ -127,7 +151,7 @@ func (g *generator) plan(d domain.Date) *dayPlan {
 	if pl, ok := g.plans[d]; ok {
 		return pl
 	}
-	pl := &dayPlan{date: d, start: g.localTime(d, 0), end: g.localTime(d.AddDays(1), 0), offWrist: g.offWrist(d)}
+	pl := &dayPlan{date: d, start: g.localDayStart(d), end: g.localDayStart(d.AddDays(1)), offWrist: g.offWrist(d)}
 	g.plans[d] = pl
 	if pl.offWrist {
 		return pl

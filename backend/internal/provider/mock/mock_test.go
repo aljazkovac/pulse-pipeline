@@ -453,6 +453,42 @@ func TestDSTDaysHaveLocalLength(t *testing.T) {
 	}
 }
 
+func TestDSTAtSkippedMidnight(t *testing.T) {
+	p := newProvider(1)
+	c := conn(t, userA, "America/Santiago")
+	d := date(t, "2026-09-06")
+	// Santiago jumps from 23:59 on September 5 to 01:00 on September 6.
+	boundary := time.Date(2026, 9, 6, 4, 0, 0, 0, time.UTC)
+	before := domain.TimeRange{Start: boundary.Add(-24 * time.Hour), End: boundary}
+	after := domain.TimeRange{Start: boundary, End: boundary.Add(23 * time.Hour)}
+	whole := domain.TimeRange{Start: before.Start, End: after.End}
+
+	full := intraday(t, p, c, domain.MetricHeartRate, whole)
+	previousDay := intraday(t, p, c, domain.MetricHeartRate, before)
+	transitionDay := intraday(t, p, c, domain.MetricHeartRate, after)
+	if !reflect.DeepEqual(full, append(previousDay, transitionDay...)) {
+		t.Errorf("two-day fetch returned %d samples; split fetch returned %d + %d", len(full), len(previousDay), len(transitionDay))
+	}
+	if len(previousDay) == 0 || !previousDay[len(previousDay)-1].RecordedAt.Equal(boundary.Add(-time.Minute)) {
+		t.Error("previous day's heart rate is missing the last minute before the transition")
+	}
+	if len(transitionDay) == 0 || !transitionDay[0].RecordedAt.Equal(boundary) {
+		t.Error("transition day's heart rate is missing the first minute after the transition")
+	}
+
+	var kcal float64
+	for _, pt := range intraday(t, p, c, domain.MetricCalories, after) {
+		kcal += pt.Value
+	}
+	got := summaries(t, p, c, d, d)
+	if len(got) != 1 || got[0].CaloriesKcal == nil {
+		t.Fatalf("want a daily summary with calories for %s, got %+v", d, got)
+	}
+	if want := int32(math.Round(kcal)); *got[0].CaloriesKcal != want {
+		t.Errorf("daily calories = %d, want %d from intraday samples", *got[0].CaloriesKcal, want)
+	}
+}
+
 func TestNoDataAfterNow(t *testing.T) {
 	p := newProvider(9)
 	c := conn(t, userA, "Europe/Stockholm")
