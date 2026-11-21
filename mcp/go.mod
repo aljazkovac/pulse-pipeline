@@ -1,3 +1,3 @@
 module github.com/aljazkovac/pulse-pipeline/mcp
 
-go 1.23
+go 1.26.0
