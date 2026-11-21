@@ -1,10 +1,14 @@
 """Regression tests using real Git index and working-tree states."""
 
 import tempfile
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
 from pr_gatekeeper import changed_files, check_forbidden_files, git
+
+SCRIPT = Path(__file__).with_name("pr_gatekeeper.py").resolve()
 
 
 class ChangedFilesTests(unittest.TestCase):
@@ -19,6 +23,58 @@ class ChangedFilesTests(unittest.TestCase):
         git(self.repo, "config", "core.hooksPath", "/dev/null")
         git(self.repo, "commit", "--allow-empty", "-m", "Base")
         self.base = git(self.repo, "rev-parse", "HEAD")
+
+    def run_push_scan(self, before):
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--skip-make", "--no-fetch", "--push-before", before],
+            cwd=self.repo, capture_output=True, text=True, check=False,
+        )
+
+    def test_push_scans_commits_even_when_main_points_to_head(self):
+        (self.repo / ".env").write_text("TOKEN=placeholder", encoding="utf-8")
+        git(self.repo, "add", ".env")
+        git(self.repo, "commit", "-m", "Add secret")
+        git(self.repo, "rm", ".env")
+        git(self.repo, "commit", "-m", "Remove secret")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        result = self.run_push_scan(self.base)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("    .env", result.stdout)
+
+    def test_push_excludes_secrets_already_on_base(self):
+        (self.repo / ".env").write_text("TOKEN=placeholder", encoding="utf-8")
+        git(self.repo, "add", ".env")
+        git(self.repo, "commit", "-m", "Existing secret")
+        before = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "safe.txt").write_text("safe", encoding="utf-8")
+        git(self.repo, "add", "safe.txt")
+        git(self.repo, "commit", "-m", "Safe push")
+        result = self.run_push_scan(before)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("- safe.txt", result.stdout)
+
+    def test_initial_push_includes_root_secret_even_if_removed(self):
+        (self.repo / ".env").write_text("TOKEN=placeholder", encoding="utf-8")
+        git(self.repo, "add", ".env")
+        git(self.repo, "commit", "--amend", "--no-edit")
+        git(self.repo, "rm", ".env")
+        git(self.repo, "commit", "-m", "Remove root secret")
+        result = self.run_push_scan("0" * 40)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("    .env", result.stdout)
+
+    def test_initial_push_allows_safe_root_files(self):
+        (self.repo / ".env.example").write_text("TOKEN=", encoding="utf-8")
+        git(self.repo, "add", ".env.example")
+        git(self.repo, "commit", "--amend", "--no-edit")
+        result = self.run_push_scan("0" * 40)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("- .env.example", result.stdout)
+
+    def test_push_with_missing_boundary_fails_closed(self):
+        result = self.run_push_scan("1" * 40)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("gatekeeper error", result.stderr)
 
     def test_reversed_changes_still_block_secrets(self):
         for committed in (False, True):
