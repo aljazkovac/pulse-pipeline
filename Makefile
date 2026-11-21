@@ -1,10 +1,13 @@
-.PHONY: help setup-tools up down ps logs clean build test lint e2e db-shell
+.PHONY: help setup-tools up down ps logs clean build test lint e2e db-shell generate migrate-up migrate-down
 
 # web/ targets activate once web/package.json exists. The package must define the
 # scripts `build`, `typecheck` (tsc --noEmit, strict), `lint` (ESLint incl.
 # no-explicit-any), `test` (Vitest) and `test:e2e` (Playwright desktop + mobile).
 WEB_PACKAGE := $(wildcard web/package.json)
 WEB_PM ?= npm
+
+# Local database for migrate-* targets; matches .env.example / docker-compose.yml.
+DATABASE_URL ?= postgres://pulse:pulse_dev_password@localhost:5432/pulse_pipeline?sslmode=disable
 
 # Default target
 .DEFAULT_GOAL := help
@@ -35,6 +38,15 @@ clean: ## Stop containers and remove local volumes
 db-shell: ## Open a psql interactive shell in the local PostgreSQL container
 	docker compose exec postgres psql -U $${POSTGRES_USER:-pulse} -d $${POSTGRES_DB:-pulse_pipeline}
 
+generate: ## Regenerate sqlc code in backend/internal/store/db from SQL queries + migrations
+	cd backend && sqlc generate
+
+migrate-up: ## Apply all database migrations to DATABASE_URL (default: local docker-compose Postgres)
+	migrate -path backend/migrations -database "$(DATABASE_URL)" up
+
+migrate-down: ## Revert the most recent database migration on DATABASE_URL
+	migrate -path backend/migrations -database "$(DATABASE_URL)" down 1
+
 build: ## Build Go backend and MCP binaries (and web/ bundle when present)
 	cd backend && go build -o ../bin/pulse-api ./cmd/api
 	cd backend && go build -o ../bin/pulse-worker ./cmd/worker
@@ -43,7 +55,7 @@ ifneq ($(WEB_PACKAGE),)
 	cd web && $(WEB_PM) run build
 endif
 
-test: ## Run unit tests across backend, MCP, gatekeeper script (and web/ Vitest when present)
+test: ## Run unit + Testcontainers integration tests (needs Docker), gatekeeper tests (and web/ Vitest)
 	cd backend && go test -v -race ./...
 	cd mcp && go test -v -race ./...
 	python3 -m unittest discover -s .agents/skills/pr-reviewer/scripts

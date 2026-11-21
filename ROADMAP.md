@@ -15,7 +15,7 @@ PP serves dual purposes:
 
 | Layer                   | Technology Choice                                                            | Rationale                                                                                                                                                                                                                                                              |
 | :---------------------- | :--------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Backend & Ingestion** | **Go (1.23+)**                                                               | Compile-time static typing, first-class REST & gRPC support for the Google Health API, tiny container images, and cloud-native/K8s synergy.                                                                                                                            |
+| **Backend & Ingestion** | **Go (1.26+)**                                                               | Compile-time static typing, first-class REST & gRPC support for the Google Health API, tiny container images, and cloud-native/K8s synergy.                                                                                                                            |
 | **Database**            | **Standard PostgreSQL 17** (`pgx` + `sqlc` + `golang-migrate`)               | Handles millions of time-series rows with standard composite indexing, runs identically in local Docker and managed cloud DBs, and generates compile-time type-safe Go code from SQL via `sqlc`.                                                                       |
 | **Web & Phone App**     | **React + TypeScript + Vite + Tailwind CSS (PWA)**                           | Single responsive codebase for desktop browsers and installable mobile home-screen apps (Progressive Web App) without native build clunkiness; 100% DOM-compatible with Playwright E2E agents. Can be wrapped in Capacitor later if store distribution is ever needed. |
 | **MCP Server**          | **Go (`modelcontextprotocol/go-sdk`)**                                       | Shares domain models and database query packages directly with the Go backend, compiling to a single fast binary.                                                                                                                                                      |
@@ -80,16 +80,16 @@ Establish the monorepo layout, local development tooling, quality gates, and cus
 
 Build the multi-user, multi-provider data foundation and nightly ingestion service.
 
-- [ ] Design canonical PostgreSQL schema with `golang-migrate` migrations:
-  - [ ] `users` & `provider_connections` (encrypted OAuth 2.0 tokens, scopes, sync cursors)
-  - [ ] `daily_summaries` (steps, resting HR, HRV, sleep score, calories, SpO2)
-  - [ ] `intraday_metrics` (high-frequency time-series points indexed by `(user_id, metric_type, recorded_at)`)
-  - [ ] `sleep_sessions` & `sleep_stages`
-  - [ ] `sync_runs` (audit log of nightly pull jobs, status, records ingested, errors)
-- [ ] Set up `sqlc` and `pgx` in `backend/` for type-safe SQL data access
-- [ ] Define the `HealthProvider` adapter interface (`FetchDailySummaries`, `FetchIntradayMetrics`, `FetchSleepSessions`, `RefreshAuth`)
+- [x] Design canonical PostgreSQL schema with `golang-migrate` migrations:
+  - [x] `users` & `provider_connections` (encrypted OAuth 2.0 tokens, scopes, sync cursors — ciphertext columns; AES-GCM cipher lands with `GoogleHealthProvider`)
+  - [x] `daily_summaries` (steps, resting HR, HRV, sleep score, calories, SpO2)
+  - [x] `intraday_metrics` (high-frequency time-series points indexed by `(user_id, metric_type, recorded_at)`)
+  - [x] `sleep_sessions` & `sleep_stages`
+  - [x] `sync_runs` (audit log of nightly pull jobs, status, records ingested, errors)
+- [x] Set up `sqlc` and `pgx` in `backend/` for type-safe SQL data access
+- [x] Define the `HealthProvider` adapter interface (`FetchDailySummaries`, `FetchIntradayMetrics`, `FetchSleepSessions`, `RefreshAuth`)
 - [ ] Implement a deterministic `MockHealthProvider` generating realistic synthetic health data for local dev and automated testing
-- [ ] Implement the `GoogleHealthProvider` (Google OAuth 2.0 flow + Google Health API client for Fitbit Air data)
+- [ ] Implement the `GoogleHealthProvider` (Google OAuth 2.0 flow + Google Health API client for Fitbit Air data, AES-256-GCM token encryption per ADR-0002 §3)
 - [ ] Build the nightly sync worker (idempotent upserts, retry/backoff, backfill support, manual trigger endpoint)
 - [ ] Write Go unit tests and Testcontainers-based PostgreSQL integration tests
 

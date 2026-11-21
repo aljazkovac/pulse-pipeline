@@ -6,7 +6,7 @@ Built for a single user initially, the platform is designed around multi-user is
 
 ## Tech Stack
 
-- **Backend & Nightly Sync Worker:** Go 1.23+, `pgx`, `sqlc`, `golang-migrate`
+- **Backend & Nightly Sync Worker:** Go 1.26+, `pgx`, `sqlc`, `golang-migrate`
 - **Database:** PostgreSQL 17
 - **Frontend (Desktop + Mobile App):** React, TypeScript, Vite, Tailwind CSS (Progressive Web App)
 - **AI / Agentic Integration:** Model Context Protocol (MCP) Go SDK + Custom SDLC Agents
