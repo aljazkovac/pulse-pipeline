@@ -79,17 +79,17 @@ error bodies; adapters remain responsible for keeping tokens out of their errors
 ### 4. Concurrency guard and crash recovery
 
 Migration `000002` adds a partial unique index `sync_runs (user_id, provider) WHERE status =
-'running'`. `StartSyncRun` inserts with `ON CONFLICT … DO NOTHING` and returns
-`store.ErrSyncInProgress` when another run holds the slot; the scheduler skips that connection,
-without rescheduling it, until its next poll.
+'running'`. Claiming a run locks the connection while checking its status and due time, reading
+its cursor, and inserting the audit row. The scheduler skips connections held by another run
+or rescheduled since the last poll.
 
-A running run records a **heartbeat** (`sync_runs.heartbeat_at`) after every unit. Before starting,
-the worker fails runs of the same connection whose last heartbeat (or start) is older than
-`StaleRunAfter` (2h) — measured on the database clock, which set both — so a crashed worker
-releases its slot while a long backfill that keeps making progress is never mistaken for one. If a
-run's heartbeat finds it was abandoned anyway, it stops at once and writes no connection state,
-since another run may own the connection. Run bookkeeping uses a context detached from
-cancellation, so a worker stopping on SIGTERM still closes its audit row as `failed`.
+Workers update the **heartbeat** (`sync_runs.heartbeat_at`) in the same transaction as each
+upsert. The update locks the running audit row, so an abandoned worker cannot commit health
+writes after another worker takes over. Before claiming a run, the worker marks a previous
+run failed if its last heartbeat (or start) is older than `StaleRunAfter` (2h) on the database
+clock. Finalization uses the same connection lock as claiming and commits the terminal audit
+row and connection update together. It uses a context detached from cancellation so a worker
+stopping on SIGTERM can still close its audit row.
 
 ### 5. Manual trigger over HTTP is deferred
 
@@ -101,10 +101,10 @@ the Phase 2 Sync & Connections view, once the API authenticates requests.
 
 ## Consequences
 
-- **Positive:** re-running anything converges; one bad endpoint degrades a run instead of failing
-  it; late provider corrections are picked up within `OverlapDays`; two syncs of one connection
-  cannot interleave, even across replicas; a crash is self-healing after `StaleRunAfter`; every run
-  is auditable in `sync_runs` with a bounded, token-scrubbed error summary.
+- Repeating a sync converges on the same rows. A single endpoint failure can leave the run
+  partial. The overlap picks up late provider corrections. The active run owns health and
+  connection writes, and a crashed worker's slot becomes eligible for takeover after
+  `StaleRunAfter`. The audit row keeps a bounded, token-scrubbed error summary.
 - **Trade-offs:** one extra `UPDATE` per unit for the heartbeat. Connections are synced sequentially (ample at single-user scale; a bounded worker
   pool is a local change later). A connection with a permanently failing unit retries hourly
   without advancing its cursor until the cause is fixed — visible as repeated `partial` runs. The

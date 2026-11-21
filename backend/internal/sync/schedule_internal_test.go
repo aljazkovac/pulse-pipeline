@@ -87,6 +87,28 @@ func TestLocalSpan_FollowsDST(t *testing.T) {
 	}
 }
 
+func TestLocalSpan_SkippedMidnight(t *testing.T) {
+	santiago, err := time.LoadLocation("America/Santiago")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, after := d(t, "2026-09-05"), d(t, "2026-09-06")
+	previousDay := localSpan(domain.DateRange{Start: before, End: before}, santiago)
+	transitionDay := localSpan(domain.DateRange{Start: after, End: after}, santiago)
+	boundary := time.Date(2026, 9, 6, 4, 0, 0, 0, time.UTC)
+
+	if !previousDay.End.Equal(boundary) || !transitionDay.Start.Equal(boundary) {
+		t.Errorf("previous day ends at %s and transition day starts at %s, want both at %s",
+			previousDay.End, transitionDay.Start, boundary)
+	}
+	if got := previousDay.End.Sub(previousDay.Start); got != 24*time.Hour {
+		t.Errorf("day before the transition spans %s, want 24h", got)
+	}
+	if got := transitionDay.End.Sub(transitionDay.Start); got != 23*time.Hour {
+		t.Errorf("transition day spans %s, want 23h", got)
+	}
+}
+
 func TestNextNightly(t *testing.T) {
 	stockholm, err := time.LoadLocation("Europe/Stockholm")
 	if err != nil {
@@ -209,9 +231,9 @@ func TestOutcome_StatusAndMessage(t *testing.T) {
 }
 
 func TestOutcome_ScrubsTokens(t *testing.T) {
-	o := &outcome{secrets: []string{"", "fake-access-123", "fake-refresh-456"}}
-	o.errs = []error{errors.New("401 for Bearer fake-access-123; refresh fake-refresh-456 rejected")}
-	if msg := o.message(); strings.Contains(msg, "fake-") || strings.Count(msg, "[REDACTED]") != 2 {
+	o := &outcome{secrets: []string{"", "fake-access-123", "fake-access-123-refresh", "fake-new-456"}}
+	o.errs = []error{errors.New("401 for Bearer fake-access-123; refresh fake-access-123-refresh and fake-new-456 rejected")}
+	if msg := o.message(); msg != "401 for Bearer [REDACTED]; refresh [REDACTED] and [REDACTED] rejected" {
 		t.Errorf("message = %q", msg)
 	}
 }

@@ -20,8 +20,8 @@ import (
 // the database URL and a pool, then runs the tests and tears everything down.
 // It returns the exit code for os.Exit.
 //
-// Locally the tests are skipped when Docker is unavailable; in CI (CI set) a
-// missing database fails loudly instead of silently skipping the suite.
+// Locally database-dependent tests use Require to skip when Docker is
+// unavailable. In CI a failure to start PostgreSQL fails the suite.
 func Main(m *testing.M, ready func(databaseURL string, pool *pgxpool.Pool)) int {
 	ctx := context.Background()
 
@@ -37,7 +37,7 @@ func Main(m *testing.M, ready func(databaseURL string, pool *pgxpool.Pool)) int 
 			return 1
 		}
 		fmt.Fprintf(os.Stderr, "SKIP integration tests: Docker unavailable (%v)\n", err)
-		return 0
+		return m.Run()
 	}
 	defer func() {
 		if err := container.Terminate(context.Background()); err != nil {
@@ -66,4 +66,12 @@ func Main(m *testing.M, ready func(databaseURL string, pool *pgxpool.Pool)) int 
 
 	ready(url, pool)
 	return m.Run()
+}
+
+// Require skips a test when Main could not start the shared database.
+func Require(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	if pool == nil {
+		t.Skip("PostgreSQL test container unavailable")
+	}
 }

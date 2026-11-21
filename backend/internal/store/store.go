@@ -35,6 +35,7 @@ const intradayBatchSize = 5000
 type Store struct {
 	pool *pgxpool.Pool
 	q    *db.Queries
+	tx   pgx.Tx
 }
 
 // New returns a Store backed by pool.
@@ -42,9 +43,14 @@ func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool, q: db.New(pool)}
 }
 
-// inTx runs fn inside a transaction, committing on nil and rolling back otherwise.
-func (s *Store) inTx(ctx context.Context, fn func(q *db.Queries) error) error {
-	if err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error { return fn(s.q.WithTx(tx)) }); err != nil {
+// inTx reuses an enclosing transaction or opens one for fn.
+func (s *Store) inTx(ctx context.Context, fn func(*Store) error) error {
+	if s.tx != nil {
+		return fn(s)
+	}
+	if err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		return fn(&Store{pool: s.pool, q: s.q.WithTx(tx), tx: tx})
+	}); err != nil {
 		return fmt.Errorf("transaction: %w", err)
 	}
 	return nil
@@ -204,9 +210,9 @@ func (s *Store) UpsertDailySummaries(ctx context.Context, userID uuid.UUID, summ
 			return 0, fmt.Errorf("upserting daily summary: %w", err)
 		}
 	}
-	err := s.inTx(ctx, func(q *db.Queries) error {
+	err := s.inTx(ctx, func(tx *Store) error {
 		for _, d := range summaries {
-			err := q.UpsertDailySummary(ctx, db.UpsertDailySummaryParams{
+			err := tx.q.UpsertDailySummary(ctx, db.UpsertDailySummaryParams{
 				UserID: userID, Provider: string(d.Provider), SummaryDate: pgDate(d.Date),
 				Steps: pgInt4(d.Steps), RestingHeartRate: pgInt2(d.RestingHeartRate),
 				HrvRmssdMs: pgFloat8(d.HRVRMSSDMs), SleepScore: pgInt2(d.SleepScore),
@@ -287,10 +293,10 @@ func (s *Store) UpsertIntradayMetrics(ctx context.Context, userID uuid.UUID, pro
 	}
 
 	var written int64
-	err := s.inTx(ctx, func(q *db.Queries) error {
+	err := s.inTx(ctx, func(tx *Store) error {
 		for start := 0; start < len(times); start += intradayBatchSize {
 			end := min(start+intradayBatchSize, len(times))
-			n, err := q.UpsertIntradayMetrics(ctx, db.UpsertIntradayMetricsParams{
+			n, err := tx.q.UpsertIntradayMetrics(ctx, db.UpsertIntradayMetricsParams{
 				UserID: userID, Provider: string(provider), MetricType: string(metric),
 				RecordedAt: times[start:end], Value: values[start:end],
 			})
@@ -338,9 +344,9 @@ func (s *Store) UpsertSleepSessions(ctx context.Context, userID uuid.UUID, sessi
 			return 0, fmt.Errorf("upserting sleep sessions: %w", err)
 		}
 	}
-	err := s.inTx(ctx, func(q *db.Queries) error {
+	err := s.inTx(ctx, func(tx *Store) error {
 		for _, ss := range sessions {
-			id, err := q.UpsertSleepSession(ctx, db.UpsertSleepSessionParams{
+			id, err := tx.q.UpsertSleepSession(ctx, db.UpsertSleepSessionParams{
 				UserID: userID, Provider: string(ss.Provider), ProviderSessionID: ss.ProviderSessionID,
 				SleepDate: pgDate(ss.SleepDate), StartAt: ss.StartAt.UTC(), EndAt: ss.EndAt.UTC(),
 				IsMainSleep: ss.IsMainSleep, EfficiencyPct: pgInt2(ss.EfficiencyPct),
@@ -348,7 +354,7 @@ func (s *Store) UpsertSleepSessions(ctx context.Context, userID uuid.UUID, sessi
 			if err != nil {
 				return fmt.Errorf("upserting sleep session %s: %w", ss.ProviderSessionID, err)
 			}
-			if err := q.DeleteSleepStages(ctx, db.DeleteSleepStagesParams{SessionID: id, UserID: userID}); err != nil {
+			if err := tx.q.DeleteSleepStages(ctx, db.DeleteSleepStagesParams{SessionID: id, UserID: userID}); err != nil {
 				return fmt.Errorf("clearing stages of sleep session %s: %w", ss.ProviderSessionID, err)
 			}
 			if len(ss.Stages) == 0 {
@@ -365,7 +371,7 @@ func (s *Store) UpsertSleepSessions(ctx context.Context, userID uuid.UUID, sessi
 				params.StartAt = append(params.StartAt, st.StartAt.UTC())
 				params.EndAt = append(params.EndAt, st.EndAt.UTC())
 			}
-			if _, err := q.InsertSleepStages(ctx, params); err != nil {
+			if _, err := tx.q.InsertSleepStages(ctx, params); err != nil {
 				return fmt.Errorf("inserting stages of sleep session %s: %w", ss.ProviderSessionID, err)
 			}
 		}

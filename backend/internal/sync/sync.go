@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand/v2"
+	"slices"
 	"strings"
 	"time"
 
@@ -30,29 +31,21 @@ var (
 	// ErrUnknownProvider means no HealthProvider is registered for a connection.
 	ErrUnknownProvider = errors.New("sync: no provider registered")
 	// ErrConnectionInactive means the connection is revoked or in error.
-	ErrConnectionInactive = errors.New("sync: connection is not active")
+	ErrConnectionInactive = store.ErrConnectionInactive
 )
 
 // Store is the subset of *store.Store the orchestrator needs. Every method
 // except ListConnectionsDueForSync is scoped by user ID.
 type Store interface {
 	GetUser(ctx context.Context, id uuid.UUID) (domain.User, error)
-	GetConnection(ctx context.Context, userID uuid.UUID, provider domain.Provider) (domain.ConnectionInfo, error)
-	GetConnectionSyncCursor(ctx context.Context, userID, connectionID uuid.UUID) ([]byte, error)
-	MarkConnectionSynced(ctx context.Context, userID, connectionID uuid.UUID, syncedAt, nextSyncAt time.Time, cursor []byte) error
-	RescheduleConnection(ctx context.Context, userID, connectionID uuid.UUID, nextSyncAt time.Time) error
-	SetConnectionStatus(ctx context.Context, userID, connectionID uuid.UUID, status domain.ConnectionStatus) error
+	RescheduleDueConnection(ctx context.Context, userID, connectionID uuid.UUID, dueAt, nextSyncAt time.Time) error
 	// ListConnectionsDueForSync is system context only (AGENTS.md §1.1).
 	ListConnectionsDueForSync(ctx context.Context, now time.Time, limit int32) ([]domain.DueConnection, error)
 
-	AbandonStaleSyncRuns(ctx context.Context, userID uuid.UUID, provider domain.Provider, olderThan time.Duration) (int64, error)
-	StartSyncRun(ctx context.Context, userID uuid.UUID, provider domain.Provider, trigger domain.SyncTrigger, r domain.DateRange) (domain.SyncRun, error)
+	ClaimSyncRun(ctx context.Context, userID uuid.UUID, provider domain.Provider, trigger domain.SyncTrigger, now time.Time, staleAfter time.Duration, plan func([]byte) (domain.DateRange, error)) (domain.SyncRun, uuid.UUID, error)
 	TouchSyncRun(ctx context.Context, userID, runID uuid.UUID) error
-	FinishSyncRun(ctx context.Context, userID, runID uuid.UUID, status domain.SyncStatus, records int32, errMsg string) (domain.SyncRun, error)
-
-	UpsertDailySummaries(ctx context.Context, userID uuid.UUID, summaries []domain.DailySummary) (int, error)
-	UpsertSleepSessions(ctx context.Context, userID uuid.UUID, sessions []domain.SleepSession) (int, error)
-	UpsertIntradayMetrics(ctx context.Context, userID uuid.UUID, provider domain.Provider, metric domain.MetricType, points []domain.IntradayPoint) (int64, error)
+	WriteSyncUnit(ctx context.Context, userID, runID uuid.UUID, write func(store.SyncUnitWriter) (int64, error)) (int64, error)
+	FinishConnectionSyncRun(ctx context.Context, run domain.SyncRun, connectionID uuid.UUID, result store.SyncResult) (domain.SyncRun, error)
 }
 
 var _ Store = (*store.Store)(nil)
@@ -251,42 +244,25 @@ func (s *Syncer) SyncConnection(ctx context.Context, req Request) (domain.SyncRu
 	if err != nil {
 		return domain.SyncRun{}, fmt.Errorf("sync: %w", err)
 	}
-	info, err := s.store.GetConnection(ctx, req.UserID, req.Provider)
-	if err != nil {
-		return domain.SyncRun{}, fmt.Errorf("sync: %w", err)
-	}
-	if info.Status != domain.ConnectionActive {
-		return domain.SyncRun{}, fmt.Errorf("%w: %s connection for user %s is %s", ErrConnectionInactive, req.Provider, req.UserID, info.Status)
-	}
-	rawCursor, err := s.store.GetConnectionSyncCursor(ctx, req.UserID, info.ID)
-	if err != nil {
-		return domain.SyncRun{}, fmt.Errorf("sync: %w", err)
-	}
-	cur, err := parseCursor(rawCursor)
-	if err != nil {
-		return domain.SyncRun{}, fmt.Errorf("sync: connection %s: %w", info.ID, err)
-	}
-
 	loc := user.Location()
-	today := domain.DateOf(s.now().In(loc))
-	r, err := planRange(req, cur.syncedThrough, today, s.cfg)
+	now := s.now()
+	var cur cursor
+	run, connectionID, err := s.store.ClaimSyncRun(ctx, req.UserID, req.Provider, req.Trigger, now, s.cfg.StaleRunAfter,
+		func(raw []byte) (domain.DateRange, error) {
+			var err error
+			cur, err = parseCursor(raw)
+			if err != nil {
+				return domain.DateRange{}, err
+			}
+			return planRange(req, cur.syncedThrough, domain.DateOf(now.In(loc)), s.cfg)
+		})
 	if err != nil {
-		return domain.SyncRun{}, fmt.Errorf("sync: user %s: %w", req.UserID, err)
+		return domain.SyncRun{}, fmt.Errorf("sync: %w", err)
 	}
 
-	if n, err := s.store.AbandonStaleSyncRuns(ctx, req.UserID, req.Provider, s.cfg.StaleRunAfter); err != nil {
-		return domain.SyncRun{}, fmt.Errorf("sync: %w", err)
-	} else if n > 0 {
-		s.log.Warn("abandoned stale sync runs", "user_id", req.UserID, "provider", req.Provider, "count", n)
-	}
-	run, err := s.store.StartSyncRun(ctx, req.UserID, req.Provider, req.Trigger, r)
-	if err != nil {
-		return domain.SyncRun{}, fmt.Errorf("sync: %w", err)
-	}
-
-	conn := domain.Connection{ID: info.ID, UserID: req.UserID, Provider: req.Provider, Location: loc}
-	out := s.ingest(ctx, hp, conn, run.ID, r)
-	return s.finish(ctx, req, info, loc, run, cur, out)
+	conn := domain.Connection{ID: connectionID, UserID: req.UserID, Provider: req.Provider, Location: loc}
+	out := s.ingest(ctx, hp, conn, run.ID, run.Range)
+	return s.finish(ctx, conn, run, cur, out)
 }
 
 // outcome accumulates the result of a run's units.
@@ -295,7 +271,6 @@ type outcome struct {
 	succeeded    int
 	errs         []error
 	unauthorized bool
-	abandoned    bool     // another worker declared the run stale; touch nothing
 	secrets      []string // token values to scrub from the stored message
 }
 
@@ -324,10 +299,16 @@ func (o *outcome) message() string {
 		parts = append(parts, err.Error())
 	}
 	msg := strings.Join(parts, "; ")
-	for _, secret := range o.secrets {
+	secrets := slices.Clone(o.secrets)
+	slices.SortFunc(secrets, func(a, b string) int { return len(b) - len(a) })
+	var replacements []string
+	for _, secret := range secrets {
 		if secret != "" {
-			msg = strings.ReplaceAll(msg, secret, "[REDACTED]")
+			replacements = append(replacements, secret, "[REDACTED]")
 		}
+	}
+	if len(replacements) > 0 {
+		msg = strings.NewReplacer(replacements...).Replace(msg)
 	}
 	if len(msg) > maxLen {
 		// Cut on a byte budget, then drop any rune split in half: PostgreSQL
@@ -359,25 +340,22 @@ func (s *Syncer) ingest(ctx context.Context, hp domain.HealthProvider, conn doma
 	}
 	conn.Credentials = creds
 
-	for _, u := range s.units(hp, conn, r) {
+	for _, u := range s.units(hp, conn, runID, r) {
 		if err := ctx.Err(); err != nil {
 			fail(fmt.Errorf("stopped before %s: %w", u.name, err))
 			break
 		}
 		n, err := u.run(ctx)
-		if err != nil {
-			fail(fmt.Errorf("%s: %w", u.name, err))
-		} else {
+		if err == nil {
 			out.records += n
 			out.succeeded++
+			continue // the write transaction recorded the heartbeat
 		}
-		if out.unauthorized {
-			break // every other request would be rejected too
+		fail(fmt.Errorf("%s: %w", u.name, err))
+		if out.unauthorized || errors.Is(err, store.ErrSyncRunAbandoned) {
+			break
 		}
 		if err := s.store.TouchSyncRun(ctx, conn.UserID, runID); errors.Is(err, store.ErrNotFound) {
-			// Declared stale by another worker, which may be syncing now.
-			out.abandoned = true
-			fail(errors.New("run was abandoned as stale by another worker; stopped"))
 			break
 		} else if err != nil && ctx.Err() == nil {
 			s.log.Warn("could not record sync heartbeat", "run_id", runID, "error", err)
@@ -410,7 +388,7 @@ func (s *Syncer) credentials(ctx context.Context, hp domain.HealthProvider, conn
 	return fresh, nil
 }
 
-func (s *Syncer) units(hp domain.HealthProvider, conn domain.Connection, r domain.DateRange) []unit {
+func (s *Syncer) units(hp domain.HealthProvider, conn domain.Connection, runID uuid.UUID, r domain.DateRange) []unit {
 	var units []unit
 	for _, c := range chunkDates(r, s.cfg.ChunkDays) {
 		units = append(units,
@@ -424,8 +402,10 @@ func (s *Syncer) units(hp domain.HealthProvider, conn domain.Connection, r domai
 						return 0, fmt.Errorf("provider returned a %q summary", row.Provider)
 					}
 				}
-				n, err := s.store.UpsertDailySummaries(ctx, conn.UserID, rows)
-				return int64(n), err
+				return s.store.WriteSyncUnit(ctx, conn.UserID, runID, func(w store.SyncUnitWriter) (int64, error) {
+					n, err := w.UpsertDailySummaries(ctx, conn.UserID, rows)
+					return int64(n), err
+				})
 			}},
 			unit{"sleep sessions " + rangeString(c), func(ctx context.Context) (int64, error) {
 				rows, err := retry(ctx, s, func() ([]domain.SleepSession, error) { return hp.FetchSleepSessions(ctx, conn, c) })
@@ -437,20 +417,27 @@ func (s *Syncer) units(hp domain.HealthProvider, conn domain.Connection, r domai
 						return 0, fmt.Errorf("provider returned a %q sleep session", row.Provider)
 					}
 				}
-				n, err := s.store.UpsertSleepSessions(ctx, conn.UserID, rows)
-				return int64(n), err
+				return s.store.WriteSyncUnit(ctx, conn.UserID, runID, func(w store.SyncUnitWriter) (int64, error) {
+					n, err := w.UpsertSleepSessions(ctx, conn.UserID, rows)
+					return int64(n), err
+				})
 			}},
 		)
 	}
 	for _, m := range domain.MetricTypes {
 		for _, c := range chunkDates(r, s.cfg.IntradayChunkDays) {
 			span := localSpan(c, conn.Location)
+			if !span.End.After(span.Start) {
+				continue // the timezone skipped the entire date range
+			}
 			units = append(units, unit{string(m) + " " + rangeString(c), func(ctx context.Context) (int64, error) {
 				pts, err := retry(ctx, s, func() ([]domain.IntradayPoint, error) { return hp.FetchIntradayMetrics(ctx, conn, m, span) })
 				if err != nil {
 					return 0, fmt.Errorf("fetching: %w", err)
 				}
-				return s.store.UpsertIntradayMetrics(ctx, conn.UserID, hp.Name(), m, pts)
+				return s.store.WriteSyncUnit(ctx, conn.UserID, runID, func(w store.SyncUnitWriter) (int64, error) {
+					return w.UpsertIntradayMetrics(ctx, conn.UserID, conn.Provider, m, pts)
+				})
 			}})
 		}
 	}
@@ -459,40 +446,32 @@ func (s *Syncer) units(hp domain.HealthProvider, conn domain.Connection, r domai
 
 // finish records the outcome. It runs on a context detached from ctx's
 // cancellation so a worker shutting down mid-run still closes its audit row.
-func (s *Syncer) finish(ctx context.Context, req Request, info domain.ConnectionInfo, loc *time.Location, run domain.SyncRun, cur cursor, out *outcome) (domain.SyncRun, error) {
+func (s *Syncer) finish(ctx context.Context, conn domain.Connection, run domain.SyncRun, cur cursor, out *outcome) (domain.SyncRun, error) {
 	bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 
-	status, now := out.status(), s.now()
-	if out.abandoned {
-		// The run row is already closed and another run may own the
-		// connection now: write nothing.
-		return run, fmt.Errorf("sync: run %s was abandoned as stale while still running; raise StaleRunAfter", run.ID)
+	now := s.now()
+	result := store.SyncResult{
+		Status: out.status(), RecordsIngested: clampInt32(out.records), ErrorMessage: out.message(),
+		Unauthorized: out.unauthorized,
 	}
-	var bookkeeping error
 	switch {
-	case out.unauthorized:
-		// Stop scheduling until the user reconnects the provider.
-		bookkeeping = s.store.SetConnectionStatus(bctx, req.UserID, info.ID, domain.ConnectionError)
-	case req.Trigger == domain.SyncTriggerBackfill:
-		// Backfills fill history and touch no connection state: the cursor
-		// and schedule read before the run may be stale by now.
-	case status == domain.SyncSucceeded:
-		var raw []byte
-		if raw, bookkeeping = cur.advance(run.Range.End); bookkeeping == nil {
-			bookkeeping = s.store.MarkConnectionSynced(bctx, req.UserID, info.ID, now, nextNightly(now, loc, s.cfg.SyncHour), raw)
+	case result.Unauthorized, run.Trigger == domain.SyncTriggerBackfill:
+		// Unauthorized results only change status. Other backfills only record the audit.
+	case result.Status == domain.SyncSucceeded:
+		raw, err := cur.advance(run.Range.End)
+		if err != nil {
+			return run, fmt.Errorf("sync: advancing cursor for run %s: %w", run.ID, err)
 		}
-	case req.Trigger == domain.SyncTriggerScheduled:
+		result.SyncedAt, result.NextSyncAt, result.Cursor = now, nextNightly(now, conn.Location, s.cfg.SyncHour), raw
+	case run.Trigger == domain.SyncTriggerScheduled:
 		// Keep the cursor so the next attempt re-covers the whole range.
-		bookkeeping = s.store.RescheduleConnection(bctx, req.UserID, info.ID, now.Add(s.cfg.RetryAfter))
+		result.NextSyncAt = now.Add(s.cfg.RetryAfter)
 	}
 
-	finished, err := s.store.FinishSyncRun(bctx, req.UserID, run.ID, status, clampInt32(out.records), out.message())
+	finished, err := s.store.FinishConnectionSyncRun(bctx, run, conn.ID, result)
 	if err != nil {
-		finished = run // keep the run's identity so callers know it started
-	}
-	if err = errors.Join(bookkeeping, err); err != nil {
-		return finished, fmt.Errorf("sync: recording run %s: %w", run.ID, err)
+		return run, fmt.Errorf("sync: recording run %s: %w", run.ID, err)
 	}
 	return finished, nil
 }
@@ -503,7 +482,8 @@ func (s *Syncer) finish(ctx context.Context, req Request, info domain.Connection
 // connections that cannot start are pushed back by RetryAfter so they do not
 // spin on every poll.
 func (s *Syncer) RunDue(ctx context.Context) (int, error) {
-	due, err := s.store.ListConnectionsDueForSync(ctx, s.now(), s.cfg.DueBatchSize)
+	dueAt := s.now()
+	due, err := s.store.ListConnectionsDueForSync(ctx, dueAt, s.cfg.DueBatchSize)
 	if err != nil {
 		return 0, fmt.Errorf("sync: %w", err)
 	}
@@ -519,9 +499,11 @@ func (s *Syncer) RunDue(ctx context.Context) (int, error) {
 			return done, fmt.Errorf("sync: stopped after %d runs: %w", done, ctx.Err())
 		case errors.Is(err, store.ErrSyncInProgress):
 			log.Info("skipping connection: sync already in progress")
+		case errors.Is(err, store.ErrSyncNotDue), errors.Is(err, ErrConnectionInactive):
+			// The connection changed since the due list was read.
 		case err != nil && run.ID == uuid.Nil:
 			log.Error("could not start scheduled sync", "error", err)
-			if rerr := s.store.RescheduleConnection(ctx, c.UserID, c.ID, s.now().Add(s.cfg.RetryAfter)); rerr != nil {
+			if rerr := s.store.RescheduleDueConnection(ctx, c.UserID, c.ID, dueAt, s.now().Add(s.cfg.RetryAfter)); rerr != nil {
 				log.Error("could not reschedule connection", "error", rerr)
 			}
 		case err != nil:

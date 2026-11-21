@@ -104,6 +104,31 @@ func (d Date) Time() time.Time {
 	return time.Date(d.Year, d.Month, d.Day, 0, 0, 0, 0, time.UTC)
 }
 
+// StartIn returns the UTC instant when d begins in loc. If a transition skips
+// midnight, it uses the transition instant. If midnight repeats, it uses the
+// first occurrence. A wholly skipped date shares the next date's start.
+func (d Date) StartIn(loc *time.Location) time.Time {
+	resolved := time.Date(d.Year, d.Month, d.Day, 0, 0, 0, 0, loc)
+	start, end := resolved.ZoneBounds()
+	// time.Date can resolve a skipped midnight into the preceding day.
+	if DateOf(resolved).Before(d) {
+		return end.UTC()
+	}
+
+	wallMidnight := d.Time()
+	_, offset := resolved.Zone()
+	midnight := wallMidnight.Add(-time.Duration(offset) * time.Second)
+	if start.IsZero() || midnight.After(start) {
+		return midnight
+	}
+	_, previousOffset := start.Add(-time.Nanosecond).Zone()
+	previousMidnight := wallMidnight.Add(-time.Duration(previousOffset) * time.Second)
+	if previousMidnight.Before(start) {
+		return previousMidnight
+	}
+	return start.UTC()
+}
+
 // AddDays returns d shifted by n days.
 func (d Date) AddDays(n int) Date { return DateOf(d.Time().AddDate(0, 0, n)) }
 

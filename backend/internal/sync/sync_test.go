@@ -53,12 +53,17 @@ type option func(*harness, *sync.Config, *[]domain.HealthProvider)
 
 func newHarness(t *testing.T, opts ...option) *harness {
 	t.Helper()
+	testdb.Require(t, testPool)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	t.Cleanup(cancel)
 	h := &harness{t: t, ctx: ctx, now: t0}
 	h.mock = mock.New(mock.Options{Seed: 7, Now: h.clock})
 	h.user = h.newUser("Europe/Stockholm")
 	h.conn = h.connect(h.user, domain.ProviderMock)
+	h.conn.NextSyncAt = h.now.Add(-time.Minute)
+	if err := testStore.RescheduleConnection(h.ctx, h.user.ID, h.conn.ID, h.conn.NextSyncAt); err != nil {
+		t.Fatal(err)
+	}
 
 	cfg := sync.DefaultConfig()
 	cfg.InitialBackfillDays = 7 // keeps each first sync to ~30k rows; the default is unit-tested
@@ -339,6 +344,42 @@ func TestRunDue_ResumesFromCursorWithOverlap(t *testing.T) {
 	}
 	if done, _ := h.syncer.RunDue(h.ctx); done != 0 {
 		t.Errorf("connection synced again before its next nightly slot")
+	}
+}
+
+type dueSnapshot struct {
+	*store.Store
+	afterList func()
+}
+
+func (s dueSnapshot) ListConnectionsDueForSync(ctx context.Context, now time.Time, limit int32) ([]domain.DueConnection, error) {
+	due, err := s.Store.ListConnectionsDueForSync(ctx, now, limit)
+	if err == nil {
+		s.afterList()
+	}
+	return due, err
+}
+
+func TestRunDue_SkipsConnectionRescheduledSinceListing(t *testing.T) {
+	var nextSync time.Time
+	h := newHarness(t, func(h *harness, _ *sync.Config, _ *[]domain.HealthProvider) {
+		h.store = dueSnapshot{Store: testStore, afterList: func() {
+			if run := h.sync(domain.SyncTriggerManual, nil); run.Status != domain.SyncSucceeded {
+				t.Fatalf("manual sync: %+v", run)
+			}
+			nextSync = h.connection().NextSyncAt
+		}}
+	})
+	h.isolateDue(h.conn)
+
+	if done, err := h.syncer.RunDue(h.ctx); err != nil || done != 0 {
+		t.Fatalf("RunDue processed a stale due entry: %d, %v", done, err)
+	}
+	if n := h.count("sync_runs", h.user.ID); n != 1 {
+		t.Errorf("recorded %d runs, want only the manual run", n)
+	}
+	if got := h.connection().NextSyncAt; !got.Equal(nextSync) {
+		t.Errorf("next sync = %s, want %s from the manual run", got, nextSync)
 	}
 }
 
@@ -729,27 +770,50 @@ func TestRefreshFailures(t *testing.T) {
 	}
 }
 
-// A run another worker declared stale must stop and write nothing more.
-func TestAbandonedRun_StopsWithoutBookkeeping(t *testing.T) {
-	var h *harness
-	h = newHarness(t, withProvider(newFaulty(func(op string, _ int) error {
-		if op == "sleep" { // after the first unit's heartbeat
-			if _, err := testPool.Exec(h.ctx, `UPDATE sync_runs SET status = 'failed', finished_at = now(), error_message = 'abandoned'
-				WHERE user_id = $1 AND status = 'running'`, h.user.ID); err != nil {
-				h.t.Fatal(err)
+func TestAbandonedRun_CannotWriteOrChangeConnection(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "provider returns rows"},
+		{name: "provider rejects credentials", err: domain.ErrUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var h *harness
+			h = newHarness(t, withProvider(newFaulty(func(op string, _ int) error {
+				if op != "sleep" {
+					return nil
+				}
+				// Abandon the run during the provider request, then claim the slot.
+				if _, err := testPool.Exec(h.ctx, `UPDATE sync_runs SET heartbeat_at = now() - interval '3 hours'
+					WHERE user_id = $1 AND provider = $2 AND status = 'running'`, h.user.ID, domain.ProviderMock); err != nil {
+					t.Fatal(err)
+				}
+				_, _, err := testStore.ClaimSyncRun(h.ctx, h.user.ID, domain.ProviderMock, domain.SyncTriggerManual, h.now, 2*time.Hour,
+					func([]byte) (domain.DateRange, error) { return dateRange(t, "2026-11-20", "2026-11-21"), nil })
+				if err != nil {
+					t.Fatalf("claiming replacement run: %v", err)
+				}
+				return tc.err
+			})))
+			before := h.connection()
+
+			_, err := h.syncer.SyncConnection(h.ctx, sync.Request{UserID: h.user.ID, Provider: domain.ProviderMock, Trigger: domain.SyncTriggerScheduled})
+			if !errors.Is(err, store.ErrSyncRunAbandoned) {
+				t.Fatalf("err = %v, want abandoned", err)
 			}
-		}
-		return nil
-	})))
-	_, err := h.syncer.SyncConnection(h.ctx, sync.Request{UserID: h.user.ID, Provider: domain.ProviderMock, Trigger: domain.SyncTriggerScheduled})
-	if err == nil || !strings.Contains(err.Error(), "abandoned") {
-		t.Fatalf("err = %v, want abandoned", err)
-	}
-	if h.countMetric(domain.MetricHeartRate) != 0 {
-		t.Error("kept ingesting after the run was abandoned")
-	}
-	if c := h.connection(); c.LastSyncedAt != nil || strings.Contains(h.cursor(), "synced_through") {
-		t.Errorf("abandoned run did bookkeeping: %+v cursor %s", c, h.cursor())
+			if n := h.count("sleep_sessions", h.user.ID); n != 0 {
+				t.Errorf("abandoned run wrote %d sleep sessions", n)
+			}
+			if h.countMetric(domain.MetricHeartRate) != 0 {
+				t.Error("kept ingesting after the run was abandoned")
+			}
+			after := h.connection()
+			if after.Status != domain.ConnectionActive || !after.NextSyncAt.Equal(before.NextSyncAt) ||
+				after.LastSyncedAt != nil || strings.Contains(h.cursor(), "synced_through") {
+				t.Errorf("abandoned run changed the connection: %+v cursor %s", after, h.cursor())
+			}
+		})
 	}
 }
 
@@ -781,7 +845,7 @@ func TestHeartbeat_KeepsLongRunsFromLookingStale(t *testing.T) {
 // failingFinish makes the audit row impossible to close.
 type failingFinish struct{ *store.Store }
 
-func (failingFinish) FinishSyncRun(context.Context, uuid.UUID, uuid.UUID, domain.SyncStatus, int32, string) (domain.SyncRun, error) {
+func (failingFinish) FinishConnectionSyncRun(context.Context, domain.SyncRun, uuid.UUID, store.SyncResult) (domain.SyncRun, error) {
 	return domain.SyncRun{}, errors.New("connection reset")
 }
 
@@ -792,16 +856,15 @@ func TestFinishFailure_StillIdentifiesTheRun(t *testing.T) {
 		t.Fatalf("run %s, err %v; want the started run's ID with an error", run.ID, err)
 	}
 	// RunDue must treat it as a bookkeeping failure, not reschedule a run that never started.
-	before := h.connection()
 	h.isolateDue(h.conn)
-	h.now = before.NextSyncAt.Add(time.Minute)
+	due := h.connection().NextSyncAt
 	if _, err := testPool.Exec(h.ctx, `UPDATE sync_runs SET status = 'failed', finished_at = now() WHERE user_id = $1 AND status = 'running'`, h.user.ID); err != nil {
 		t.Fatal(err)
 	}
 	if done, err := h.syncer.RunDue(h.ctx); err != nil || done != 0 {
 		t.Fatalf("RunDue = %d, %v", done, err)
 	}
-	if after := h.connection(); !after.NextSyncAt.After(h.now.Add(2 * time.Hour)) {
-		t.Errorf("next sync %s: a run that ingested data was pushed back as if it never started", after.NextSyncAt)
+	if after := h.connection(); !after.NextSyncAt.Equal(due) {
+		t.Errorf("next sync = %s, want original due time %s after a failed finish", after.NextSyncAt, due)
 	}
 }

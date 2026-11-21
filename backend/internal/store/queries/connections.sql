@@ -11,6 +11,12 @@ SELECT id, user_id, provider, status, scopes, next_sync_at, last_synced_at, crea
 FROM provider_connections
 WHERE user_id = @user_id AND provider = @provider;
 
+-- name: LockConnectionForSync :one
+SELECT id, status, next_sync_at, sync_cursor
+FROM provider_connections
+WHERE user_id = @user_id AND provider = @provider
+FOR UPDATE;
+
 -- name: GetConnectionSyncCursor :one
 SELECT sync_cursor
 FROM provider_connections
@@ -28,6 +34,12 @@ WHERE id = @id AND user_id = @user_id;
 UPDATE provider_connections
 SET next_sync_at = @next_sync_at, updated_at = now()
 WHERE id = @id AND user_id = @user_id;
+
+-- name: RescheduleDueConnection :exec
+UPDATE provider_connections
+SET next_sync_at = @next_sync_at, updated_at = now()
+WHERE id = @id AND user_id = @user_id
+  AND status = 'active' AND next_sync_at <= @due_at;
 
 -- name: SetConnectionStatus :execrows
 UPDATE provider_connections

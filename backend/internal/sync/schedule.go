@@ -107,10 +107,9 @@ func chunkDates(r domain.DateRange, n int) []domain.DateRange {
 // localSpan is the instant range covering local days r in loc:
 // [midnight of r.Start, midnight after r.End).
 func localSpan(r domain.DateRange, loc *time.Location) domain.TimeRange {
-	after := r.End.AddDays(1)
 	return domain.TimeRange{
-		Start: time.Date(r.Start.Year, r.Start.Month, r.Start.Day, 0, 0, 0, 0, loc),
-		End:   time.Date(after.Year, after.Month, after.Day, 0, 0, 0, 0, loc),
+		Start: r.Start.StartIn(loc),
+		End:   r.End.AddDays(1).StartIn(loc),
 	}
 }
 
