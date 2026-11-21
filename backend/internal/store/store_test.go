@@ -92,6 +92,25 @@ func TestMigrations_UpDownUp(t *testing.T) {
 	}
 }
 
+func TestMigrations_RedactURLPasswords(t *testing.T) {
+	u := url.URL{Scheme: "postgres", User: url.UserPassword("pulse", "user/test+secret"), Host: "localhost", Path: "/pulse"}
+	query := url.Values{
+		"password":            {"query/test secret"},
+		"sslmode":             {"disable"},
+		"x-statement-timeout": {"query/test secret"}, // the driver includes the invalid value in its error
+	}
+	u.RawQuery = query.Encode()
+	err := store.MigrateUp(u.String())
+	if err == nil || !strings.Contains(err.Error(), "invalid syntax") {
+		t.Fatal("expected the invalid migration option error")
+	}
+	for _, secret := range []string{"user/test+secret", "user%2Ftest+secret", "query/test secret", "query%2Ftest+secret"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Error("migration error exposed a password")
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // users
 // ---------------------------------------------------------------------------
@@ -409,6 +428,11 @@ func TestSleep_ListGroupsStagesPerSessionNewestFirst(t *testing.T) {
 		if g.Stages == nil {
 			t.Errorf("%s: stages must be an empty slice, not nil", g.ProviderSessionID)
 		}
+		for i := 1; i < len(g.Stages); i++ {
+			if !g.Stages[i-1].StartAt.Before(g.Stages[i].StartAt) {
+				t.Errorf("%s: stages must be chronological", g.ProviderSessionID)
+			}
+		}
 	}
 	if stagesBy["n1"] != 2 || stagesBy["n2"] != 1 || stagesBy["nap"] != 0 {
 		t.Fatalf("stages grouped wrongly: %v", stagesBy)
@@ -443,6 +467,28 @@ func TestUpserts_RejectZeroValues(t *testing.T) {
 	}
 	if _, err := testStore.UpsertDailySummaries(ctx, u.ID, []domain.DailySummary{{Date: mustDate(t, "2026-11-20")}}); err == nil {
 		t.Error("empty provider must be rejected")
+	}
+}
+
+func TestUpserts_RejectImpossibleDates(t *testing.T) {
+	ctx := ctxT(t)
+	u := newUser(t)
+	day := mustDate(t, "2026-03-02")
+	if _, err := testStore.UpsertDailySummaries(ctx, u.ID, []domain.DailySummary{{Provider: mock, Date: day, Steps: ptr[int32](10)}}); err != nil {
+		t.Fatal(err)
+	}
+	invalid := domain.Date{Year: 2026, Month: time.February, Day: 30}
+	if _, err := testStore.UpsertDailySummaries(ctx, u.ID, []domain.DailySummary{{Provider: mock, Date: invalid}}); err == nil {
+		t.Error("invalid date must be rejected")
+	}
+	got, err := testStore.ListDailySummaries(ctx, u.ID, mock, domain.DateRange{Start: day, End: day})
+	if err != nil || len(got) != 1 || got[0].Steps == nil || *got[0].Steps != 10 {
+		t.Fatalf("valid summary changed after invalid write: %v %+v", err, got)
+	}
+	bad := night(t, "invalid-date", t0, domain.SleepStageLight)
+	bad.SleepDate = invalid
+	if _, err := testStore.UpsertSleepSessions(ctx, u.ID, []domain.SleepSession{bad}); err == nil {
+		t.Error("invalid sleep date must be rejected")
 	}
 }
 
@@ -522,6 +568,13 @@ func TestConnections_DueForSyncListsOnlyActiveDue(t *testing.T) {
 	}
 	if dueIDs(t, now.Add(12*time.Hour))[ca.ID] {
 		t.Fatal("connection must not be due before next_sync_at")
+	}
+	cursor, err := testStore.GetConnectionSyncCursor(ctx, a.ID, ca.ID)
+	if err != nil || !strings.Contains(string(cursor), "2026-11-20") {
+		t.Fatalf("owner must get the stored cursor: %v %s", err, cursor)
+	}
+	if _, err := testStore.GetConnectionSyncCursor(ctx, b.ID, ca.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("another user must get ErrNotFound, got %v", err)
 	}
 	info, err := testStore.GetConnection(ctx, a.ID, mock)
 	if err != nil {

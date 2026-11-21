@@ -25,17 +25,12 @@ SELECT @session_id::uuid, @user_id::uuid,
        unnest(@stage::varchar[]), unnest(@start_at::timestamptz[]), unnest(@end_at::timestamptz[]);
 
 -- name: ListSleepSessions :many
-SELECT id, provider, provider_session_id, sleep_date, start_at, end_at,
-       is_main_sleep, efficiency_pct
-FROM sleep_sessions
-WHERE user_id = @user_id
-  AND provider = @provider
-  AND sleep_date BETWEEN @start_date AND @end_date
-ORDER BY sleep_date DESC, start_at DESC;
-
--- name: ListSleepStagesForSessions :many
-SELECT session_id, stage, start_at, end_at
-FROM sleep_stages
-WHERE user_id = @user_id
-  AND session_id = ANY(@session_ids::uuid[])
-ORDER BY session_id, start_at;
+SELECT ss.id, ss.provider, ss.provider_session_id, ss.sleep_date, ss.start_at, ss.end_at,
+       ss.is_main_sleep, ss.efficiency_pct, st.stage, st.start_at AS stage_start_at,
+       st.end_at AS stage_end_at
+FROM sleep_sessions ss
+LEFT JOIN sleep_stages st ON st.session_id = ss.id AND st.user_id = ss.user_id
+WHERE ss.user_id = @user_id
+  AND ss.provider = @provider
+  AND ss.sleep_date BETWEEN @start_date AND @end_date
+ORDER BY ss.sleep_date DESC, ss.start_at DESC, ss.id, st.start_at;

@@ -20,12 +20,10 @@ type ConnectionInfo struct {
 }
 
 // DueConnection identifies a connection the nightly scheduler should sync.
-// It deliberately carries no health data or tokens (AGENTS.md §1.1).
 type DueConnection struct {
-	ID         uuid.UUID
-	UserID     uuid.UUID
-	Provider   Provider
-	SyncCursor []byte // provider-specific JSON
+	ID       uuid.UUID
+	UserID   uuid.UUID
+	Provider Provider
 }
 
 // SyncTrigger records why a sync run started.

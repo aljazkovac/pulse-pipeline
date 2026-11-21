@@ -51,6 +51,18 @@ func TestRanges_Validate(t *testing.T) {
 	if err := (domain.DateRange{Start: d, End: d.AddDays(-1)}).Validate(); err == nil {
 		t.Error("inverted date range must be invalid")
 	}
+	for _, invalid := range []domain.Date{
+		{},
+		{Year: 2026, Month: time.November},
+		{Year: 2026, Month: time.February, Day: 29},
+	} {
+		if err := (domain.DateRange{Start: invalid, End: d}).Validate(); err == nil {
+			t.Errorf("invalid start must be rejected: %#v", invalid)
+		}
+		if err := (domain.DateRange{Start: d.AddDays(-365), End: invalid}).Validate(); err == nil {
+			t.Errorf("invalid end must be rejected: %#v", invalid)
+		}
+	}
 	now := time.Now()
 	if err := (domain.TimeRange{Start: now, End: now}).Validate(); err == nil {
 		t.Error("empty time range must be invalid")

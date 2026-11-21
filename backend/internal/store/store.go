@@ -105,6 +105,15 @@ func (s *Store) GetConnection(ctx context.Context, userID uuid.UUID, provider do
 	return connectionInfo(row), nil
 }
 
+// GetConnectionSyncCursor returns the connection's provider-specific JSON cursor.
+func (s *Store) GetConnectionSyncCursor(ctx context.Context, userID, connectionID uuid.UUID) ([]byte, error) {
+	cursor, err := s.q.GetConnectionSyncCursor(ctx, db.GetConnectionSyncCursorParams{ID: connectionID, UserID: userID})
+	if err != nil {
+		return nil, fmt.Errorf("getting sync cursor for connection %s: %w", connectionID, notFound(err))
+	}
+	return cursor, nil
+}
+
 // MarkConnectionSynced records a successful sync and schedules the next one.
 // cursor is provider-specific JSON; nil stores an empty object. It returns
 // ErrNotFound if the connection does not belong to the user.
@@ -141,8 +150,7 @@ func (s *Store) SetConnectionStatus(ctx context.Context, userID, connectionID uu
 
 // ListConnectionsDueForSync is SYSTEM CONTEXT ONLY (AGENTS.md §1.1): it is the
 // single cross-user query, used by the nightly scheduler to decide which users
-// to process. It returns identifiers and sync cursors, never health data or
-// tokens. API and MCP handlers must not call it.
+// to process. It returns identifiers only. API and MCP handlers must not call it.
 func (s *Store) ListConnectionsDueForSync(ctx context.Context, now time.Time, limit int32) ([]domain.DueConnection, error) {
 	rows, err := s.q.ListConnectionsDueForSync(ctx, db.ListConnectionsDueForSyncParams{Now: now.UTC(), MaxRows: limit})
 	if err != nil {
@@ -150,7 +158,7 @@ func (s *Store) ListConnectionsDueForSync(ctx context.Context, now time.Time, li
 	}
 	out := make([]domain.DueConnection, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, domain.DueConnection{ID: r.ID, UserID: r.UserID, Provider: domain.Provider(r.Provider), SyncCursor: r.SyncCursor})
+		out = append(out, domain.DueConnection{ID: r.ID, UserID: r.UserID, Provider: domain.Provider(r.Provider)})
 	}
 	return out, nil
 }
@@ -174,8 +182,8 @@ func (s *Store) UpsertDailySummaries(ctx context.Context, userID uuid.UUID, summ
 		if d.Provider == "" {
 			return 0, fmt.Errorf("upserting daily summary %s: provider is required", d.Date)
 		}
-		if d.Date.IsZero() {
-			return 0, errors.New("upserting daily summary: date is required")
+		if err := d.Date.Validate(); err != nil {
+			return 0, fmt.Errorf("upserting daily summary: %w", err)
 		}
 	}
 	err := s.inTx(ctx, func(q *db.Queries) error {
@@ -357,10 +365,11 @@ func validateSleepSession(ss domain.SleepSession) error {
 		return fmt.Errorf("sleep session %q: provider is required", ss.ProviderSessionID)
 	case ss.ProviderSessionID == "":
 		return errors.New("sleep session: provider session ID is required")
-	case ss.SleepDate.IsZero():
-		return fmt.Errorf("sleep session %q: sleep date is required", ss.ProviderSessionID)
 	case !ss.EndAt.After(ss.StartAt):
 		return fmt.Errorf("sleep session %q: end must be after start", ss.ProviderSessionID)
+	}
+	if err := ss.SleepDate.Validate(); err != nil {
+		return fmt.Errorf("sleep session %q: invalid sleep date: %w", ss.ProviderSessionID, err)
 	}
 	seen := make(map[int64]bool, len(ss.Stages))
 	for _, st := range ss.Stages {
@@ -391,33 +400,23 @@ func (s *Store) ListSleepSessions(ctx context.Context, userID uuid.UUID, provide
 	if err != nil {
 		return nil, fmt.Errorf("listing sleep sessions for user %s: %w", userID, err)
 	}
-	if len(rows) == 0 {
-		return []domain.SleepSession{}, nil
-	}
-
-	out := make([]domain.SleepSession, 0, len(rows))
-	byID := make(map[uuid.UUID]int, len(rows))
-	ids := make([]uuid.UUID, 0, len(rows))
+	// The query groups each session and its stages in the same snapshot.
+	out := []domain.SleepSession{}
 	for _, row := range rows {
-		byID[row.ID] = len(out)
-		ids = append(ids, row.ID)
-		out = append(out, domain.SleepSession{
-			ID: row.ID, Provider: domain.Provider(row.Provider), ProviderSessionID: row.ProviderSessionID,
-			SleepDate: fromPgDate(row.SleepDate), StartAt: row.StartAt.UTC(), EndAt: row.EndAt.UTC(),
-			IsMainSleep: row.IsMainSleep, EfficiencyPct: fromInt2(row.EfficiencyPct),
-			Stages: []domain.SleepStage{},
-		})
-	}
-
-	stages, err := s.q.ListSleepStagesForSessions(ctx, db.ListSleepStagesForSessionsParams{UserID: userID, SessionIds: ids})
-	if err != nil {
-		return nil, fmt.Errorf("listing sleep stages for user %s: %w", userID, err)
-	}
-	for _, st := range stages {
-		i := byID[st.SessionID]
-		out[i].Stages = append(out[i].Stages, domain.SleepStage{
-			Stage: domain.SleepStageType(st.Stage), StartAt: st.StartAt.UTC(), EndAt: st.EndAt.UTC(),
-		})
+		if len(out) == 0 || out[len(out)-1].ID != row.ID {
+			out = append(out, domain.SleepSession{
+				ID: row.ID, Provider: domain.Provider(row.Provider), ProviderSessionID: row.ProviderSessionID,
+				SleepDate: fromPgDate(row.SleepDate), StartAt: row.StartAt.UTC(), EndAt: row.EndAt.UTC(),
+				IsMainSleep: row.IsMainSleep, EfficiencyPct: fromInt2(row.EfficiencyPct),
+				Stages: []domain.SleepStage{},
+			})
+		}
+		if row.Stage.Valid {
+			session := &out[len(out)-1]
+			session.Stages = append(session.Stages, domain.SleepStage{
+				Stage: domain.SleepStageType(row.Stage.String), StartAt: row.StageStartAt.UTC(), EndAt: row.StageEndAt.UTC(),
+			})
+		}
 	}
 	return out, nil
 }
@@ -430,9 +429,6 @@ func (s *Store) ListSleepSessions(ctx context.Context, userID uuid.UUID, provide
 func (s *Store) StartSyncRun(ctx context.Context, userID uuid.UUID, provider domain.Provider, trigger domain.SyncTrigger, r domain.DateRange) (domain.SyncRun, error) {
 	if err := r.Validate(); err != nil {
 		return domain.SyncRun{}, fmt.Errorf("starting sync run: %w", err)
-	}
-	if r.Start.IsZero() {
-		return domain.SyncRun{}, errors.New("starting sync run: date range is required")
 	}
 	row, err := s.q.CreateSyncRun(ctx, db.CreateSyncRunParams{
 		UserID: userID, Provider: string(provider), Trigger: string(trigger),

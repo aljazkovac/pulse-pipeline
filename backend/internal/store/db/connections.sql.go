@@ -54,6 +54,24 @@ func (q *Queries) CreateProviderConnection(ctx context.Context, arg CreateProvid
 	return i, err
 }
 
+const getConnectionSyncCursor = `-- name: GetConnectionSyncCursor :one
+SELECT sync_cursor
+FROM provider_connections
+WHERE id = $1 AND user_id = $2
+`
+
+type GetConnectionSyncCursorParams struct {
+	ID     uuid.UUID
+	UserID uuid.UUID
+}
+
+func (q *Queries) GetConnectionSyncCursor(ctx context.Context, arg GetConnectionSyncCursorParams) ([]byte, error) {
+	row := q.db.QueryRow(ctx, getConnectionSyncCursor, arg.ID, arg.UserID)
+	var sync_cursor []byte
+	err := row.Scan(&sync_cursor)
+	return sync_cursor, err
+}
+
 const getProviderConnection = `-- name: GetProviderConnection :one
 SELECT id, user_id, provider, status, scopes, next_sync_at, last_synced_at, created_at
 FROM provider_connections
@@ -93,7 +111,7 @@ func (q *Queries) GetProviderConnection(ctx context.Context, arg GetProviderConn
 }
 
 const listConnectionsDueForSync = `-- name: ListConnectionsDueForSync :many
-SELECT id, user_id, provider, sync_cursor
+SELECT id, user_id, provider
 FROM provider_connections
 WHERE status = 'active' AND next_sync_at <= $1
 ORDER BY next_sync_at
@@ -106,14 +124,13 @@ type ListConnectionsDueForSyncParams struct {
 }
 
 type ListConnectionsDueForSyncRow struct {
-	ID         uuid.UUID
-	UserID     uuid.UUID
-	Provider   string
-	SyncCursor []byte
+	ID       uuid.UUID
+	UserID   uuid.UUID
+	Provider string
 }
 
 // SYSTEM CONTEXT (AGENTS.md §1.1 exception): the only cross-user query.
-// Returns identifiers and sync state only, never health data or tokens.
+// Returns identifiers only.
 // Must not be reachable from API or MCP handlers.
 func (q *Queries) ListConnectionsDueForSync(ctx context.Context, arg ListConnectionsDueForSyncParams) ([]ListConnectionsDueForSyncRow, error) {
 	rows, err := q.db.Query(ctx, listConnectionsDueForSync, arg.Now, arg.MaxRows)
@@ -124,12 +141,7 @@ func (q *Queries) ListConnectionsDueForSync(ctx context.Context, arg ListConnect
 	items := []ListConnectionsDueForSyncRow{}
 	for rows.Next() {
 		var i ListConnectionsDueForSyncRow
-		if err := rows.Scan(
-			&i.ID,
-			&i.UserID,
-			&i.Provider,
-			&i.SyncCursor,
-		); err != nil {
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Provider); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

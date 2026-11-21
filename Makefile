@@ -21,7 +21,7 @@ setup-tools: ## Install required Go & local CLI tools via Homebrew (macOS)
 	brew install go golangci-lint golang-migrate sqlc
 
 up: ## Start local infrastructure (PostgreSQL 17, Flipt, Prometheus, Grafana)
-	docker compose up -d
+	docker compose up --wait
 
 down: ## Stop local infrastructure containers
 	docker compose down
@@ -44,11 +44,13 @@ generate: ## Regenerate sqlc code in backend/internal/store/db from SQL queries 
 generate-check: ## Fail if committed sqlc code is out of date with the SQL (run in CI)
 	cd backend && sqlc diff
 
+migrate-up migrate-down: export PULSE_MIGRATION_DATABASE_URL := $(value DATABASE_URL)
+
 migrate-up: ## Apply all database migrations to DATABASE_URL (default: local docker-compose Postgres)
-	migrate -path backend/migrations -database "$(DATABASE_URL)" up
+	@migrate -path backend/migrations -database "$${PULSE_MIGRATION_DATABASE_URL}" up
 
 migrate-down: ## Revert the most recent database migration on DATABASE_URL
-	migrate -path backend/migrations -database "$(DATABASE_URL)" down 1
+	@migrate -path backend/migrations -database "$${PULSE_MIGRATION_DATABASE_URL}" down 1
 
 build: ## Build Go backend and MCP binaries (and web/ bundle when present)
 	cd backend && go build -o ../bin/pulse-api ./cmd/api

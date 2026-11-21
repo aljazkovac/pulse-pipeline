@@ -57,13 +57,15 @@ func (q *Queries) InsertSleepStages(ctx context.Context, arg InsertSleepStagesPa
 }
 
 const listSleepSessions = `-- name: ListSleepSessions :many
-SELECT id, provider, provider_session_id, sleep_date, start_at, end_at,
-       is_main_sleep, efficiency_pct
-FROM sleep_sessions
-WHERE user_id = $1
-  AND provider = $2
-  AND sleep_date BETWEEN $3 AND $4
-ORDER BY sleep_date DESC, start_at DESC
+SELECT ss.id, ss.provider, ss.provider_session_id, ss.sleep_date, ss.start_at, ss.end_at,
+       ss.is_main_sleep, ss.efficiency_pct, st.stage, st.start_at AS stage_start_at,
+       st.end_at AS stage_end_at
+FROM sleep_sessions ss
+LEFT JOIN sleep_stages st ON st.session_id = ss.id AND st.user_id = ss.user_id
+WHERE ss.user_id = $1
+  AND ss.provider = $2
+  AND ss.sleep_date BETWEEN $3 AND $4
+ORDER BY ss.sleep_date DESC, ss.start_at DESC, ss.id, st.start_at
 `
 
 type ListSleepSessionsParams struct {
@@ -82,6 +84,9 @@ type ListSleepSessionsRow struct {
 	EndAt             time.Time
 	IsMainSleep       bool
 	EfficiencyPct     pgtype.Int2
+	Stage             pgtype.Text
+	StageStartAt      *time.Time
+	StageEndAt        *time.Time
 }
 
 func (q *Queries) ListSleepSessions(ctx context.Context, arg ListSleepSessionsParams) ([]ListSleepSessionsRow, error) {
@@ -107,51 +112,9 @@ func (q *Queries) ListSleepSessions(ctx context.Context, arg ListSleepSessionsPa
 			&i.EndAt,
 			&i.IsMainSleep,
 			&i.EfficiencyPct,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listSleepStagesForSessions = `-- name: ListSleepStagesForSessions :many
-SELECT session_id, stage, start_at, end_at
-FROM sleep_stages
-WHERE user_id = $1
-  AND session_id = ANY($2::uuid[])
-ORDER BY session_id, start_at
-`
-
-type ListSleepStagesForSessionsParams struct {
-	UserID     uuid.UUID
-	SessionIds []uuid.UUID
-}
-
-type ListSleepStagesForSessionsRow struct {
-	SessionID uuid.UUID
-	Stage     string
-	StartAt   time.Time
-	EndAt     time.Time
-}
-
-func (q *Queries) ListSleepStagesForSessions(ctx context.Context, arg ListSleepStagesForSessionsParams) ([]ListSleepStagesForSessionsRow, error) {
-	rows, err := q.db.Query(ctx, listSleepStagesForSessions, arg.UserID, arg.SessionIds)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ListSleepStagesForSessionsRow{}
-	for rows.Next() {
-		var i ListSleepStagesForSessionsRow
-		if err := rows.Scan(
-			&i.SessionID,
 			&i.Stage,
-			&i.StartAt,
-			&i.EndAt,
+			&i.StageStartAt,
+			&i.StageEndAt,
 		); err != nil {
 			return nil, err
 		}

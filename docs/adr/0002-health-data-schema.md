@@ -79,9 +79,9 @@ sync worker uses to refresh tokens. The cipher implementation lands with the
 ### 4. System-context query
 
 `ListConnectionsDueForSync` is the only cross-user query. It returns `(connection id, user_id,
-provider, sync_cursor)` for active connections with `next_sync_at <= now()` — never health data
-or tokens — and lives in a separately named store method that API and MCP handlers do not use
-(`AGENTS.md` §1.1 exception).
+provider)` for active connections with `next_sync_at <= now()`. The scheduler then reads each
+cursor through `GetConnectionSyncCursor`, scoped to the owning `user_id`. API and MCP handlers
+do not use the scheduler query (`AGENTS.md` §1.1 exception).
 
 ### 5. Go package contracts (`backend/internal/…`)
 

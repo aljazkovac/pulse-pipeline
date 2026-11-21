@@ -4,6 +4,7 @@
 package domain
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -87,6 +88,17 @@ func ParseDate(s string) (Date, error) {
 // IsZero reports whether d is the zero Date (unset).
 func (d Date) IsZero() bool { return d == Date{} }
 
+// Validate checks that d is a calendar day without normalizing its components.
+func (d Date) Validate() error {
+	if d.IsZero() {
+		return errors.New("date is required")
+	}
+	if DateOf(d.Time()) != d {
+		return fmt.Errorf("invalid date: year %d, month %d, day %d", d.Year, d.Month, d.Day)
+	}
+	return nil
+}
+
 // Time returns midnight of d in UTC, which is how dates cross the DB boundary.
 func (d Date) Time() time.Time {
 	return time.Date(d.Year, d.Month, d.Day, 0, 0, 0, 0, time.UTC)
@@ -106,8 +118,14 @@ type DateRange struct {
 	End   Date
 }
 
-// Validate reports an error if the range is inverted.
+// Validate reports an error if either date is invalid or the range is inverted.
 func (r DateRange) Validate() error {
+	if err := r.Start.Validate(); err != nil {
+		return fmt.Errorf("invalid range start: %w", err)
+	}
+	if err := r.End.Validate(); err != nil {
+		return fmt.Errorf("invalid range end: %w", err)
+	}
 	if r.End.Before(r.Start) {
 		return fmt.Errorf("invalid date range: end %s before start %s", r.End, r.Start)
 	}

@@ -11,6 +11,11 @@ SELECT id, user_id, provider, status, scopes, next_sync_at, last_synced_at, crea
 FROM provider_connections
 WHERE user_id = @user_id AND provider = @provider;
 
+-- name: GetConnectionSyncCursor :one
+SELECT sync_cursor
+FROM provider_connections
+WHERE id = @id AND user_id = @user_id;
+
 -- name: MarkConnectionSynced :execrows
 UPDATE provider_connections
 SET last_synced_at = @last_synced_at,
@@ -25,10 +30,10 @@ SET status = @status, updated_at = now()
 WHERE id = @id AND user_id = @user_id;
 
 -- SYSTEM CONTEXT (AGENTS.md §1.1 exception): the only cross-user query.
--- Returns identifiers and sync state only, never health data or tokens.
+-- Returns identifiers only.
 -- Must not be reachable from API or MCP handlers.
 -- name: ListConnectionsDueForSync :many
-SELECT id, user_id, provider, sync_cursor
+SELECT id, user_id, provider
 FROM provider_connections
 WHERE status = 'active' AND next_sync_at <= @now
 ORDER BY next_sync_at
