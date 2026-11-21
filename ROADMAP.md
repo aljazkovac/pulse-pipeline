@@ -88,7 +88,7 @@ Build the multi-user, multi-provider data foundation and nightly ingestion servi
   - [x] `sync_runs` (audit log of nightly pull jobs, status, records ingested, errors)
 - [x] Set up `sqlc` and `pgx` in `backend/` for type-safe SQL data access
 - [x] Define the `HealthProvider` adapter interface (`FetchDailySummaries`, `FetchIntradayMetrics`, `FetchSleepSessions`, `RefreshAuth`)
-- [ ] Implement a deterministic `MockHealthProvider` generating realistic synthetic health data for local dev and automated testing
+- [x] Implement a deterministic `MockHealthProvider` generating realistic synthetic health data for local dev and automated testing
 - [ ] Implement the `GoogleHealthProvider` (Google OAuth 2.0 flow + Google Health API client for Fitbit Air data, AES-256-GCM token encryption per ADR-0002 §3)
 - [ ] Build the nightly sync worker (idempotent upserts, retry/backoff, backfill support, manual trigger endpoint)
 - [ ] Write Go unit tests and Testcontainers-based PostgreSQL integration tests
