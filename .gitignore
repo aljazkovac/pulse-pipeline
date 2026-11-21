@@ -17,6 +17,10 @@ vendor/
 go.work
 go.work.sum
 
+# Python
+__pycache__/
+*.pyc
+
 # Node / Frontend / Docs
 node_modules/
 .pnpm-store/
