@@ -14,6 +14,7 @@ import (
 
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/domain"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/store"
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/testdb"
 )
 
 const mock = domain.ProviderMock
@@ -24,6 +25,7 @@ const mock = domain.ProviderMock
 
 func ctxT(t *testing.T) context.Context {
 	t.Helper()
+	testdb.Require(t, testPool)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 	return ctx

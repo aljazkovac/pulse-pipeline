@@ -152,6 +152,37 @@ func (q *Queries) ListConnectionsDueForSync(ctx context.Context, arg ListConnect
 	return items, nil
 }
 
+const lockConnectionForSync = `-- name: LockConnectionForSync :one
+SELECT id, status, next_sync_at, sync_cursor
+FROM provider_connections
+WHERE user_id = $1 AND provider = $2
+FOR UPDATE
+`
+
+type LockConnectionForSyncParams struct {
+	UserID   uuid.UUID
+	Provider string
+}
+
+type LockConnectionForSyncRow struct {
+	ID         uuid.UUID
+	Status     string
+	NextSyncAt time.Time
+	SyncCursor []byte
+}
+
+func (q *Queries) LockConnectionForSync(ctx context.Context, arg LockConnectionForSyncParams) (LockConnectionForSyncRow, error) {
+	row := q.db.QueryRow(ctx, lockConnectionForSync, arg.UserID, arg.Provider)
+	var i LockConnectionForSyncRow
+	err := row.Scan(
+		&i.ID,
+		&i.Status,
+		&i.NextSyncAt,
+		&i.SyncCursor,
+	)
+	return i, err
+}
+
 const markConnectionSynced = `-- name: MarkConnectionSynced :execrows
 UPDATE provider_connections
 SET last_synced_at = $1,
@@ -181,6 +212,50 @@ func (q *Queries) MarkConnectionSynced(ctx context.Context, arg MarkConnectionSy
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const rescheduleConnection = `-- name: RescheduleConnection :execrows
+UPDATE provider_connections
+SET next_sync_at = $1, updated_at = now()
+WHERE id = $2 AND user_id = $3
+`
+
+type RescheduleConnectionParams struct {
+	NextSyncAt time.Time
+	ID         uuid.UUID
+	UserID     uuid.UUID
+}
+
+func (q *Queries) RescheduleConnection(ctx context.Context, arg RescheduleConnectionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, rescheduleConnection, arg.NextSyncAt, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const rescheduleDueConnection = `-- name: RescheduleDueConnection :exec
+UPDATE provider_connections
+SET next_sync_at = $1, updated_at = now()
+WHERE id = $2 AND user_id = $3
+  AND status = 'active' AND next_sync_at <= $4
+`
+
+type RescheduleDueConnectionParams struct {
+	NextSyncAt time.Time
+	ID         uuid.UUID
+	UserID     uuid.UUID
+	DueAt      time.Time
+}
+
+func (q *Queries) RescheduleDueConnection(ctx context.Context, arg RescheduleDueConnectionParams) error {
+	_, err := q.db.Exec(ctx, rescheduleDueConnection,
+		arg.NextSyncAt,
+		arg.ID,
+		arg.UserID,
+		arg.DueAt,
+	)
+	return err
 }
 
 const setConnectionStatus = `-- name: SetConnectionStatus :execrows
