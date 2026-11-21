@@ -45,13 +45,20 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       # Blocks .env files, keys and credential JSON added anywhere in the
-      # branch history, even if a later commit removed them. Test/lint run in
+      # branch/pushed history, even if a later commit removed them. Test/lint run in
       # the build-test-lint job, so make targets are skipped here.
       - name: Run PR gatekeeper (forbidden files only)
-        run: >-
-          python3 .agents/skills/pr-reviewer/scripts/pr_gatekeeper.py
-          --skip-make --no-fetch --base "${BASE_REF}"
+        run: |
+          if [ "$EVENT_NAME" = "push" ]; then
+            python3 .agents/skills/pr-reviewer/scripts/pr_gatekeeper.py \
+              --skip-make --no-fetch --push-before "$PUSH_BEFORE"
+          else
+            python3 .agents/skills/pr-reviewer/scripts/pr_gatekeeper.py \
+              --skip-make --no-fetch --base "$BASE_REF"
+          fi
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
           BASE_REF: ${{ github.base_ref || 'main' }}
 
   build-test-lint:

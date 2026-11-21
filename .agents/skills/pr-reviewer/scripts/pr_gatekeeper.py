@@ -8,7 +8,8 @@ runtime or in CI:
     python3 .agents/skills/pr-reviewer/scripts/pr_gatekeeper.py [--base main]
 
 Steps:
-  1. Fetch the base branch (best effort) and compute the merge-base.
+  1. Compute the merge-base, or use the push event's previous commit directly
+     (--push-before). An all-zero previous SHA scans the full initial history.
   2. Collect every file added or modified since the merge-base: in any commit
      on the branch (even if a later commit removed it), staged, unstaged, or
      untracked. Deletions are ignored so removing a secret never blocks.
@@ -77,14 +78,16 @@ def resolve_base(repo: Path, remote: str, base: str, fetch: bool) -> tuple[str, 
     raise RuntimeError(f"neither {remote}/{base} nor {base} exists")
 
 
-def changed_files(repo: Path, merge_base: str) -> list[str]:
+def changed_files(repo: Path, merge_base: str | None) -> list[str]:
     """Files added or modified since merge_base, in history, index, or working tree.
 
     Each commit is inspected separately so a file added in one commit and
     removed in a later one is still reported: it remains in the pushed history.
+    None scans all history, including files introduced in root commits.
     """
     history = git(
-        repo, "log", "--name-only", "--format=", "--diff-filter=d", f"{merge_base}..HEAD"
+        repo, "log", "--root", "--name-only", "--format=", "--diff-filter=d",
+        f"{merge_base}..HEAD" if merge_base else "HEAD",
     ).splitlines()
     staged = git(repo, "diff", "--cached", "--name-only", "--diff-filter=d").splitlines()
     unstaged = git(repo, "diff", "--name-only", "--diff-filter=d").splitlines()
@@ -126,6 +129,10 @@ def run_make(repo: Path, target: str) -> CheckResult:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--base", default="main", help="base branch (default: main)")
+    parser.add_argument(
+        "--push-before",
+        help="push event's previous commit SHA; all zeros scans the full initial history",
+    )
     parser.add_argument("--remote", default="origin", help="remote (default: origin)")
     parser.add_argument("--no-fetch", action="store_true", help="do not fetch the base branch")
     parser.add_argument(
@@ -135,7 +142,14 @@ def main() -> int:
 
     try:
         repo = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
-        merge_base, warnings = resolve_base(repo, args.remote, args.base, not args.no_fetch)
+        if args.push_before is not None:
+            warnings = []
+            if args.push_before == "0" * 40:
+                merge_base = None
+            else:
+                merge_base = git(repo, "rev-parse", "--verify", f"{args.push_before}^{{commit}}")
+        else:
+            merge_base, warnings = resolve_base(repo, args.remote, args.base, not args.no_fetch)
         files = changed_files(repo, merge_base)
         dimensions = DIMENSIONS_FILE.read_text(encoding="utf-8")
     except (RuntimeError, OSError) as err:
@@ -152,9 +166,15 @@ def main() -> int:
     print("# PR Gatekeeper Report\n")
     for warning in warnings:
         print(f"WARNING: {warning}")
-    print(f"Base: {args.remote}/{args.base} (merge-base {merge_base[:12]})")
+    if args.push_before is not None:
+        print(f"Push boundary: {merge_base or 'initial push (full history)'}")
+    else:
+        print(f"Base: {args.remote}/{args.base} (merge-base {merge_base[:12]})")
     print("Review diffs (plus untracked files below):")
-    print(f"  Committed: git diff {merge_base} HEAD")
+    if merge_base:
+        print(f"  Committed: git diff {merge_base} HEAD")
+    else:
+        print("  Committed: git log --root -p HEAD")
     print("  Staged: git diff --cached")
     print("  Unstaged: git diff\n")
 
