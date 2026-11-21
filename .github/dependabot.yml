@@ -1,0 +1,21 @@
+# Keeps SHA-pinned GitHub Actions and Go modules up to date.
+# Add an `npm` entry for /web once web/package.json exists.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directories:
+      - /backend
+      - /mcp
+    schedule:
+      interval: weekly
+    groups:
+      go-modules:
+        patterns: ["*"]

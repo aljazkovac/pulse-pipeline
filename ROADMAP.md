@@ -72,7 +72,7 @@ Establish the monorepo layout, local development tooling, quality gates, and cus
   - [x] **Coder Agent:** Implements features following Go and TypeScript conventions
   - [x] **QA / Spec Agent:** Authors test specifications and Playwright E2E scenarios
   - [x] **PR Reviewer / Gatekeeper Agent:** Enforces code quality, security, and test coverage
-- [ ] Configure GitHub Actions CI pipeline (linting, type-checking, unit/integration test gates)
+- [x] Configure GitHub Actions CI pipeline (linting, type-checking, unit/integration test gates)
 
 ---
 
