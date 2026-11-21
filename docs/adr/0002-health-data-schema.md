@@ -112,6 +112,17 @@ Providers return normalized domain values only; raw Google Health JSON never lea
 (`embed.FS`), so the worker, tests and a `make migrate-up` target all apply the same files.
 Every `up` migration has a matching `down`.
 
+## Implementation Status
+
+This ADR records decisions; it is delivered across several PRs.
+
+| Section | Status |
+| :--- | :--- |
+| §1 Tables, §2 Indexes, §4 System-context query, §6 Migrations | Implemented (migration `000001`, `store`, Testcontainers tests). |
+| §5 `domain` types + `HealthProvider` interface, `store` package | Implemented. |
+| §3 Token storage | Columns only. AES-256-GCM cipher, `TOKEN_ENCRYPTION_KEY`, and the token read/write queries land with `GoogleHealthProvider`. |
+| §5 `provider/mock`, `provider/googlehealth`, `sync` | Pending (next Phase 1 PRs). Migrations will be applied by the worker at startup then. |
+
 ## Consequences
 
 - **Positive:** Re-running any sync converges (upserts on natural keys); deleting a user cascades

@@ -24,6 +24,7 @@ concurrency:
 
 env:
   GOLANGCI_LINT_VERSION: v2.15.0
+  SQLC_VERSION: "1.31.1"
   PYTHON_VERSION: "3.13"
   NODE_VERSION: "22"
 
@@ -60,6 +61,26 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PUSH_BEFORE: ${{ github.event.before }}
           BASE_REF: ${{ github.base_ref || 'main' }}
+
+  sqlc-drift:
+    name: sqlc generated code up to date
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up sqlc
+        uses: sqlc-dev/setup-sqlc@bac53b7fb28c039a6c7f5736fd1e89744021bdd6 # v5.0.0
+        with:
+          sqlc-version: ${{ env.SQLC_VERSION }}
+
+      # Fails when backend/internal/store/db differs from what the SQL queries
+      # and migrations generate, i.e. someone forgot `make generate`.
+      - name: Check for drift
+        run: make generate-check
 
   build-test-lint:
     name: Build, test & lint

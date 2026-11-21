@@ -1,4 +1,4 @@
-.PHONY: help setup-tools up down ps logs clean build test lint e2e db-shell generate migrate-up migrate-down
+.PHONY: help setup-tools up down ps logs clean build test lint e2e db-shell generate generate-check migrate-up migrate-down
 
 # web/ targets activate once web/package.json exists. The package must define the
 # scripts `build`, `typecheck` (tsc --noEmit, strict), `lint` (ESLint incl.
@@ -40,6 +40,9 @@ db-shell: ## Open a psql interactive shell in the local PostgreSQL container
 
 generate: ## Regenerate sqlc code in backend/internal/store/db from SQL queries + migrations
 	cd backend && sqlc generate
+
+generate-check: ## Fail if committed sqlc code is out of date with the SQL (run in CI)
+	cd backend && sqlc diff
 
 migrate-up: ## Apply all database migrations to DATABASE_URL (default: local docker-compose Postgres)
 	migrate -path backend/migrations -database "$(DATABASE_URL)" up
