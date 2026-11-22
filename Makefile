@@ -68,9 +68,10 @@ ifneq ($(WEB_PACKAGE),)
 	cd web && $(WEB_PM) run test
 endif
 
+# Use testdb's CI mode to fail if the integration database cannot start.
 cover: ## Backend coverage across packages (needs Docker); report in bin/coverage.html
 	@mkdir -p bin
-	cd backend && go test -race -coverpkg=./... -coverprofile=../bin/coverage.out ./...
+	cd backend && CI=1 go test -count=1 -race -coverpkg=./... -coverprofile=../bin/coverage.out ./...
 	cd backend && go tool cover -html=../bin/coverage.out -o ../bin/coverage.html
 	@cd backend && go tool cover -func=../bin/coverage.out | tail -1
 

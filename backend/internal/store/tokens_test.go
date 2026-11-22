@@ -126,8 +126,16 @@ func TestLinkConnection_CreatesThenReactivates(t *testing.T) {
 		t.Fatalf("relink: id %s (want %s), err %v", again, id, err)
 	}
 	info, err = testStore.GetConnection(ctx, u.ID, gh)
-	if err != nil || info.Status != domain.ConnectionActive || len(info.Scopes) != 2 || info.NextSyncAt.After(time.Now()) {
+	if err != nil || info.Status != domain.ConnectionActive || len(info.Scopes) != 2 {
 		t.Fatalf("relinked connection: %v %+v", err, info)
+	}
+	// LinkConnection schedules the sync using PostgreSQL's clock.
+	var databaseNow time.Time
+	if err := testPool.QueryRow(ctx, "SELECT now()").Scan(&databaseNow); err != nil {
+		t.Fatalf("reading database time: %v", err)
+	}
+	if info.NextSyncAt.After(databaseNow) {
+		t.Fatalf("relinked connection due at %v, after database time %v", info.NextSyncAt, databaseNow)
 	}
 	raw, err := testStore.GetConnectionSyncCursor(ctx, u.ID, id)
 	if err != nil || !bytes.Contains(raw, []byte("2026-11-19")) {

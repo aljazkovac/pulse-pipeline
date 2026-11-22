@@ -21,9 +21,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/domain"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/store"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/testdb"
 )
+
+const testTimezone = "Europe/Stockholm"
 
 var (
 	testURL  string
@@ -60,7 +63,7 @@ func seedDev(t *testing.T, ctx context.Context) uuid.UUID {
 	t.Helper()
 	var out bytes.Buffer
 	email := fmt.Sprintf("worker-test-%s@example.com", uuid.NewString())
-	if err := run(ctx, []string{"seed-dev", "-email", email, "-tz", "Europe/Stockholm"}, devEnv(nil), &out, quietLogger()); err != nil {
+	if err := run(ctx, []string{"seed-dev", "-email", email, "-tz", testTimezone}, devEnv(nil), &out, quietLogger()); err != nil {
 		t.Fatalf("seed-dev: %v", err)
 	}
 	m := createdUser.FindStringSubmatch(out.String())
@@ -79,9 +82,7 @@ func count(t *testing.T, ctx context.Context, sql string, args ...any) int {
 	return n
 }
 
-// fingerprint hashes the user's ingested data that can no longer change: the
-// mock provider produces data up to "now", so today's rows legitimately grow
-// between two syncs a few seconds apart.
+// fingerprint hashes the user's settled data from before the cutoff.
 func fingerprint(t *testing.T, ctx context.Context, userID uuid.UUID, before time.Time) string {
 	t.Helper()
 	const q = `
@@ -90,12 +91,12 @@ SELECT
      FROM intraday_metrics WHERE user_id = $1 AND recorded_at < $2)
   || '|' ||
   (SELECT count(*) || ':' || coalesce(md5(string_agg(summary_date::text || coalesce(steps, -1)::text || coalesce(resting_heart_rate, -1)::text, ',' ORDER BY summary_date)), '')
-     FROM daily_summaries WHERE user_id = $1 AND summary_date < ($2 AT TIME ZONE 'Europe/Stockholm')::date)
+     FROM daily_summaries WHERE user_id = $1 AND summary_date < ($2 AT TIME ZONE $3)::date)
   || '|' ||
   (SELECT count(*) || ':' || coalesce(md5(string_agg(provider_session_id || start_at::text || end_at::text, ',' ORDER BY start_at)), '')
      FROM sleep_sessions WHERE user_id = $1 AND end_at < $2)`
 	var fp string
-	if err := testPool.QueryRow(ctx, q, userID, before).Scan(&fp); err != nil {
+	if err := testPool.QueryRow(ctx, q, userID, before, testTimezone).Scan(&fp); err != nil {
 		t.Fatalf("fingerprint: %v", err)
 	}
 	return fp
@@ -104,9 +105,13 @@ SELECT
 func TestWorker_SeedDevThenManualSyncIngestsIdempotently(t *testing.T) {
 	ctx := ctxT(t)
 	userID := seedDev(t, ctx)
-	// An hour back, nothing the mock emits can still change between the two
-	// syncs, whichever local day the cutoff falls on.
-	cutoff := time.Now().Add(-time.Hour)
+	loc, err := time.LoadLocation(testTimezone)
+	if err != nil {
+		t.Fatalf("load test timezone: %v", err)
+	}
+	// An overnight session can publish yesterday's HRV and SpO₂ samples
+	// when it ends today. Compare only data from before yesterday began.
+	cutoff := domain.DateOf(time.Now().In(loc)).AddDays(-1).StartIn(loc)
 
 	args := []string{"sync", "-user", userID.String(), "-provider", "mock"}
 	var out bytes.Buffer
@@ -116,13 +121,17 @@ func TestWorker_SeedDevThenManualSyncIngestsIdempotently(t *testing.T) {
 	if !strings.Contains(out.String(), ": succeeded, manual ") {
 		t.Fatalf("first sync output = %q", out.String())
 	}
+	if n := count(t, ctx, `SELECT count(*) FROM sync_runs WHERE user_id = $1
+		AND trigger = 'manual' AND status = 'succeeded' AND range_end - range_start = 29`, userID); n != 1 {
+		t.Errorf("succeeded manual runs covering 30 days = %d, want 1", n)
+	}
 	first := fingerprint(t, ctx, userID, cutoff)
 	if strings.HasPrefix(first, "0:") {
 		t.Fatalf("first sync ingested no intraday data: %s", first)
 	}
 	for _, table := range []string{"daily_summaries", "sleep_sessions"} {
-		if n := count(t, ctx, "SELECT count(*) FROM "+table+" WHERE user_id = $1", userID); n < 20 {
-			t.Errorf("%s: %d rows after a 30-day initial sync", table, n)
+		if n := count(t, ctx, "SELECT count(*) FROM "+table+" WHERE user_id = $1", userID); n == 0 {
+			t.Errorf("%s: no rows after the initial sync", table)
 		}
 	}
 
