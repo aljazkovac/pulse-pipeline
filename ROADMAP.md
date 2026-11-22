@@ -111,7 +111,7 @@ Add the authenticated read API the dashboards need, then build the responsive fr
 **2a — Slices**
 
 - [ ] **Overview Dashboard:** step goal ring (new `users.step_goal` setting), sleep duration (derived from sleep sessions), resting HR and HRV for the selected local day, last sync status; settings for timezone, step goal and primary provider (`PATCH /api/v1/me`)
-- [ ] **Sync & Connections View:** connections and recent `sync_runs`; Google Health web linking via a *Web application* OAuth client, reusing the ADR-0004 exchange, scope check and vault and recording the issuing client per connection; "Sync now" queues a manual run (`sync_requested_at`, `202 Accepted`) that the worker picks up on its next poll (amends ADR-0003 §5)
+- [ ] **Sync & Connections View:** connections and recent `sync_runs`; Google Health web linking via a _Web application_ OAuth client, reusing the ADR-0004 exchange, scope check and vault and recording the issuing client per connection; "Sync now" queues a manual run (`sync_requested_at`, `202 Accepted`) that the worker picks up on its next poll (amends ADR-0003 §5)
 
 **2b — Analytics & installability**
 
