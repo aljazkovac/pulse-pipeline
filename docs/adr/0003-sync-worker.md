@@ -27,8 +27,8 @@ Its constraints:
 
 `backend/internal/sync` holds the orchestrator (`Syncer`). It depends on a narrow `Store`
 interface (satisfied by `*store.Store`), a set of `domain.HealthProvider`s keyed by `Name()`, and a
-`CredentialStore` for decrypted OAuth tokens (`NoCredentials` until the encrypted store lands with
-`GoogleHealthProvider`, ADR-0002 §3). `cmd/worker` is thin wiring:
+`CredentialStore` for decrypted OAuth tokens (`credentials.Vault` when `TOKEN_ENCRYPTION_KEY` is
+set, ADR-0004 §4; `NoCredentials` otherwise). `cmd/worker` is thin wiring:
 
 | Command | Trigger | Behaviour |
 | :--- | :--- | :--- |
@@ -110,6 +110,6 @@ the Phase 2 Sync & Connections view, once the API authenticates requests.
   without advancing its cursor until the cause is fixed — visible as repeated `partial` runs. The
   overlap re-writes recent daily and sleep rows every night (intraday upserts skip unchanged
   values). No HTTP manual trigger until Phase 2 auth.
-- **Follow-ups:** `GoogleHealthProvider` supplies the encrypted `CredentialStore` and maps HTTP
-  errors onto `ErrTransient` / `ErrUnauthorized`; Phase 4 adds metrics for run duration, status and
-  rows ingested.
+- **Follow-ups:** Phase 4 adds metrics for run duration, status and rows ingested. (Done in
+  ADR-0004: the encrypted `CredentialStore`, Google's HTTP errors mapped onto `ErrTransient` /
+  `ErrUnauthorized`, and credentials re-checked for expiry before every unit.)

@@ -1,5 +1,6 @@
--- Non-secret connection columns only. Token ciphertext is read/written by
--- dedicated queries added with the GoogleHealthProvider (ADR-0002 §3).
+-- Non-secret connection columns only, except the token queries at the end of
+-- this file, which read and write AES-256-GCM ciphertext (ADR-0002 §3,
+-- ADR-0004). Plaintext tokens never reach SQL.
 
 -- name: CreateProviderConnection :one
 INSERT INTO provider_connections (user_id, provider, scopes)
@@ -55,3 +56,31 @@ FROM provider_connections
 WHERE status = 'active' AND next_sync_at <= @now
 ORDER BY next_sync_at
 LIMIT @max_rows;
+
+-- Token ciphertext (ADR-0002 §3). Only the credential vault uses these.
+
+-- name: GetConnectionTokens :one
+SELECT access_token_ciphertext, refresh_token_ciphertext, token_key_version, token_expires_at
+FROM provider_connections
+WHERE id = @id AND user_id = @user_id;
+
+-- name: SetConnectionTokens :execrows
+UPDATE provider_connections
+SET access_token_ciphertext  = @access_token_ciphertext,
+    refresh_token_ciphertext = @refresh_token_ciphertext,
+    token_key_version        = @token_key_version,
+    token_expires_at         = @token_expires_at,
+    updated_at               = now()
+WHERE id = @id AND user_id = @user_id;
+
+-- Links (or re-links) a provider account: the connection becomes active and
+-- due now, keeping its sync cursor so history is not re-fetched.
+-- name: UpsertConnectionForLink :one
+INSERT INTO provider_connections (user_id, provider, scopes)
+VALUES (@user_id, @provider, @scopes)
+ON CONFLICT (user_id, provider) DO UPDATE
+SET scopes       = EXCLUDED.scopes,
+    status       = 'active',
+    next_sync_at = now(),
+    updated_at   = now()
+RETURNING id;

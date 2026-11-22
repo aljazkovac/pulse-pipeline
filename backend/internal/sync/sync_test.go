@@ -682,6 +682,101 @@ func TestCredentials_RefreshedOnlyWhenAboutToExpire(t *testing.T) {
 	}
 }
 
+// tokenSpy records the access token each fetch sees and advances the clock,
+// so a run outlives its access token.
+type tokenSpy struct {
+	domain.HealthProvider
+	h    *harness
+	seen []string
+}
+
+func (s *tokenSpy) observe(c domain.Connection) {
+	s.seen = append(s.seen, c.Credentials.AccessToken)
+	s.h.now = s.h.now.Add(time.Minute)
+}
+
+func (s *tokenSpy) FetchDailySummaries(ctx context.Context, c domain.Connection, r domain.DateRange) ([]domain.DailySummary, error) {
+	s.observe(c)
+	return s.HealthProvider.FetchDailySummaries(ctx, c, r)
+}
+
+func (s *tokenSpy) FetchSleepSessions(ctx context.Context, c domain.Connection, r domain.DateRange) ([]domain.SleepSession, error) {
+	s.observe(c)
+	return s.HealthProvider.FetchSleepSessions(ctx, c, r)
+}
+
+func (s *tokenSpy) FetchIntradayMetrics(ctx context.Context, c domain.Connection, m domain.MetricType, r domain.TimeRange) ([]domain.IntradayPoint, error) {
+	s.observe(c)
+	return s.HealthProvider.FetchIntradayMetrics(ctx, c, m, r)
+}
+
+func TestCredentials_RefreshedMidRunBeforeTheyExpire(t *testing.T) {
+	// Valid for 8 minutes: not refreshed at the start (RefreshBefore is 5m),
+	// but each unit takes a minute, so it must be refreshed mid-run.
+	creds := &memCredentials{creds: domain.Credentials{AccessToken: "fake-access", RefreshToken: "fake-refresh", ExpiresAt: t0.Add(8 * time.Minute)}}
+	var spy *tokenSpy
+	h := newHarness(t,
+		func(_ *harness, c *sync.Config, _ *[]domain.HealthProvider) { c.Credentials = creds },
+		func(h *harness, _ *sync.Config, ps *[]domain.HealthProvider) {
+			spy = &tokenSpy{HealthProvider: h.mock, h: h}
+			*ps = []domain.HealthProvider{spy}
+		})
+
+	if run := h.sync(domain.SyncTriggerManual, nil); run.Status != domain.SyncSucceeded {
+		t.Fatalf("run = %+v", run)
+	}
+	if len(creds.saved) != 1 {
+		t.Fatalf("saved %d credentials, want exactly one mid-run refresh", len(creds.saved))
+	}
+	fresh := creds.saved[0].AccessToken
+	if len(spy.seen) < 5 || spy.seen[0] != "fake-access" || spy.seen[len(spy.seen)-1] != fresh {
+		t.Fatalf("tokens seen by units = %v; want the original first and the refreshed one last", spy.seen)
+	}
+	for i, tok := range spy.seen {
+		// Unit i runs at t0+i min; from t0+3m the token is inside the window.
+		if inWindow := i >= 3; inWindow && tok == "fake-access" {
+			t.Errorf("unit %d used the token after it entered the refresh window", i)
+		}
+	}
+}
+
+func TestUnauthorized_RefreshesOnceAndRetriesTheUnit(t *testing.T) {
+	// The token looks valid for another hour, but the provider rejects it
+	// mid-run: refresh once, retry the unit, keep the connection active.
+	creds := &memCredentials{creds: domain.Credentials{AccessToken: "fake-access", RefreshToken: "fake-refresh", ExpiresAt: t0.Add(time.Hour)}}
+	h := newHarness(t,
+		func(_ *harness, c *sync.Config, _ *[]domain.HealthProvider) { c.Credentials = creds },
+		withProvider(newFaulty(func(op string, call int) error {
+			if op == string(domain.MetricSteps) && call == 1 {
+				return fmt.Errorf("HTTP 401 for fake-access: %w", domain.ErrUnauthorized)
+			}
+			return nil
+		})))
+	run := h.sync(domain.SyncTriggerScheduled, nil)
+	if run.Status != domain.SyncSucceeded {
+		t.Fatalf("run = %s (%s), want succeeded after one forced refresh", run.Status, run.ErrorMessage)
+	}
+	if len(creds.saved) != 1 || h.connection().Status != domain.ConnectionActive || h.countMetric(domain.MetricSteps) == 0 {
+		t.Errorf("saves %d, status %s, steps rows %d", len(creds.saved), h.connection().Status, h.countMetric(domain.MetricSteps))
+	}
+}
+
+func TestUnauthorized_RejectedRefreshDisablesConnection(t *testing.T) {
+	creds := &memCredentials{creds: domain.Credentials{AccessToken: "fake-access", RefreshToken: "fake-refresh", ExpiresAt: t0.Add(time.Hour)}}
+	h := newHarness(t,
+		func(_ *harness, c *sync.Config, _ *[]domain.HealthProvider) { c.Credentials = creds },
+		withProvider(newFaulty(func(op string, _ int) error {
+			if op == string(domain.MetricSteps) || op == "refresh" {
+				return fmt.Errorf("rejected: %w", domain.ErrUnauthorized)
+			}
+			return nil
+		})))
+	run := h.sync(domain.SyncTriggerScheduled, nil)
+	if run.Status != domain.SyncPartial || h.connection().Status != domain.ConnectionError || len(creds.saved) != 0 {
+		t.Fatalf("run %s, connection %s, saves %d; want partial, error, none", run.Status, h.connection().Status, len(creds.saved))
+	}
+}
+
 func TestRunDue_SkipsBusyConnectionWithoutRescheduling(t *testing.T) {
 	h := newHarness(t)
 	held, err := testStore.StartSyncRun(h.ctx, h.user.ID, domain.ProviderMock, domain.SyncTriggerManual, dateRange(t, "2026-11-21", "2026-11-21"))

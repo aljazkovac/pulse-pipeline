@@ -1,7 +1,7 @@
 # Pulse Pipeline — Backend & Sync Worker (`backend/`)
 
 Go service containing:
-- `cmd/api`: HTTP/REST API serving the Web/PWA frontend and handling Google OAuth 2.0 callbacks.
+- `cmd/api`: HTTP/REST API serving the Web/PWA frontend (the Google OAuth web callback arrives with Phase 2 auth; until then accounts are linked with `pulse-worker connect-google`).
 - `cmd/worker`: Nightly health data ingestion service pulling from the Google Health API (`HealthProvider` adapter).
 - `internal/`: Domain models, provider adapters, `sqlc` database repositories, and OpenTelemetry / OpenFeature integration.
 - `migrations/`: PostgreSQL schema migrations (`golang-migrate`).
@@ -17,6 +17,44 @@ gap, no SpO2/HRV). Use it wherever code needs provider data without Google crede
 ```go
 p := mock.New(mock.Options{Seed: 1, Now: func() time.Time { return fixedNow }})
 ```
+
+`internal/provider/googlehealth` reads Fitbit Air data from the
+[Google Health API](https://developers.google.com/health) v4 ([ADR-0004](../docs/adr/0004-google-health-provider.md)):
+daily steps and calories from daily rollups; resting heart rate, HRV and SpO2 from Google's daily
+types; intraday heart rate, HRV, SpO2 and steps from `:reconcile`; intraday calories from 60-second
+rollups; and sleep sessions with deep/REM/light/awake stages. The API has no sleep score, so
+`sleep_score` stays empty for Google data. Its OAuth tokens are stored AES-256-GCM encrypted
+(`internal/tokencrypt`, `internal/credentials`).
+
+### Linking a Google Health account
+
+1. In Google Cloud Console, enable the Google Health API, configure the OAuth consent screen
+   (External, Testing) with your Google account as a test user, and create an OAuth client of
+   type **Desktop app**. Open the Google Health app on your phone once so the account is linked.
+2. Put the client ID and secret, and a token key, in your local `.env` (never in the repository
+   or in chat):
+
+   ```bash
+   openssl rand -base64 32   # value for TOKEN_ENCRYPTION_KEY
+   ```
+
+3. Create a user (for example with `seed-dev`) and link it. The command prints a Google consent
+   URL; open it in a browser **on the same machine** and allow every permission. Google redirects
+   to a temporary listener on `127.0.0.1`, and the command stores the tokens encrypted:
+
+   ```bash
+   go run ./cmd/worker connect-google -user <ID>
+   go run ./cmd/worker sync -user <ID> -provider google_health
+   ```
+
+While the Google Cloud app is in *Testing* status, Google expires its refresh tokens after
+7 days. The next sync then fails with `invalid_grant`, the connection goes to `error`, and
+`connect-google` must be run again (it keeps the sync history).
+
+**Rotating `TOKEN_ENCRYPTION_KEY`:** set the new key with a higher
+`TOKEN_ENCRYPTION_KEY_VERSION` and move the old one to `TOKEN_ENCRYPTION_PREVIOUS_KEYS`
+(`1:<old base64 key>`). Each token refresh re-encrypts with the new key; drop the old key once
+`SELECT token_key_version, count(*) FROM provider_connections GROUP BY 1` shows no rows on it.
 
 ## Sync Worker
 
@@ -42,6 +80,10 @@ go run ./cmd/worker sync -user <ID> -provider mock -from 2026-01-01 -to 2026-01-
 | `PULSE_SYNC_POLL_INTERVAL` | `1m` | How often `run` checks for due connections. |
 | `PULSE_ENABLE_MOCK_PROVIDER` | `false` | Register the synthetic `mock` provider. |
 | `ENV` | — | `seed-dev` refuses to run unless it is `development`. |
+| `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` | — | Desktop-app OAuth client; when both are set the `google_health` provider is registered and `connect-google` works. |
+| `TOKEN_ENCRYPTION_KEY` | — | Base64 of 32 random bytes; encrypts OAuth tokens at rest. Required with the Google provider. |
+| `TOKEN_ENCRYPTION_KEY_VERSION` | `1` | Version stored with each ciphertext; raise it when rotating. |
+| `TOKEN_ENCRYPTION_PREVIOUS_KEYS` | — | `version:base64key,…` of retired keys still needed to read older rows. |
 
 ## Database Workflow
 

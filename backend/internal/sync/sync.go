@@ -333,19 +333,37 @@ func (s *Syncer) ingest(ctx context.Context, hp domain.HealthProvider, conn doma
 		}
 	}
 
-	creds, err := s.credentials(ctx, hp, conn, out)
+	creds, err := s.creds.LoadCredentials(ctx, conn.UserID, conn.ID)
 	if err != nil {
-		fail(err)
+		fail(fmt.Errorf("loading credentials: %w", err))
 		return out
 	}
+	out.secrets = append(out.secrets, creds.AccessToken, creds.RefreshToken)
 	conn.Credentials = creds
 
-	for _, u := range s.units(hp, conn, runID, r) {
+	// Units read conn when they run, so a refresh between units reaches them.
+	for _, u := range s.units(hp, &conn, runID, r) {
 		if err := ctx.Err(); err != nil {
 			fail(fmt.Errorf("stopped before %s: %w", u.name, err))
 			break
 		}
+		// Access tokens can expire during a long run (Google's last an hour,
+		// ADR-0004 §2), so check before every unit, not only the first.
+		if err := s.refresh(ctx, hp, &conn, out, false); err != nil {
+			fail(err)
+			break
+		}
 		n, err := u.run(ctx)
+		if errors.Is(err, domain.ErrUnauthorized) && !conn.Credentials.ExpiresAt.IsZero() {
+			// The access token was rejected before its recorded expiry (a
+			// long unit, clock skew, early invalidation). Refresh once and
+			// retry the unit; only a rejected refresh means re-linking.
+			if rerr := s.refresh(ctx, hp, &conn, out, true); rerr != nil {
+				err = fmt.Errorf("%w (after the provider rejected the access token)", rerr)
+			} else {
+				n, err = u.run(ctx)
+			}
+		}
 		if err == nil {
 			out.records += n
 			out.succeeded++
@@ -364,36 +382,33 @@ func (s *Syncer) ingest(ctx context.Context, hp domain.HealthProvider, conn doma
 	return out
 }
 
-// credentials loads the connection's tokens and refreshes them if they are
-// about to expire. Zero ExpiresAt means the provider needs no refresh. Every
-// token it sees is registered in out for scrubbing.
-func (s *Syncer) credentials(ctx context.Context, hp domain.HealthProvider, conn domain.Connection, out *outcome) (domain.Credentials, error) {
-	creds, err := s.creds.LoadCredentials(ctx, conn.UserID, conn.ID)
-	if err != nil {
-		return domain.Credentials{}, fmt.Errorf("loading credentials: %w", err)
+// refresh refreshes conn's credentials when force is set or they expire
+// within RefreshBefore, and persists the new ones. Zero ExpiresAt means the
+// provider needs no refresh. Every token it sees is registered in out for
+// scrubbing.
+func (s *Syncer) refresh(ctx context.Context, hp domain.HealthProvider, conn *domain.Connection, out *outcome, force bool) error {
+	exp := conn.Credentials.ExpiresAt
+	if exp.IsZero() || (!force && exp.After(s.now().Add(s.cfg.RefreshBefore))) {
+		return nil
 	}
-	out.secrets = append(out.secrets, creds.AccessToken, creds.RefreshToken)
-	if creds.ExpiresAt.IsZero() || creds.ExpiresAt.After(s.now().Add(s.cfg.RefreshBefore)) {
-		return creds, nil
-	}
-	conn.Credentials = creds
-	fresh, err := retry(ctx, s, func() (domain.Credentials, error) { return hp.RefreshAuth(ctx, conn) })
+	fresh, err := retry(ctx, s, func() (domain.Credentials, error) { return hp.RefreshAuth(ctx, *conn) })
 	if err != nil {
-		return domain.Credentials{}, fmt.Errorf("refreshing credentials: %w", err)
+		return fmt.Errorf("refreshing credentials: %w", err)
 	}
 	out.secrets = append(out.secrets, fresh.AccessToken, fresh.RefreshToken)
 	if err := s.creds.SaveCredentials(ctx, conn.UserID, conn.ID, fresh); err != nil {
-		return domain.Credentials{}, fmt.Errorf("saving refreshed credentials: %w", err)
+		return fmt.Errorf("saving refreshed credentials: %w", err)
 	}
-	return fresh, nil
+	conn.Credentials = fresh
+	return nil
 }
 
-func (s *Syncer) units(hp domain.HealthProvider, conn domain.Connection, runID uuid.UUID, r domain.DateRange) []unit {
+func (s *Syncer) units(hp domain.HealthProvider, conn *domain.Connection, runID uuid.UUID, r domain.DateRange) []unit {
 	var units []unit
 	for _, c := range chunkDates(r, s.cfg.ChunkDays) {
 		units = append(units,
 			unit{"daily summaries " + rangeString(c), func(ctx context.Context) (int64, error) {
-				rows, err := retry(ctx, s, func() ([]domain.DailySummary, error) { return hp.FetchDailySummaries(ctx, conn, c) })
+				rows, err := retry(ctx, s, func() ([]domain.DailySummary, error) { return hp.FetchDailySummaries(ctx, *conn, c) })
 				if err != nil {
 					return 0, fmt.Errorf("fetching: %w", err)
 				}
@@ -408,7 +423,7 @@ func (s *Syncer) units(hp domain.HealthProvider, conn domain.Connection, runID u
 				})
 			}},
 			unit{"sleep sessions " + rangeString(c), func(ctx context.Context) (int64, error) {
-				rows, err := retry(ctx, s, func() ([]domain.SleepSession, error) { return hp.FetchSleepSessions(ctx, conn, c) })
+				rows, err := retry(ctx, s, func() ([]domain.SleepSession, error) { return hp.FetchSleepSessions(ctx, *conn, c) })
 				if err != nil {
 					return 0, fmt.Errorf("fetching: %w", err)
 				}
@@ -431,7 +446,7 @@ func (s *Syncer) units(hp domain.HealthProvider, conn domain.Connection, runID u
 				continue // the timezone skipped the entire date range
 			}
 			units = append(units, unit{string(m) + " " + rangeString(c), func(ctx context.Context) (int64, error) {
-				pts, err := retry(ctx, s, func() ([]domain.IntradayPoint, error) { return hp.FetchIntradayMetrics(ctx, conn, m, span) })
+				pts, err := retry(ctx, s, func() ([]domain.IntradayPoint, error) { return hp.FetchIntradayMetrics(ctx, *conn, m, span) })
 				if err != nil {
 					return 0, fmt.Errorf("fetching: %w", err)
 				}
