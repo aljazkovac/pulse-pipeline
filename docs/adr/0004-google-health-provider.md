@@ -168,6 +168,10 @@ This needs a **Desktop app** OAuth client. Its ID and secret come from
 the repository. Phase 2 adds the web callback for authenticated users; it reuses the code
 exchange, scope check and vault, and only changes where the user ID comes from.
 
+> **Amended by [ADR-0005](0005-api-auth-and-read-model.md) §4 (proposed):** web linking needs a separate
+> *Web application* OAuth client; because refresh tokens are bound to their issuing client, each
+> connection records `oauth_client` (`desktop` | `web`) and `RefreshAuth` uses the matching one.
+
 ### 4. Token encryption (completes ADR-0002 §3)
 
 - `internal/tokencrypt.Keyring`: AES-256-GCM with a random 96-bit nonce per value, stored as

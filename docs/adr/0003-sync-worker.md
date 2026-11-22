@@ -99,6 +99,10 @@ The manual and backfill paths ship now as the `pulse-worker sync` command (opera
 The HTTP endpoint will call `Syncer.SyncConnection` with the authenticated user's ID and lands with
 the Phase 2 Sync & Connections view, once the API authenticates requests.
 
+> **Amended by [ADR-0005](0005-api-auth-and-read-model.md) §6 (proposed):** the HTTP endpoint queues the
+> sync (`sync_requested_at`) for the worker instead of calling `Syncer.SyncConnection` in the
+> request; the queued run uses the `manual` trigger.
+
 ## Consequences
 
 - Repeating a sync converges on the same rows. A single endpoint failure can leave the run
