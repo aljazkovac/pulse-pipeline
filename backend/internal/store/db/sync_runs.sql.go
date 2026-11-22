@@ -128,6 +128,25 @@ func (q *Queries) FinishSyncRun(ctx context.Context, arg FinishSyncRunParams) (S
 	return i, err
 }
 
+const hasRunningSyncRun = `-- name: HasRunningSyncRun :one
+SELECT EXISTS (
+    SELECT 1 FROM sync_runs
+    WHERE user_id = $1 AND provider = $2 AND status = 'running'
+)
+`
+
+type HasRunningSyncRunParams struct {
+	UserID   uuid.UUID
+	Provider string
+}
+
+func (q *Queries) HasRunningSyncRun(ctx context.Context, arg HasRunningSyncRunParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasRunningSyncRun, arg.UserID, arg.Provider)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const listSyncRuns = `-- name: ListSyncRuns :many
 SELECT id, user_id, provider, trigger, status, range_start, range_end,
        records_ingested, error_message, started_at, finished_at, heartbeat_at

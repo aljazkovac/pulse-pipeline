@@ -71,8 +71,8 @@ var (
 	// ErrTransient marks a failure worth retrying with backoff: rate limiting
 	// (HTTP 429), upstream unavailability (5xx) or a network timeout.
 	ErrTransient = errors.New("transient provider error")
-	// ErrUnauthorized means the credentials were rejected and refreshing them
-	// failed; the user must reconnect the provider.
+	// ErrUnauthorized means the provider rejected the access token during a
+	// fetch or the refresh token during RefreshAuth.
 	ErrUnauthorized = errors.New("provider rejected credentials")
 )
 

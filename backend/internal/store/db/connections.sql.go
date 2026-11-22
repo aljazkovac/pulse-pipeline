@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const createProviderConnection = `-- name: CreateProviderConnection :one
@@ -36,8 +37,9 @@ type CreateProviderConnectionRow struct {
 	CreatedAt    time.Time
 }
 
-// Non-secret connection columns only. Token ciphertext is read/written by
-// dedicated queries added with the GoogleHealthProvider (ADR-0002 §3).
+// Non-secret connection columns only, except the token queries at the end of
+// this file, which read and write AES-256-GCM ciphertext (ADR-0002 §3,
+// ADR-0004). Plaintext tokens never reach SQL.
 func (q *Queries) CreateProviderConnection(ctx context.Context, arg CreateProviderConnectionParams) (CreateProviderConnectionRow, error) {
 	row := q.db.QueryRow(ctx, createProviderConnection, arg.UserID, arg.Provider, arg.Scopes)
 	var i CreateProviderConnectionRow
@@ -70,6 +72,38 @@ func (q *Queries) GetConnectionSyncCursor(ctx context.Context, arg GetConnection
 	var sync_cursor []byte
 	err := row.Scan(&sync_cursor)
 	return sync_cursor, err
+}
+
+const getConnectionTokens = `-- name: GetConnectionTokens :one
+
+SELECT access_token_ciphertext, refresh_token_ciphertext, token_key_version, token_expires_at
+FROM provider_connections
+WHERE id = $1 AND user_id = $2
+`
+
+type GetConnectionTokensParams struct {
+	ID     uuid.UUID
+	UserID uuid.UUID
+}
+
+type GetConnectionTokensRow struct {
+	AccessTokenCiphertext  []byte
+	RefreshTokenCiphertext []byte
+	TokenKeyVersion        pgtype.Int2
+	TokenExpiresAt         *time.Time
+}
+
+// Token ciphertext (ADR-0002 §3). Only the credential vault uses these.
+func (q *Queries) GetConnectionTokens(ctx context.Context, arg GetConnectionTokensParams) (GetConnectionTokensRow, error) {
+	row := q.db.QueryRow(ctx, getConnectionTokens, arg.ID, arg.UserID)
+	var i GetConnectionTokensRow
+	err := row.Scan(
+		&i.AccessTokenCiphertext,
+		&i.RefreshTokenCiphertext,
+		&i.TokenKeyVersion,
+		&i.TokenExpiresAt,
+	)
+	return i, err
 }
 
 const getProviderConnection = `-- name: GetProviderConnection :one
@@ -276,4 +310,74 @@ func (q *Queries) SetConnectionStatus(ctx context.Context, arg SetConnectionStat
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const setConnectionTokens = `-- name: SetConnectionTokens :execrows
+UPDATE provider_connections
+SET access_token_ciphertext  = $1,
+    refresh_token_ciphertext = $2,
+    token_key_version        = $3,
+    token_expires_at         = $4,
+    updated_at               = now()
+WHERE id = $5 AND user_id = $6
+`
+
+type SetConnectionTokensParams struct {
+	AccessTokenCiphertext  []byte
+	RefreshTokenCiphertext []byte
+	TokenKeyVersion        pgtype.Int2
+	TokenExpiresAt         *time.Time
+	ID                     uuid.UUID
+	UserID                 uuid.UUID
+}
+
+func (q *Queries) SetConnectionTokens(ctx context.Context, arg SetConnectionTokensParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setConnectionTokens,
+		arg.AccessTokenCiphertext,
+		arg.RefreshTokenCiphertext,
+		arg.TokenKeyVersion,
+		arg.TokenExpiresAt,
+		arg.ID,
+		arg.UserID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const upsertConnectionForLink = `-- name: UpsertConnectionForLink :one
+INSERT INTO provider_connections (user_id, provider, scopes, provider_account_id)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (user_id, provider) DO UPDATE
+SET scopes       = EXCLUDED.scopes,
+    status       = 'active',
+    next_sync_at = now(),
+    updated_at   = now()
+RETURNING id, provider_account_id
+`
+
+type UpsertConnectionForLinkParams struct {
+	UserID            uuid.UUID
+	Provider          string
+	Scopes            []string
+	ProviderAccountID pgtype.Text
+}
+
+type UpsertConnectionForLinkRow struct {
+	ID                uuid.UUID
+	ProviderAccountID pgtype.Text
+}
+
+// Re-linking locks the existing row and preserves its account ID and cursor.
+func (q *Queries) UpsertConnectionForLink(ctx context.Context, arg UpsertConnectionForLinkParams) (UpsertConnectionForLinkRow, error) {
+	row := q.db.QueryRow(ctx, upsertConnectionForLink,
+		arg.UserID,
+		arg.Provider,
+		arg.Scopes,
+		arg.ProviderAccountID,
+	)
+	var i UpsertConnectionForLinkRow
+	err := row.Scan(&i.ID, &i.ProviderAccountID)
+	return i, err
 }

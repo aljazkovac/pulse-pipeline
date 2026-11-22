@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -36,6 +37,62 @@ func TestLoadConfig(t *testing.T) {
 		if _, err := loadConfig(env(e)); err == nil {
 			t.Errorf("%s: want error", name)
 		}
+	}
+}
+
+// Fictional values; the key is 32 bytes of 0x01, base64-encoded.
+const (
+	fakeKey    = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+	fakeSecret = "fake-google-client-secret"
+)
+
+func TestLoadConfig_GoogleAndTokenKey(t *testing.T) {
+	base := func(extra map[string]string) map[string]string {
+		m := map[string]string{"DATABASE_URL": "postgres://localhost/x"}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return m
+	}
+	cfg, err := loadConfig(env(base(map[string]string{
+		"GOOGLE_OAUTH_CLIENT_ID": "fake-id.apps.example.com", "GOOGLE_OAUTH_CLIENT_SECRET": fakeSecret, "TOKEN_ENCRYPTION_KEY": fakeKey,
+	})))
+	if err != nil || !cfg.google.enabled() || cfg.keyring == nil || cfg.keyring.CurrentVersion() != 1 {
+		t.Fatalf("google config = %v, keyring %v, err %v", cfg.google, cfg.keyring != nil, err)
+	}
+	if s := fmt.Sprintf("%v %+v %#v %#v", cfg.google, cfg, cfg, cfg.google); strings.Contains(s, fakeSecret) || strings.Contains(s, "postgres://") {
+		t.Errorf("printing the config leaks the client secret: %s", s)
+	}
+	keyOnly, err := loadConfig(env(base(map[string]string{"TOKEN_ENCRYPTION_KEY": fakeKey, "TOKEN_ENCRYPTION_KEY_VERSION": "3"})))
+	if err != nil || keyOnly.google.enabled() || keyOnly.keyring.CurrentVersion() != 3 {
+		t.Fatalf("key only = %+v, %v", keyOnly, err)
+	}
+	for name, e := range map[string]map[string]string{
+		"id without secret":  {"GOOGLE_OAUTH_CLIENT_ID": "fake-id", "TOKEN_ENCRYPTION_KEY": fakeKey},
+		"secret without id":  {"GOOGLE_OAUTH_CLIENT_SECRET": fakeSecret, "TOKEN_ENCRYPTION_KEY": fakeKey},
+		"google without key": {"GOOGLE_OAUTH_CLIENT_ID": "fake-id", "GOOGLE_OAUTH_CLIENT_SECRET": fakeSecret},
+		"bad key":            {"TOKEN_ENCRYPTION_KEY": "too-short"},
+		"bad key version":    {"TOKEN_ENCRYPTION_KEY": fakeKey, "TOKEN_ENCRYPTION_KEY_VERSION": "-1"},
+	} {
+		_, err := loadConfig(env(base(e)))
+		if err == nil {
+			t.Errorf("%s: want error", name)
+			continue
+		}
+		if strings.Contains(err.Error(), fakeSecret) || strings.Contains(err.Error(), fakeKey) {
+			t.Errorf("%s: error leaks a secret: %v", name, err)
+		}
+	}
+}
+
+func TestParseConnectArgs(t *testing.T) {
+	id := uuid.MustParse("00000000-0000-4000-8000-000000000001")
+	got, err := parseConnectArgs([]string{"-user", id.String()})
+	if err != nil || got != id {
+		t.Fatalf("parseConnectArgs = %s, %v", got, err)
+	}
+	if _, err := parseConnectArgs(nil); !errors.Is(err, errUsage) {
+		t.Errorf("no user: want usage error, got %v", err)
 	}
 }
 
@@ -88,6 +145,9 @@ func TestRunRejectsBadInvocationsBeforeTouchingTheDatabase(t *testing.T) {
 		"run with operands": {[]string{"run", "now"}, true, "no arguments"},
 		"sync without user": {[]string{"sync", "-provider", "mock"}, true, "-user"},
 		"seed outside dev":  {[]string{"seed-dev"}, false, "ENV=development"},
+		"connect bad user":  {[]string{"connect-google", "-user", "me"}, true, "-user must be a UUID"},
+		"connect extra arg": {[]string{"connect-google", "-user", "00000000-0000-4000-8000-000000000001", "now"}, true, "unexpected argument"},
+		"connect no google": {[]string{"connect-google", "-user", "00000000-0000-4000-8000-000000000001"}, false, "GOOGLE_OAUTH_CLIENT_ID"},
 	} {
 		err := run(context.Background(), tc.args, e, io.Discard, logger)
 		if err == nil || errors.Is(err, errUsage) != tc.usage || !strings.Contains(err.Error(), tc.want) {

@@ -4,9 +4,13 @@
 //	pulse-worker sync -user ID -provider P   sync one connection now (manual)
 //	    [-from YYYY-MM-DD -to YYYY-MM-DD]    ...or backfill a date range
 //	pulse-worker seed-dev [-email E] [-tz Z] create a local user with a mock connection
+//	pulse-worker connect-google -user ID     link a Google Health account (ADR-0004 §3)
 //
 // Environment: DATABASE_URL (required), PULSE_SYNC_POLL_INTERVAL (default 1m),
-// PULSE_ENABLE_MOCK_PROVIDER (default false), ENV (seed-dev needs "development").
+// PULSE_ENABLE_MOCK_PROVIDER (default false), ENV (seed-dev needs "development"),
+// GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET (register the Google
+// Health provider), TOKEN_ENCRYPTION_KEY, TOKEN_ENCRYPTION_KEY_VERSION and
+// TOKEN_ENCRYPTION_PREVIOUS_KEYS (encrypted token storage, required with Google).
 // Every command applies pending migrations first.
 package main
 
@@ -26,10 +30,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/credentials"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/domain"
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/provider/googlehealth"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/provider/mock"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/store"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/sync"
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/tokencrypt"
 )
 
 // errUsage marks command-line mistakes; main prints usage and exits 2.
@@ -55,7 +62,8 @@ func main() {
 const usage = `usage:
   pulse-worker [run]
   pulse-worker sync -user ID -provider PROVIDER [-from YYYY-MM-DD -to YYYY-MM-DD]
-  pulse-worker seed-dev [-email EMAIL] [-tz IANA_ZONE]`
+  pulse-worker seed-dev [-email EMAIL] [-tz IANA_ZONE]
+  pulse-worker connect-google -user ID`
 
 func run(ctx context.Context, args []string, getenv func(string) string, stdout io.Writer, logger *slog.Logger) error {
 	cmd := "run"
@@ -72,16 +80,16 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout 
 		if len(args) > 0 {
 			return fmt.Errorf("%w: run takes no arguments", errUsage)
 		}
-		return withSyncer(ctx, cfg, logger, func(_ *store.Store, s *sync.Syncer) error {
-			return poll(ctx, s, cfg.pollInterval, logger)
+		return withDeps(ctx, cfg, logger, func(d deps) error {
+			return poll(ctx, d.syncer, cfg.pollInterval, logger)
 		})
 	case "sync":
 		req, err := parseSyncArgs(args)
 		if err != nil {
 			return err
 		}
-		return withSyncer(ctx, cfg, logger, func(_ *store.Store, s *sync.Syncer) error {
-			r, err := s.SyncConnection(ctx, req)
+		return withDeps(ctx, cfg, logger, func(d deps) error {
+			r, err := d.syncer.SyncConnection(ctx, req)
 			if err != nil {
 				return err
 			}
@@ -100,21 +108,54 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout 
 		if cfg.env != "development" {
 			return errors.New("seed-dev only runs with ENV=development")
 		}
-		return withSyncer(ctx, cfg, logger, func(st *store.Store, _ *sync.Syncer) error {
-			u, err := st.CreateUser(ctx, email, tz)
+		return withDeps(ctx, cfg, logger, func(d deps) error {
+			u, err := d.store.CreateUser(ctx, email, tz)
 			if err != nil {
 				return err
 			}
-			if _, err := st.CreateConnection(ctx, u.ID, domain.ProviderMock, nil); err != nil {
+			if _, err := d.store.CreateConnection(ctx, u.ID, domain.ProviderMock, nil); err != nil {
 				return err
 			}
 			_, err = fmt.Fprintf(stdout, "created user %s (%s, %s) with a mock connection; "+
 				"run the worker with PULSE_ENABLE_MOCK_PROVIDER=true to sync it\n", u.ID, email, tz)
 			return err
 		})
+	case "connect-google":
+		userID, err := parseConnectArgs(args)
+		if err != nil {
+			return err
+		}
+		if !cfg.google.enabled() {
+			return errors.New("connect-google needs GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET and TOKEN_ENCRYPTION_KEY")
+		}
+		return withDeps(ctx, cfg, logger, func(d deps) error {
+			return connectGoogle(ctx, d, userID, stdout)
+		})
 	default:
 		return fmt.Errorf("%w: unknown command %q", errUsage, cmd)
 	}
+}
+
+// connectGoogle links a Google Health account to an existing user through
+// the loopback OAuth flow and stores the tokens encrypted (ADR-0004 §3).
+func connectGoogle(ctx context.Context, d deps, userID uuid.UUID, stdout io.Writer) error {
+	u, err := d.store.GetUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	grant, err := d.google.AuthorizeLoopback(ctx, func(authURL string) error {
+		_, err := fmt.Fprintf(stdout, "Linking Google Health for %s.\nOpen this URL in a browser on this machine and allow every permission:\n\n  %s\n\nWaiting for Google to redirect back...\n", u.Email, authURL)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	connectionID, err := d.vault.Link(ctx, u.ID, domain.ProviderGoogleHealth, grant.HealthUserID, grant.Scopes, grant.Credentials)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(stdout, "Linked Google Health for user %s (connection %s). The worker syncs it on its next poll.\n", u.ID, connectionID)
+	return err
 }
 
 type config struct {
@@ -122,7 +163,32 @@ type config struct {
 	pollInterval time.Duration
 	enableMock   bool
 	env          string
+	keyring      *tokencrypt.Keyring // nil without TOKEN_ENCRYPTION_KEY
+	google       googleConfig
 }
+
+// googleConfig holds the OAuth client. Its String method keeps the secret
+// out of logs.
+type googleConfig struct {
+	clientID, clientSecret string
+}
+
+func (g googleConfig) enabled() bool { return g.clientID != "" }
+
+// String omits the database URL (it may hold a password), the client secret
+// and the keys, so printing a config cannot leak them.
+func (c config) String() string {
+	return fmt.Sprintf("config{poll_interval: %s, mock: %t, env: %q, google: %t, token_key: %t}",
+		c.pollInterval, c.enableMock, c.env, c.google.enabled(), c.keyring != nil)
+}
+
+// GoString redacts for %#v as well.
+func (c config) GoString() string { return c.String() }
+
+func (g googleConfig) String() string { return fmt.Sprintf("googleConfig{client_id: %q}", g.clientID) }
+
+// GoString redacts for %#v as well.
+func (g googleConfig) GoString() string { return g.String() }
 
 func loadConfig(getenv func(string) string) (config, error) {
 	cfg := config{databaseURL: getenv("DATABASE_URL"), pollInterval: time.Minute, env: getenv("ENV")}
@@ -142,6 +208,21 @@ func loadConfig(getenv func(string) string) (config, error) {
 			return config{}, fmt.Errorf("PULSE_ENABLE_MOCK_PROVIDER %q: want true or false", v)
 		}
 		cfg.enableMock = b
+	}
+
+	if v := getenv("TOKEN_ENCRYPTION_KEY"); v != "" {
+		kr, err := tokencrypt.FromEnv(v, getenv("TOKEN_ENCRYPTION_KEY_VERSION"), getenv("TOKEN_ENCRYPTION_PREVIOUS_KEYS"))
+		if err != nil {
+			return config{}, err
+		}
+		cfg.keyring = kr
+	}
+	cfg.google = googleConfig{clientID: getenv("GOOGLE_OAUTH_CLIENT_ID"), clientSecret: getenv("GOOGLE_OAUTH_CLIENT_SECRET")}
+	switch {
+	case (cfg.google.clientID == "") != (cfg.google.clientSecret == ""):
+		return config{}, errors.New("GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET must be set together")
+	case cfg.google.enabled() && cfg.keyring == nil:
+		return config{}, errors.New("the Google Health provider needs TOKEN_ENCRYPTION_KEY to store tokens encrypted")
 	}
 	return cfg, nil
 }
@@ -199,8 +280,34 @@ func parseSeedArgs(args []string) (email, tz string, err error) {
 	return email, tz, nil
 }
 
-// withSyncer migrates the database, connects, and builds the Syncer.
-func withSyncer(ctx context.Context, cfg config, logger *slog.Logger, fn func(*store.Store, *sync.Syncer) error) error {
+func parseConnectArgs(args []string) (uuid.UUID, error) {
+	fs := flag.NewFlagSet("connect-google", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	user := fs.String("user", "", "user ID")
+	if err := fs.Parse(args); err != nil {
+		return uuid.Nil, fmt.Errorf("%w: connect-google: %v", errUsage, err)
+	}
+	if fs.NArg() > 0 {
+		return uuid.Nil, fmt.Errorf("%w: connect-google: unexpected argument %q", errUsage, fs.Arg(0))
+	}
+	id, err := uuid.Parse(*user)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("%w: connect-google: -user must be a UUID", errUsage)
+	}
+	return id, nil
+}
+
+// deps are the wired components a command uses.
+type deps struct {
+	store  *store.Store
+	syncer *sync.Syncer
+	vault  *credentials.Vault      // nil without TOKEN_ENCRYPTION_KEY
+	google *googlehealth.Provider // nil unless the Google OAuth client is configured
+}
+
+// withDeps migrates the database, connects, and wires the providers, the
+// credential vault and the Syncer.
+func withDeps(ctx context.Context, cfg config, logger *slog.Logger, fn func(deps) error) error {
 	if err := store.MigrateUp(cfg.databaseURL); err != nil {
 		return err
 	}
@@ -213,18 +320,29 @@ func withSyncer(ctx context.Context, cfg config, logger *slog.Logger, fn func(*s
 		return fmt.Errorf("connecting to database: %w", err)
 	}
 
+	d := deps{store: store.New(pool)}
+	syncCfg := sync.DefaultConfig()
+	syncCfg.Logger = logger
+	if cfg.keyring != nil {
+		d.vault = credentials.NewVault(d.store, cfg.keyring)
+		syncCfg.Credentials = d.vault
+	}
+
 	var providers []domain.HealthProvider
 	if cfg.enableMock {
 		providers = append(providers, mock.New(mock.Options{Seed: 1}))
 	}
-	syncCfg := sync.DefaultConfig()
-	syncCfg.Logger = logger
-	st := store.New(pool)
-	s, err := sync.New(st, providers, syncCfg)
-	if err != nil {
+	if cfg.google.enabled() {
+		d.google, err = googlehealth.New(googlehealth.Options{ClientID: cfg.google.clientID, ClientSecret: cfg.google.clientSecret})
+		if err != nil {
+			return err
+		}
+		providers = append(providers, d.google)
+	}
+	if d.syncer, err = sync.New(d.store, providers, syncCfg); err != nil {
 		return err
 	}
-	return fn(st, s)
+	return fn(d)
 }
 
 // poll runs due syncs immediately and then every interval until ctx ends.

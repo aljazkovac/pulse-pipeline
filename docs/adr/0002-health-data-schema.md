@@ -73,8 +73,8 @@ Access and refresh tokens are stored only as **application-level AES-256-GCM cip
 The key comes from the `TOKEN_ENCRYPTION_KEY` environment variable (a Kubernetes Secret in
 cluster). Plaintext tokens never reach the database, logs, API responses or MCP output, and the
 store's read model for connections omits the ciphertext columns except for the one query the
-sync worker uses to refresh tokens. The cipher implementation lands with the
-`GoogleHealthProvider`; this ADR fixes the column shape.
+sync worker uses to refresh tokens. ADR-0004 §4 specifies the cipher, key rotation and
+the credential vault; this ADR fixes the column shape.
 
 ### 4. System-context query
 
@@ -90,7 +90,7 @@ do not use the scheduler query (`AGENTS.md` §1.1 exception).
 - `store`: `sqlc`-generated code in `store/db` (committed, regenerated with `make generate`) plus
   a hand-written `Store` that maps domain types ↔ rows, owns transactions, and requires a
   `userID` on every health-data method.
-- `provider/{mock,googlehealth}`: `HealthProvider` implementations (next PRs).
+- `provider/{mock,googlehealth}`: `HealthProvider` implementations (ADR-0004 for Google Health).
 - `sync`: nightly orchestrator writing `sync_runs` (next PRs).
 
 ```go
@@ -120,10 +120,10 @@ This ADR records decisions; it is delivered across several PRs.
 | :--- | :--- |
 | §1 Tables, §2 Indexes, §4 System-context query, §6 Migrations | Implemented (migration `000001`, `store`, Testcontainers tests). |
 | §5 `domain` types + `HealthProvider` interface, `store` package | Implemented. |
-| §3 Token storage | Columns only. AES-256-GCM cipher, `TOKEN_ENCRYPTION_KEY`, and the token read/write queries land with `GoogleHealthProvider`. |
+| §3 Token storage | Implemented per ADR-0004 §4: AES-256-GCM `tokencrypt.Keyring` (`TOKEN_ENCRYPTION_KEY`, versioned for rotation, ciphertext bound to row and column), `user_id`-scoped token queries, and `credentials.Vault` as the sync worker's `CredentialStore`. |
 | §5 `provider/mock` | Implemented: deterministic synthetic data keyed by (seed, user, local day); daily summaries aggregate the intraday series; a Testcontainers test ingests it twice and round-trips it. |
 | §5 `sync` | Implemented per ADR-0003; the worker applies migrations at startup. |
-| §5 `provider/googlehealth` | Pending (next Phase 1 PR). |
+| §5 `provider/googlehealth` | Implemented per ADR-0004: Google Health API v4 adapter, loopback OAuth linking via `pulse-worker connect-google`, `httptest` unit tests and a Testcontainers sync run. |
 
 ## Consequences
 
