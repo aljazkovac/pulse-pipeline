@@ -19,8 +19,8 @@ import (
 // scoped by user ID.
 type TokenStore interface {
 	GetConnectionTokens(ctx context.Context, userID, connectionID uuid.UUID) (store.SealedTokens, error)
-	SetConnectionTokens(ctx context.Context, userID, connectionID uuid.UUID, t store.SealedTokens) error
-	LinkConnection(ctx context.Context, userID uuid.UUID, provider domain.Provider, scopes []string, seal func(uuid.UUID) (store.SealedTokens, error)) (uuid.UUID, error)
+	SetSyncRunTokens(ctx context.Context, run domain.SyncRun, connectionID uuid.UUID, t store.SealedTokens) error
+	LinkConnection(ctx context.Context, userID uuid.UUID, provider domain.Provider, accountID string, scopes []string, seal func(uuid.UUID) (store.SealedTokens, error)) (uuid.UUID, error)
 }
 
 var _ TokenStore = (*store.Store)(nil)
@@ -54,15 +54,14 @@ func (v *Vault) LoadCredentials(ctx context.Context, userID, connectionID uuid.U
 	return domain.Credentials{AccessToken: access, RefreshToken: refresh, ExpiresAt: t.ExpiresAt}, nil
 }
 
-// SaveCredentials encrypts creds with the current key and replaces the
-// connection's tokens. Re-saving after a refresh therefore also migrates rows
-// sealed under an older key version.
-func (v *Vault) SaveCredentials(ctx context.Context, userID, connectionID uuid.UUID, creds domain.Credentials) error {
-	t, err := v.seal(creds, userID, connectionID)
+// SaveCredentials encrypts refreshed tokens with the current key and stores
+// them while the run still owns the connection.
+func (v *Vault) SaveCredentials(ctx context.Context, run domain.SyncRun, connectionID uuid.UUID, creds domain.Credentials) error {
+	t, err := v.seal(creds, run.UserID, connectionID)
 	if err != nil {
 		return err
 	}
-	if err := v.st.SetConnectionTokens(ctx, userID, connectionID, t); err != nil {
+	if err := v.st.SetSyncRunTokens(ctx, run, connectionID, t); err != nil {
 		return fmt.Errorf("credentials: %w", err)
 	}
 	return nil
@@ -70,11 +69,11 @@ func (v *Vault) SaveCredentials(ctx context.Context, userID, connectionID uuid.U
 
 // Link creates or re-activates the user's connection to provider with freshly
 // granted credentials, which must include a refresh token.
-func (v *Vault) Link(ctx context.Context, userID uuid.UUID, provider domain.Provider, scopes []string, creds domain.Credentials) (uuid.UUID, error) {
+func (v *Vault) Link(ctx context.Context, userID uuid.UUID, provider domain.Provider, accountID string, scopes []string, creds domain.Credentials) (uuid.UUID, error) {
 	if creds.AccessToken == "" || creds.RefreshToken == "" {
 		return uuid.Nil, errors.New("credentials: linking needs both an access and a refresh token")
 	}
-	id, err := v.st.LinkConnection(ctx, userID, provider, scopes, func(connectionID uuid.UUID) (store.SealedTokens, error) {
+	id, err := v.st.LinkConnection(ctx, userID, provider, accountID, scopes, func(connectionID uuid.UUID) (store.SealedTokens, error) {
 		return v.seal(creds, userID, connectionID)
 	})
 	if err != nil {

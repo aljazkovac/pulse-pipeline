@@ -86,9 +86,10 @@ func TestLinkConnection_CreatesThenReactivates(t *testing.T) {
 	ctx := ctxT(t)
 	u := newUser(t)
 	gh := domain.ProviderGoogleHealth
+	const accountID = "health-user"
 
 	var sealedFor uuid.UUID
-	id, err := testStore.LinkConnection(ctx, u.ID, gh, []string{"scope-a"}, func(connID uuid.UUID) (store.SealedTokens, error) {
+	id, err := testStore.LinkConnection(ctx, u.ID, gh, accountID, []string{"scope-a"}, func(connID uuid.UUID) (store.SealedTokens, error) {
 		sealedFor = connID
 		return fakeSealed(t0), nil
 	})
@@ -113,7 +114,7 @@ func TestLinkConnection_CreatesThenReactivates(t *testing.T) {
 	if err := testStore.SetConnectionStatus(ctx, u.ID, id, domain.ConnectionError); err != nil {
 		t.Fatal(err)
 	}
-	again, err := testStore.LinkConnection(ctx, u.ID, gh, []string{"scope-a", "scope-b"}, func(uuid.UUID) (store.SealedTokens, error) {
+	again, err := testStore.LinkConnection(ctx, u.ID, gh, accountID, []string{"scope-a", "scope-b"}, func(uuid.UUID) (store.SealedTokens, error) {
 		s := fakeSealed(t0.Add(time.Hour))
 		s.Access = []byte("fake-sealed-access-2")
 		return s, nil
@@ -136,12 +137,89 @@ func TestLinkConnection_CreatesThenReactivates(t *testing.T) {
 
 	// A failing seal rolls the whole link back.
 	other := newUser(t)
-	if _, err := testStore.LinkConnection(ctx, other.ID, gh, nil, func(uuid.UUID) (store.SealedTokens, error) {
+	if _, err := testStore.LinkConnection(ctx, other.ID, gh, accountID, nil, func(uuid.UUID) (store.SealedTokens, error) {
 		return store.SealedTokens{}, errors.New("seal failed")
 	}); err == nil {
 		t.Fatal("LinkConnection succeeded despite seal error")
 	}
 	if _, err := testStore.GetConnection(ctx, other.ID, gh); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("failed link left a connection behind: %v", err)
+	}
+}
+
+func TestLinkConnection_RejectsUnprovenAccount(t *testing.T) {
+	ctx := ctxT(t)
+	u, legacyUser := newUser(t), newUser(t)
+	gh := domain.ProviderGoogleHealth
+	id, err := testStore.LinkConnection(ctx, u.ID, gh, "health-user", []string{"original"}, func(uuid.UUID) (store.SealedTokens, error) {
+		return fakeSealed(t0), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
+	if err := testStore.RescheduleConnection(ctx, u.ID, id, future); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testStore.CreateConnection(ctx, legacyUser.ID, gh, nil); err != nil {
+		t.Fatal(err)
+	}
+	seal := func(uuid.UUID) (store.SealedTokens, error) {
+		t.Error("sealer called without a verified account match")
+		return fakeSealed(t0.Add(time.Hour)), nil
+	}
+	if _, err := testStore.LinkConnection(ctx, u.ID, gh, "other-account", nil, seal); !errors.Is(err, store.ErrProviderAccountMismatch) {
+		t.Fatalf("different account: %v, want ErrProviderAccountMismatch", err)
+	}
+	if _, err := testStore.LinkConnection(ctx, legacyUser.ID, gh, "health-user", nil, seal); !errors.Is(err, store.ErrProviderAccountUnverified) {
+		t.Fatalf("unverified legacy account: %v, want ErrProviderAccountUnverified", err)
+	}
+	conn, err := testStore.GetConnection(ctx, u.ID, gh)
+	if err != nil || !conn.NextSyncAt.Equal(future) || len(conn.Scopes) != 1 || conn.Scopes[0] != "original" {
+		t.Fatalf("rejected re-link changed the connection: %+v, %v", conn, err)
+	}
+	tokens, err := testStore.GetConnectionTokens(ctx, u.ID, id)
+	if err != nil || !tokens.ExpiresAt.Equal(t0) {
+		t.Fatalf("rejected re-link changed the tokens: %v, %v", tokens, err)
+	}
+}
+
+func TestLinkConnection_BlocksActiveRunAndFencesAbandonedRefresh(t *testing.T) {
+	ctx := ctxT(t)
+	u := newUser(t)
+	gh := domain.ProviderGoogleHealth
+	seal := func(uuid.UUID) (store.SealedTokens, error) { return fakeSealed(t0), nil }
+	id, err := testStore.LinkConnection(ctx, u.ID, gh, "health-user", nil, seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, _, err := testStore.ClaimSyncRun(ctx, u.ID, gh, domain.SyncTriggerManual, t0, time.Hour, func([]byte) (domain.DateRange, error) {
+		return domain.DateRange{Start: domain.DateOf(t0), End: domain.DateOf(t0)}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testStore.LinkConnection(ctx, u.ID, gh, "health-user", nil, seal); !errors.Is(err, store.ErrSyncInProgress) {
+		t.Fatalf("re-link during active sync: %v, want ErrSyncInProgress", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sync_runs SET started_at = now() - interval '2 hours' WHERE user_id = $1 AND id = $2`, u.ID, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := testStore.AbandonStaleSyncRuns(ctx, u.ID, gh, time.Hour); n != 1 || err != nil {
+		t.Fatalf("abandoned %d runs, err = %v", n, err)
+	}
+
+	linked := fakeSealed(t0.Add(time.Hour))
+	if _, err := testStore.LinkConnection(ctx, u.ID, gh, "health-user", nil, func(uuid.UUID) (store.SealedTokens, error) {
+		return linked, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := testStore.SetSyncRunTokens(ctx, run, id, fakeSealed(t0)); !errors.Is(err, store.ErrSyncRunAbandoned) {
+		t.Fatalf("abandoned run saving tokens: %v, want ErrSyncRunAbandoned", err)
+	}
+	got, err := testStore.GetConnectionTokens(ctx, u.ID, id)
+	if err != nil || !got.ExpiresAt.Equal(linked.ExpiresAt) {
+		t.Fatalf("newly linked tokens were overwritten: %v, %v", got, err)
 	}
 }

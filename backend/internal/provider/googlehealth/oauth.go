@@ -19,11 +19,12 @@ import (
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/domain"
 )
 
-// Grant is the result of a completed authorization: fresh credentials and
-// the scopes the user actually granted.
+// Grant holds the credentials and scopes from an authorization. AuthorizeLoopback
+// also populates HealthUserID with the verified account.
 type Grant struct {
-	Credentials domain.Credentials
-	Scopes      []string
+	Credentials  domain.Credentials
+	Scopes       []string
+	HealthUserID string
 }
 
 // String redacts the credentials.
@@ -81,13 +82,13 @@ func MissingScopes(granted []string) []string {
 	return missing
 }
 
-// CheckIdentity confirms the credentials can read Google Health data. A
+// CheckIdentity returns the Google Health account ID for the credentials. A
 // Google account that never opened the Google Health app fails with an
 // *APIError whose Reason is ReasonAccountNotLinked.
-func (p *Provider) CheckIdentity(ctx context.Context, creds domain.Credentials) error {
+func (p *Provider) CheckIdentity(ctx context.Context, creds domain.Credentials) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.apiBase+"/users/me/identity", nil)
 	if err != nil {
-		return fmt.Errorf("googlehealth: building identity request: %w", err)
+		return "", fmt.Errorf("googlehealth: building identity request: %w", err)
 	}
 	var identity struct {
 		HealthUserID string `json:"healthUserId"`
@@ -95,14 +96,14 @@ func (p *Provider) CheckIdentity(ctx context.Context, creds domain.Credentials) 
 	if err := p.call(ctx, creds.AccessToken, req, &identity); err != nil {
 		var apiErr *APIError
 		if errors.As(err, &apiErr) && apiErr.Reason == ReasonAccountNotLinked {
-			return fmt.Errorf("googlehealth: this Google account is not linked to Google Health; open the Google Health app once, then link again: %w", err)
+			return "", fmt.Errorf("googlehealth: this Google account is not linked to Google Health; open the Google Health app once, then link again: %w", err)
 		}
-		return fmt.Errorf("googlehealth: checking identity: %w", err)
+		return "", fmt.Errorf("googlehealth: checking identity: %w", err)
 	}
 	if identity.HealthUserID == "" {
-		return errors.New("googlehealth: identity response has no health user ID")
+		return "", errors.New("googlehealth: identity response has no health user ID")
 	}
-	return nil
+	return identity.HealthUserID, nil
 }
 
 // AuthorizeLoopback runs the installed-app flow (ADR-0004 §3). It listens on
@@ -195,7 +196,8 @@ func (p *Provider) AuthorizeLoopback(ctx context.Context, show func(authURL stri
 	if err != nil {
 		return Grant{}, err
 	}
-	if err := p.CheckIdentity(ctx, g.Credentials); err != nil {
+	g.HealthUserID, err = p.CheckIdentity(ctx, g.Credentials)
+	if err != nil {
 		return Grant{}, err
 	}
 	return g, nil

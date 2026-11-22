@@ -27,6 +27,8 @@ var (
 	testStore *store.Store
 )
 
+const fakeHealthUserID = "fake-health-user"
+
 // One PostgreSQL container for the package's integration tests; the unit
 // tests in this package do not touch it.
 func TestMain(m *testing.M) {
@@ -92,7 +94,7 @@ func newIntegration(t *testing.T, creds domain.Credentials) *integration {
 		t.Fatal(err)
 	}
 	in.vault = credentials.NewVault(testStore, kr)
-	if in.conn, err = in.vault.Link(ctx, in.user.ID, domain.ProviderGoogleHealth, nil, creds); err != nil {
+	if in.conn, err = in.vault.Link(ctx, in.user.ID, domain.ProviderGoogleHealth, fakeHealthUserID, nil, creds); err != nil {
 		t.Fatal(err)
 	}
 
@@ -248,7 +250,7 @@ func TestSync_RevokedGrantDisablesConnection(t *testing.T) {
 	}
 
 	// Re-linking makes it active again.
-	if _, err := in.vault.Link(in.ctx, in.user.ID, domain.ProviderGoogleHealth, nil,
+	if _, err := in.vault.Link(in.ctx, in.user.ID, domain.ProviderGoogleHealth, fakeHealthUserID, nil,
 		domain.Credentials{AccessToken: fakeAccess, RefreshToken: "fake-refresh-new", ExpiresAt: t0.Add(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}

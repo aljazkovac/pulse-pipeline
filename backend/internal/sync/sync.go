@@ -53,7 +53,7 @@ var _ Store = (*store.Store)(nil)
 // CredentialStore loads and persists a connection's decrypted OAuth tokens.
 type CredentialStore interface {
 	LoadCredentials(ctx context.Context, userID, connectionID uuid.UUID) (domain.Credentials, error)
-	SaveCredentials(ctx context.Context, userID, connectionID uuid.UUID, creds domain.Credentials) error
+	SaveCredentials(ctx context.Context, run domain.SyncRun, connectionID uuid.UUID, creds domain.Credentials) error
 }
 
 // NoCredentials serves providers that need no OAuth tokens (the mock). The
@@ -66,7 +66,7 @@ func (NoCredentials) LoadCredentials(context.Context, uuid.UUID, uuid.UUID) (dom
 }
 
 // SaveCredentials fails: there is nowhere to persist refreshed tokens.
-func (NoCredentials) SaveCredentials(context.Context, uuid.UUID, uuid.UUID, domain.Credentials) error {
+func (NoCredentials) SaveCredentials(context.Context, domain.SyncRun, uuid.UUID, domain.Credentials) error {
 	return errors.New("sync: no credential store configured")
 }
 
@@ -261,7 +261,7 @@ func (s *Syncer) SyncConnection(ctx context.Context, req Request) (domain.SyncRu
 	}
 
 	conn := domain.Connection{ID: connectionID, UserID: req.UserID, Provider: req.Provider, Location: loc}
-	out := s.ingest(ctx, hp, conn, run.ID, run.Range)
+	out := s.ingest(ctx, hp, conn, run)
 	return s.finish(ctx, conn, run, cur, out)
 }
 
@@ -324,44 +324,42 @@ type unit struct {
 	run  func(ctx context.Context) (int64, error)
 }
 
-func (s *Syncer) ingest(ctx context.Context, hp domain.HealthProvider, conn domain.Connection, runID uuid.UUID, r domain.DateRange) *outcome {
+func (s *Syncer) ingest(ctx context.Context, hp domain.HealthProvider, conn domain.Connection, run domain.SyncRun) *outcome {
 	out := &outcome{}
-	fail := func(err error) {
-		out.errs = append(out.errs, err)
-		if errors.Is(err, domain.ErrUnauthorized) {
-			out.unauthorized = true
-		}
-	}
 
 	creds, err := s.creds.LoadCredentials(ctx, conn.UserID, conn.ID)
 	if err != nil {
-		fail(fmt.Errorf("loading credentials: %w", err))
+		out.errs = append(out.errs, fmt.Errorf("loading credentials: %w", err))
 		return out
 	}
 	out.secrets = append(out.secrets, creds.AccessToken, creds.RefreshToken)
 	conn.Credentials = creds
 
 	// Units read conn when they run, so a refresh between units reaches them.
-	for _, u := range s.units(hp, &conn, runID, r) {
+	for _, u := range s.units(hp, &conn, run.ID, run.Range) {
 		if err := ctx.Err(); err != nil {
-			fail(fmt.Errorf("stopped before %s: %w", u.name, err))
+			out.errs = append(out.errs, fmt.Errorf("stopped before %s: %w", u.name, err))
 			break
 		}
 		// Access tokens can expire during a long run (Google's last an hour,
 		// ADR-0004 §2), so check before every unit, not only the first.
-		if err := s.refresh(ctx, hp, &conn, out, false); err != nil {
-			fail(err)
+		if err := s.refresh(ctx, hp, &conn, run, out, false); err != nil {
+			out.errs = append(out.errs, err)
 			break
 		}
 		n, err := u.run(ctx)
-		if errors.Is(err, domain.ErrUnauthorized) && !conn.Credentials.ExpiresAt.IsZero() {
-			// The access token was rejected before its recorded expiry (a
-			// long unit, clock skew, early invalidation). Refresh once and
-			// retry the unit; only a rejected refresh means re-linking.
-			if rerr := s.refresh(ctx, hp, &conn, out, true); rerr != nil {
-				err = fmt.Errorf("%w (after the provider rejected the access token)", rerr)
-			} else {
-				n, err = u.run(ctx)
+		if errors.Is(err, domain.ErrUnauthorized) {
+			switch {
+			case conn.Credentials.ExpiresAt.IsZero():
+				out.unauthorized = true
+			default:
+				// Retry the unit once. A second data-request rejection
+				// fails this unit, and refresh handles a rejected grant.
+				if rerr := s.refresh(ctx, hp, &conn, run, out, true); rerr != nil {
+					err = fmt.Errorf("%w (after the provider rejected the access token)", rerr)
+				} else {
+					n, err = u.run(ctx)
+				}
 			}
 		}
 		if err == nil {
@@ -369,14 +367,14 @@ func (s *Syncer) ingest(ctx context.Context, hp domain.HealthProvider, conn doma
 			out.succeeded++
 			continue // the write transaction recorded the heartbeat
 		}
-		fail(fmt.Errorf("%s: %w", u.name, err))
+		out.errs = append(out.errs, fmt.Errorf("%s: %w", u.name, err))
 		if out.unauthorized || errors.Is(err, store.ErrSyncRunAbandoned) {
 			break
 		}
-		if err := s.store.TouchSyncRun(ctx, conn.UserID, runID); errors.Is(err, store.ErrNotFound) {
+		if err := s.store.TouchSyncRun(ctx, conn.UserID, run.ID); errors.Is(err, store.ErrNotFound) {
 			break
 		} else if err != nil && ctx.Err() == nil {
-			s.log.Warn("could not record sync heartbeat", "run_id", runID, "error", err)
+			s.log.Warn("could not record sync heartbeat", "run_id", run.ID, "error", err)
 		}
 	}
 	return out
@@ -386,17 +384,18 @@ func (s *Syncer) ingest(ctx context.Context, hp domain.HealthProvider, conn doma
 // within RefreshBefore, and persists the new ones. Zero ExpiresAt means the
 // provider needs no refresh. Every token it sees is registered in out for
 // scrubbing.
-func (s *Syncer) refresh(ctx context.Context, hp domain.HealthProvider, conn *domain.Connection, out *outcome, force bool) error {
+func (s *Syncer) refresh(ctx context.Context, hp domain.HealthProvider, conn *domain.Connection, run domain.SyncRun, out *outcome, force bool) error {
 	exp := conn.Credentials.ExpiresAt
 	if exp.IsZero() || (!force && exp.After(s.now().Add(s.cfg.RefreshBefore))) {
 		return nil
 	}
 	fresh, err := retry(ctx, s, func() (domain.Credentials, error) { return hp.RefreshAuth(ctx, *conn) })
 	if err != nil {
+		out.unauthorized = errors.Is(err, domain.ErrUnauthorized)
 		return fmt.Errorf("refreshing credentials: %w", err)
 	}
 	out.secrets = append(out.secrets, fresh.AccessToken, fresh.RefreshToken)
-	if err := s.creds.SaveCredentials(ctx, conn.UserID, conn.ID, fresh); err != nil {
+	if err := s.creds.SaveCredentials(ctx, run, conn.ID, fresh); err != nil {
 		return fmt.Errorf("saving refreshed credentials: %w", err)
 	}
 	conn.Credentials = fresh

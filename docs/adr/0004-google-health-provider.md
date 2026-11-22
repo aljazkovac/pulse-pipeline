@@ -132,9 +132,9 @@ connection. Two changes in `sync`:
   `RefreshBefore`; units read the connection's current credentials when they run.
 - If a unit still fails with `ErrUnauthorized` while the credentials have an expiry (a long,
   retried unit that crossed it; clock skew; early invalidation), the worker forces one refresh
-  and re-runs that unit. Only a rejected refresh (`invalid_grant`) marks the run unauthorized and
-  sets the connection to `error`. Providers without expiring credentials (mock) keep ADR-0003's
-  behaviour.
+  and re-runs that unit. A second `401` fails the unit and leaves the connection eligible for
+  scheduled sync. Only a rejected refresh (`invalid_grant`) sets the connection to `error`.
+  Providers without expiring credentials (mock) keep ADR-0003's behaviour.
 
 ### 3. Linking an account: operator CLI with a loopback redirect
 
@@ -157,10 +157,11 @@ pulse-worker connect-google -user <USER_ID>
    verifier (on the caller's context, not the 5-minute wait), and rejects the grant unless **all three
    scopes** were granted: with partial consent every run would end `partial`, and ADR-0003
    never advances the cursor of a partial run.
-4. It calls `GET /v4/users/me/identity` to fail early with a clear message if the account is
-   not linked to Google Health.
-5. It stores the tokens encrypted (§4) and marks the connection active and due now. Re-linking
-   keeps the sync cursor.
+4. It calls `GET /v4/users/me/identity` to verify the account and obtain Google's `healthUserId`.
+5. It stores the verified ID in `provider_connections.provider_account_id` with the encrypted
+   tokens (§4) and marks the connection active and due now. Re-linking requires a matching
+   account ID and no running sync. It keeps the sync cursor. The transaction locks the connection
+   before checking for a running sync, using the same lock as the worker's claim and finish.
 
 This needs a **Desktop app** OAuth client. Its ID and secret come from
 `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` in a local `.env`, never from
@@ -182,17 +183,17 @@ exchange, scope check and vault, and only changes where the user ID comes from.
   `TOKEN_ENCRYPTION_PREVIOUS_KEYS`. Every refresh (at least nightly, since access tokens last an
   hour) re-seals both tokens with the current key. Retire the old key once
   `SELECT token_key_version, count(*) FROM provider_connections GROUP BY 1` shows no rows on it.
-- `store` moves only ciphertext (`GetConnectionTokens`, `SetConnectionTokens`, and
-  `LinkConnection`, which upserts the connection and its tokens in one transaction), each
-  scoped by `user_id`. `internal/credentials.Vault` seals and opens tokens and implements
-  `sync.CredentialStore`; connections without tokens (mock) load as empty credentials, so one
+- `store` reads and writes token ciphertext by `user_id`. `LinkConnection` stores the connection
+  and tokens in one transaction. A refresh writes tokens only while its run still owns the
+  connection. `internal/credentials.Vault` seals and opens tokens and implements
+  `sync.CredentialStore`. Connections without tokens (mock) load as empty credentials, so one
   vault serves every provider.
 - The worker registers the Google provider only when `GOOGLE_OAUTH_CLIENT_ID` and
   `GOOGLE_OAUTH_CLIENT_SECRET` are set, and then requires `TOKEN_ENCRYPTION_KEY`.
 
 ## Consequences
 
-- **Positive:** Real Fitbit Air data flows through the existing worker with no schema change.
+- **Positive:** Real Fitbit Air data flows through the existing worker.
   Vendor JSON stays inside one package. Tokens at rest are useless without the key and cannot be
   moved between rows. Re-linking a broken connection is one command and keeps history.
 - **Trade-offs:**
@@ -208,13 +209,10 @@ exchange, scope check and vault, and only changes where the user ID comes from.
     it locally against a port-forwarded database.
   - Raw intraday heart rate is high-volume (up to one sample per second); a 7-day chunk can be
     a dozen 10,000-point pages. Per-minute rollups are a local change if storage grows too fast.
-  - Re-linking does not record Google's `healthUserId`, so linking a *different* Google account
-    to the same Pulse user would mix two people's data under one user. Re-linking while a sync
-    of that connection is running can also be undone by the running worker (its refresh or
-    final status overwrites the new link). Both are operator actions and rare; see follow-ups.
+  - Existing connections without a stored account ID can sync with their current grant.
+    A new grant requires a separate Pulse user when the original account is unknown.
   - A transient error late in a paged fetch retries the whole unit from page 1, spending part of
     the 300 requests/minute per-user quota again.
-- **Follow-ups:** the Phase 2 web OAuth callback; store `healthUserId` on the connection and
-  refuse a mismatching re-link (or reset the cursor); refuse to link while a run is `running`;
-  per-page retries inside the adapter; a scope-aware sync that skips data types the user did not
-  grant; Phase 4 metrics for upstream `429`s and page counts.
+- **Follow-ups** include the Phase 2 web OAuth callback, per-page retries inside the adapter,
+  a scope-aware sync that fetches only the granted data types, and Phase 4 metrics for upstream
+  `429`s and page counts.

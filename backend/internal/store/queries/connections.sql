@@ -73,14 +73,13 @@ SET access_token_ciphertext  = @access_token_ciphertext,
     updated_at               = now()
 WHERE id = @id AND user_id = @user_id;
 
--- Links (or re-links) a provider account: the connection becomes active and
--- due now, keeping its sync cursor so history is not re-fetched.
+-- Re-linking locks the existing row and preserves its account ID and cursor.
 -- name: UpsertConnectionForLink :one
-INSERT INTO provider_connections (user_id, provider, scopes)
-VALUES (@user_id, @provider, @scopes)
+INSERT INTO provider_connections (user_id, provider, scopes, provider_account_id)
+VALUES (@user_id, @provider, @scopes, @provider_account_id)
 ON CONFLICT (user_id, provider) DO UPDATE
 SET scopes       = EXCLUDED.scopes,
     status       = 'active',
     next_sync_at = now(),
     updated_at   = now()
-RETURNING id;
+RETURNING id, provider_account_id;

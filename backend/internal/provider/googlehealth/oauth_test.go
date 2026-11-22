@@ -126,7 +126,7 @@ func TestAuthorizeLoopback_Success(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := domain.Credentials{AccessToken: fakeAccess, RefreshToken: fakeRefresh, ExpiresAt: t0.Add(3599 * time.Second)}
-	if g.Credentials != want || len(g.Scopes) != len(googlehealth.Scopes()) {
+	if g.Credentials != want || len(g.Scopes) != len(googlehealth.Scopes()) || g.HealthUserID != "1111" {
 		t.Errorf("grant = %v", g)
 	}
 	if s := g.String(); strings.Contains(s, fakeAccess) || strings.Contains(s, fakeRefresh) {
@@ -146,6 +146,7 @@ func TestAuthorizeLoopback_Failures(t *testing.T) {
 		"user denied":    {all, fakeRefresh, 200, nil, func(q url.Values) { q.Del("code"); q.Set("error", "access_denied<script>") }, "authorization denied: access_deniedscript"},
 		"partial scopes": {googlehealth.Scopes()[0], fakeRefresh, 200, nil, nil, "not all permissions were granted"},
 		"no refresh":     {all, "", 200, nil, nil, "no refresh token"},
+		"no identity":    {all, fakeRefresh, 200, map[string]any{}, nil, "no health user ID"},
 		"not linked": {all, fakeRefresh, 400, rpcErr(400, "FAILED_PRECONDITION", googlehealth.ReasonAccountNotLinked, "The account is not linked to Google Health."),
 			nil, "not linked to Google Health"},
 	} {

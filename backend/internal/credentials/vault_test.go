@@ -67,11 +67,21 @@ func fakeCreds(suffix string) domain.Credentials {
 	}
 }
 
+func startRun(t *testing.T, ctx context.Context, u domain.User) domain.SyncRun {
+	t.Helper()
+	day := domain.DateOf(t0)
+	run, err := testStore.StartSyncRun(ctx, u.ID, domain.ProviderGoogleHealth, domain.SyncTriggerManual, domain.DateRange{Start: day, End: day})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return run
+}
+
 func TestVault_LinkLoadSave(t *testing.T) {
 	ctx, u := setup(t)
 	v := credentials.NewVault(testStore, keyring(t, 1, map[int16][]byte{1: key1}))
 
-	id, err := v.Link(ctx, u.ID, domain.ProviderGoogleHealth, []string{"fake-scope"}, fakeCreds("1"))
+	id, err := v.Link(ctx, u.ID, domain.ProviderGoogleHealth, "health-user", []string{"fake-scope"}, fakeCreds("1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,14 +102,14 @@ func TestVault_LinkLoadSave(t *testing.T) {
 		t.Fatal("token plaintext stored in provider_connections")
 	}
 
-	if err := v.SaveCredentials(ctx, u.ID, id, fakeCreds("2")); err != nil {
+	if err := v.SaveCredentials(ctx, startRun(t, ctx, u), id, fakeCreds("2")); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := v.LoadCredentials(ctx, u.ID, id); err != nil || got != fakeCreds("2") {
 		t.Fatalf("after save: ok=%v err=%v", got == fakeCreds("2"), err)
 	}
 
-	if _, err := v.Link(ctx, u.ID, domain.ProviderGoogleHealth, nil, domain.Credentials{AccessToken: "fake-access-only"}); err == nil {
+	if _, err := v.Link(ctx, u.ID, domain.ProviderGoogleHealth, "health-user", nil, domain.Credentials{AccessToken: "fake-access-only"}); err == nil {
 		t.Fatal("Link accepted credentials without a refresh token")
 	}
 }
@@ -121,14 +131,18 @@ func TestVault_TenantIsolation(t *testing.T) {
 	ctx, alice := setup(t)
 	_, bob := setup(t)
 	v := credentials.NewVault(testStore, keyring(t, 1, map[int16][]byte{1: key1}))
-	aliceConn, err := v.Link(ctx, alice.ID, domain.ProviderGoogleHealth, nil, fakeCreds("alice"))
+	aliceConn, err := v.Link(ctx, alice.ID, domain.ProviderGoogleHealth, "health-alice", nil, fakeCreds("alice"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := v.LoadCredentials(ctx, bob.ID, aliceConn); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("bob loading alice's credentials: want ErrNotFound, got %v", err)
 	}
-	if err := v.SaveCredentials(ctx, bob.ID, aliceConn, fakeCreds("bob")); !errors.Is(err, store.ErrNotFound) {
+	bobConn, err := v.Link(ctx, bob.ID, domain.ProviderGoogleHealth, "health-bob", nil, fakeCreds("bob"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := v.SaveCredentials(ctx, startRun(t, ctx, bob), aliceConn, fakeCreds("bob")); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("bob saving over alice's credentials: want ErrNotFound, got %v", err)
 	}
 	if got, err := v.LoadCredentials(ctx, alice.ID, aliceConn); err != nil || got != fakeCreds("alice") {
@@ -137,10 +151,6 @@ func TestVault_TenantIsolation(t *testing.T) {
 
 	// Ciphertext copied from Alice's row into Bob's fails authentication:
 	// it is bound to the row it was sealed for.
-	bobConn, err := v.Link(ctx, bob.ID, domain.ProviderGoogleHealth, nil, fakeCreds("bob"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	if _, err := testPool.Exec(ctx, `
 		UPDATE provider_connections b
 		SET access_token_ciphertext = a.access_token_ciphertext,
@@ -169,7 +179,7 @@ func TestVault_TenantIsolation(t *testing.T) {
 func TestVault_KeyRotation(t *testing.T) {
 	ctx, u := setup(t)
 	v1 := credentials.NewVault(testStore, keyring(t, 1, map[int16][]byte{1: key1}))
-	id, err := v1.Link(ctx, u.ID, domain.ProviderGoogleHealth, nil, fakeCreds("old"))
+	id, err := v1.Link(ctx, u.ID, domain.ProviderGoogleHealth, "health-user", nil, fakeCreds("old"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +189,7 @@ func TestVault_KeyRotation(t *testing.T) {
 		t.Fatalf("reading v1 row after rotation failed: %v", err)
 	}
 	// A refresh re-saves the tokens, which re-seals them under the new key.
-	if err := rotated.SaveCredentials(ctx, u.ID, id, fakeCreds("new")); err != nil {
+	if err := rotated.SaveCredentials(ctx, startRun(t, ctx, u), id, fakeCreds("new")); err != nil {
 		t.Fatal(err)
 	}
 	sealed, err := testStore.GetConnectionTokens(ctx, u.ID, id)

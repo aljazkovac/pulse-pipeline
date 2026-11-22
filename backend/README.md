@@ -31,25 +31,42 @@ rollups; and sleep sessions with deep/REM/light/awake stages. The API has no sle
 1. In Google Cloud Console, enable the Google Health API, configure the OAuth consent screen
    (External, Testing) with your Google account as a test user, and create an OAuth client of
    type **Desktop app**. Open the Google Health app on your phone once so the account is linked.
-2. Put the client ID and secret, and a token key, in your local `.env` (never in the repository
-   or in chat):
+2. From the repository root, set `DATABASE_URL`, `GOOGLE_OAUTH_CLIENT_ID`,
+   `GOOGLE_OAUTH_CLIENT_SECRET`, and `TOKEN_ENCRYPTION_KEY` in your local `.env`.
+   Use `.env.example` as a template and keep your local `.env` out of the repository and chat.
+   Generate the token key with OpenSSL.
 
    ```bash
    openssl rand -base64 32   # value for TOKEN_ENCRYPTION_KEY
    ```
 
-3. Create a user (for example with `seed-dev`) and link it. The command prints a Google consent
-   URL; open it in a browser **on the same machine** and allow every permission. Google redirects
-   to a temporary listener on `127.0.0.1`, and the command stores the tokens encrypted:
+3. The worker reads its environment. In the shell where you will run it, export the settings
+   from your local `.env` and enter the backend directory.
 
    ```bash
-   go run ./cmd/worker connect-google -user <ID>
-   go run ./cmd/worker sync -user <ID> -provider google_health
+   set -a
+   . ./.env
+   set +a
+   cd backend
+   ```
+
+4. Use an existing Pulse user ID or create a user with `go run ./cmd/worker seed-dev` in
+   development. Replace `PULSE_USER_ID` below with that ID. Open the consent URL printed by
+   `connect-google` in a browser **on the same machine** and allow every permission. Google
+   redirects to a temporary listener on `127.0.0.1`, and the worker stores the tokens encrypted.
+
+   ```bash
+   go run ./cmd/worker connect-google -user PULSE_USER_ID
+   go run ./cmd/worker sync -user PULSE_USER_ID -provider google_health
    ```
 
 While the Google Cloud app is in *Testing* status, Google expires its refresh tokens after
 7 days. The next sync then fails with `invalid_grant`, the connection goes to `error`, and
-`connect-google` must be run again (it keeps the sync history).
+`connect-google` must be run again with the same Google Health account. Re-linking keeps the
+sync history. If a sync is running, wait for it to finish and retry. Connections linked before
+account verification was stored can continue syncing with their existing credentials. To link
+again when the original account is unknown, use a separate Pulse user to keep the histories
+separate.
 
 **Rotating `TOKEN_ENCRYPTION_KEY`:** set the new key with a higher
 `TOKEN_ENCRYPTION_KEY_VERSION` and move the old one to `TOKEN_ENCRYPTION_PREVIOUS_KEYS`

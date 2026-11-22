@@ -48,6 +48,7 @@ type ProviderConnection struct {
 	LastSyncedAt           *time.Time
 	CreatedAt              time.Time
 	UpdatedAt              time.Time
+	ProviderAccountID      pgtype.Text
 }
 
 type SleepSession struct {

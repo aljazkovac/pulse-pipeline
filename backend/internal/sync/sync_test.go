@@ -660,7 +660,7 @@ func (m *memCredentials) LoadCredentials(context.Context, uuid.UUID, uuid.UUID) 
 	return m.creds, nil
 }
 
-func (m *memCredentials) SaveCredentials(_ context.Context, _, _ uuid.UUID, c domain.Credentials) error {
+func (m *memCredentials) SaveCredentials(_ context.Context, _ domain.SyncRun, _ uuid.UUID, c domain.Credentials) error {
 	m.saved = append(m.saved, c)
 	m.creds = c
 	return nil
@@ -774,6 +774,25 @@ func TestUnauthorized_RejectedRefreshDisablesConnection(t *testing.T) {
 	run := h.sync(domain.SyncTriggerScheduled, nil)
 	if run.Status != domain.SyncPartial || h.connection().Status != domain.ConnectionError || len(creds.saved) != 0 {
 		t.Fatalf("run %s, connection %s, saves %d; want partial, error, none", run.Status, h.connection().Status, len(creds.saved))
+	}
+}
+
+func TestUnauthorized_AfterSuccessfulRefreshKeepsConnectionActive(t *testing.T) {
+	creds := &memCredentials{creds: domain.Credentials{AccessToken: "fake-access", RefreshToken: "fake-refresh", ExpiresAt: t0.Add(time.Hour)}}
+	h := newHarness(t,
+		func(_ *harness, c *sync.Config, _ *[]domain.HealthProvider) { c.Credentials = creds },
+		withProvider(newFaulty(func(op string, _ int) error {
+			if op == string(domain.MetricSteps) {
+				return fmt.Errorf("HTTP 401: %w", domain.ErrUnauthorized)
+			}
+			return nil
+		})))
+	run := h.sync(domain.SyncTriggerScheduled, nil)
+	if run.Status != domain.SyncPartial || !strings.Contains(run.ErrorMessage, "HTTP 401") || len(creds.saved) != 1 {
+		t.Fatalf("run = %+v, saves = %d; want a partial run and one refresh", run, len(creds.saved))
+	}
+	if c := h.connection(); c.Status != domain.ConnectionActive || !c.NextSyncAt.Equal(t0.Add(time.Hour)) {
+		t.Fatalf("connection = %+v, want active and rescheduled", c)
 	}
 }
 

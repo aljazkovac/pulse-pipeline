@@ -7,6 +7,12 @@ ON CONFLICT (user_id, provider) WHERE status = 'running' DO NOTHING
 RETURNING id, user_id, provider, trigger, status, range_start, range_end,
           records_ingested, error_message, started_at, finished_at, heartbeat_at;
 
+-- name: HasRunningSyncRun :one
+SELECT EXISTS (
+    SELECT 1 FROM sync_runs
+    WHERE user_id = @user_id AND provider = @provider AND status = 'running'
+);
+
 -- name: FinishSyncRun :one
 UPDATE sync_runs
 SET status           = @status,

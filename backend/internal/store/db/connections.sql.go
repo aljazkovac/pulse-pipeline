@@ -347,27 +347,37 @@ func (q *Queries) SetConnectionTokens(ctx context.Context, arg SetConnectionToke
 }
 
 const upsertConnectionForLink = `-- name: UpsertConnectionForLink :one
-INSERT INTO provider_connections (user_id, provider, scopes)
-VALUES ($1, $2, $3)
+INSERT INTO provider_connections (user_id, provider, scopes, provider_account_id)
+VALUES ($1, $2, $3, $4)
 ON CONFLICT (user_id, provider) DO UPDATE
 SET scopes       = EXCLUDED.scopes,
     status       = 'active',
     next_sync_at = now(),
     updated_at   = now()
-RETURNING id
+RETURNING id, provider_account_id
 `
 
 type UpsertConnectionForLinkParams struct {
-	UserID   uuid.UUID
-	Provider string
-	Scopes   []string
+	UserID            uuid.UUID
+	Provider          string
+	Scopes            []string
+	ProviderAccountID pgtype.Text
 }
 
-// Links (or re-links) a provider account: the connection becomes active and
-// due now, keeping its sync cursor so history is not re-fetched.
-func (q *Queries) UpsertConnectionForLink(ctx context.Context, arg UpsertConnectionForLinkParams) (uuid.UUID, error) {
-	row := q.db.QueryRow(ctx, upsertConnectionForLink, arg.UserID, arg.Provider, arg.Scopes)
-	var id uuid.UUID
-	err := row.Scan(&id)
-	return id, err
+type UpsertConnectionForLinkRow struct {
+	ID                uuid.UUID
+	ProviderAccountID pgtype.Text
+}
+
+// Re-linking locks the existing row and preserves its account ID and cursor.
+func (q *Queries) UpsertConnectionForLink(ctx context.Context, arg UpsertConnectionForLinkParams) (UpsertConnectionForLinkRow, error) {
+	row := q.db.QueryRow(ctx, upsertConnectionForLink,
+		arg.UserID,
+		arg.Provider,
+		arg.Scopes,
+		arg.ProviderAccountID,
+	)
+	var i UpsertConnectionForLinkRow
+	err := row.Scan(&i.ID, &i.ProviderAccountID)
+	return i, err
 }

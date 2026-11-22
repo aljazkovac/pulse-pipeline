@@ -150,7 +150,7 @@ func connectGoogle(ctx context.Context, d deps, userID uuid.UUID, stdout io.Writ
 	if err != nil {
 		return err
 	}
-	connectionID, err := d.vault.Link(ctx, u.ID, domain.ProviderGoogleHealth, grant.Scopes, grant.Credentials)
+	connectionID, err := d.vault.Link(ctx, u.ID, domain.ProviderGoogleHealth, grant.HealthUserID, grant.Scopes, grant.Credentials)
 	if err != nil {
 		return err
 	}

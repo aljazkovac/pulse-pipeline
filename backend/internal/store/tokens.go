@@ -23,6 +23,13 @@ type SealedTokens struct {
 	ExpiresAt  time.Time
 }
 
+var (
+	// ErrProviderAccountMismatch means re-linking used a different provider account.
+	ErrProviderAccountMismatch = errors.New("store: choose the originally linked provider account")
+	// ErrProviderAccountUnverified means a legacy link has no stored account ID.
+	ErrProviderAccountUnverified = errors.New("store: the original provider account is unknown; link to a separate Pulse user to keep histories separate")
+)
+
 // String keeps ciphertext out of logs; it is useless without the key but
 // still not something to print.
 func (t SealedTokens) String() string {
@@ -63,21 +70,41 @@ func (s *Store) SetConnectionTokens(ctx context.Context, userID, connectionID uu
 	return nil
 }
 
-// LinkConnection creates or re-activates the user's connection to provider
-// and stores its tokens in one transaction. seal receives the connection ID
-// so the ciphertext can be bound to it. Re-linking keeps the sync cursor and
-// makes the connection due immediately.
-func (s *Store) LinkConnection(ctx context.Context, userID uuid.UUID, provider domain.Provider, scopes []string, seal func(connectionID uuid.UUID) (SealedTokens, error)) (uuid.UUID, error) {
+// LinkConnection stores the verified account and its tokens in one transaction.
+// Re-linking requires the same account and no running sync. It keeps the sync
+// cursor and makes the connection due immediately.
+func (s *Store) LinkConnection(ctx context.Context, userID uuid.UUID, provider domain.Provider, accountID string, scopes []string, seal func(connectionID uuid.UUID) (SealedTokens, error)) (uuid.UUID, error) {
+	if accountID == "" {
+		return uuid.Nil, errors.New("store: linking requires a verified provider account ID")
+	}
 	if scopes == nil {
 		scopes = []string{}
 	}
 	var id uuid.UUID
 	err := s.inTx(ctx, func(tx *Store) error {
-		var err error
-		id, err = tx.q.UpsertConnectionForLink(ctx, db.UpsertConnectionForLinkParams{UserID: userID, Provider: string(provider), Scopes: scopes})
+		conn, err := tx.q.UpsertConnectionForLink(ctx, db.UpsertConnectionForLinkParams{
+			UserID: userID, Provider: string(provider), Scopes: scopes,
+			ProviderAccountID: pgtype.Text{String: accountID, Valid: true},
+		})
 		if err != nil {
 			return fmt.Errorf("upserting connection: %w", err)
 		}
+		if !conn.ProviderAccountID.Valid {
+			return ErrProviderAccountUnverified
+		}
+		if conn.ProviderAccountID.String != accountID {
+			return ErrProviderAccountMismatch
+		}
+		// Read the run after acquiring the connection lock so a concurrent
+		// claim has either committed or is waiting for this transaction.
+		running, err := tx.q.HasRunningSyncRun(ctx, db.HasRunningSyncRunParams{UserID: userID, Provider: string(provider)})
+		if err != nil {
+			return fmt.Errorf("checking for a running sync: %w", err)
+		}
+		if running {
+			return ErrSyncInProgress
+		}
+		id = conn.ID
 		t, err := seal(id)
 		if err != nil {
 			return err
@@ -88,6 +115,28 @@ func (s *Store) LinkConnection(ctx context.Context, userID uuid.UUID, provider d
 		return uuid.Nil, fmt.Errorf("linking %s connection for user %s: %w", provider, userID, err)
 	}
 	return id, nil
+}
+
+// SetSyncRunTokens saves refreshed tokens only while the run owns the
+// connection. Lock the connection before touching the run, as claim and
+// finalization do, to fence off workers that resume after being abandoned.
+func (s *Store) SetSyncRunTokens(ctx context.Context, run domain.SyncRun, connectionID uuid.UUID, t SealedTokens) error {
+	return s.inTx(ctx, func(tx *Store) error {
+		conn, err := tx.lockConnectionForSync(ctx, run.UserID, run.Provider)
+		if err != nil {
+			return err
+		}
+		if conn.ID != connectionID {
+			return fmt.Errorf("saving tokens for sync run %s: connection changed: %w", run.ID, ErrNotFound)
+		}
+		if err := tx.TouchSyncRun(ctx, run.UserID, run.ID); err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return fmt.Errorf("saving tokens for sync run %s: %w", run.ID, ErrSyncRunAbandoned)
+			}
+			return err
+		}
+		return tx.SetConnectionTokens(ctx, run.UserID, connectionID, t)
+	})
 }
 
 func (t SealedTokens) validate() error {
