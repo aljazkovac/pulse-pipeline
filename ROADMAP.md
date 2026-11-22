@@ -95,20 +95,31 @@ Build the multi-user, multi-provider data foundation and nightly ingestion servi
 
 ---
 
-### Phase 2: Web & Phone App (PWA) Dashboards + Playwright E2E Agents
+### Phase 2: Authenticated API, Web & Phone App (PWA) Dashboards + Playwright E2E Agents
 
-Create the responsive frontend accessible on desktop browsers and installable as a mobile phone app.
+Add the authenticated read API the dashboards need, then build the responsive frontend for desktop browsers and as an installable phone app. The API contract, authentication, read model and queued manual sync are decided in [ADR-0005](docs/adr/0005-api-auth-and-read-model.md). Each dashboard ships as one vertical slice — store query, endpoint, UI, Vitest and Playwright specs together — rather than leaving tests to the end. **2a** (foundation + Overview + Connections) is a usable daily driver on its own; **2b** completes the analytics views and installability.
 
-- [ ] Scaffold `web/` using React, TypeScript, Vite, and Tailwind CSS
-- [ ] Build responsive layout shell (desktop sidebar navigation + mobile bottom tab bar with safe-area support)
-- [ ] Implement core health dashboards:
-  - [ ] **Overview Dashboard:** Daily readiness/pulse summary, step goal ring, sleep duration, resting HR
-  - [ ] **Heart Rate & HRV View:** Intraday heart rate timeline and 7/30/90-day resting HR & HRV trends
-  - [ ] **Sleep Analytics View:** Sleep stages breakdown (Deep, REM, Light, Awake) and consistency trends
-  - [ ] **Sync & Connections View:** Google Health OAuth connect button (web callback for authenticated users, reusing the ADR-0004 code exchange and vault), last sync status, manual sync trigger (authenticated `POST` endpoint calling `Syncer.SyncConnection`, ADR-0003 §5)
-- [ ] Configure Progressive Web App (PWA) manifest, icons, and service worker for mobile home-screen installation
-- [ ] Write frontend unit/component tests (Vitest + Testing Library)
-- [ ] Create E2E specifications and automate desktop + mobile viewport verification using **Playwright agents**
+**2a — Foundation**
+
+- [ ] Accept ADR-0005 (API shape, Google sign-in + sessions, read model, queued manual sync, E2E auth) and write the Designer spec for the layout shell and dashboards (tokens, loading/empty/error states, a11y)
+- [ ] Scaffold `web/` (React, TypeScript `strict`, Vite, Tailwind CSS) with all five Make scripts from day one (`build`, `typecheck`, `lint`, `test`, `test:e2e`) and a dev proxy from `/api` to the API, so CI gates the frontend immediately
+- [ ] API foundation: `/api/v1` on `net/http`, OpenAPI contract with generated Go and TypeScript types (drift-checked in CI like `sqlc`), RFC 9457 errors, `Cache-Control: no-store`, graceful shutdown, no query strings or cookies in logs
+- [ ] Authentication: Google sign-in (OIDC + PKCE) for `PULSE_ALLOWED_EMAILS`, `user_identities` + server-side `sessions` (migration `000004`), `HttpOnly` session cookie, `http.CrossOriginProtection`; every handler scoped to the session's `user_id` with cross-user isolation tests
+- [ ] Deterministic E2E stack: `seed-dev -user-id`, `PULSE_DEV_NOW` fixed clock and a development-only login (`ENV=development` + `PULSE_ENABLE_DEV_LOGIN`); Playwright desktop (`1280x800`) and mobile (`390x844`) projects
+- [ ] Build responsive layout shell (desktop sidebar navigation + mobile bottom tab bar with safe-area support, signed-in/out states)
+
+**2a — Slices**
+
+- [ ] **Overview Dashboard:** step goal ring (new `users.step_goal` setting), sleep duration (derived from sleep sessions), resting HR and HRV for the selected local day, last sync status; settings for timezone, step goal and primary provider (`PATCH /api/v1/me`)
+- [ ] **Sync & Connections View:** connections and recent `sync_runs`; Google Health web linking via a *Web application* OAuth client, reusing the ADR-0004 exchange, scope check and vault and recording the issuing client per connection; "Sync now" queues a manual run (`sync_requested_at`, `202 Accepted`) that the worker picks up on its next poll (amends ADR-0003 §5)
+
+**2b — Analytics & installability**
+
+- [ ] **Heart Rate & HRV View:** bucketed intraday heart rate timeline (`date_bin` aggregation, ≤ 1,440 points) and 7/30/90-day resting HR & HRV trends with 7-day means
+- [ ] **Sleep Analytics View:** sleep stages breakdown (Deep, REM, Light, Awake), time asleep vs in bed, bedtime/wake consistency (no sleep score: Google Health does not provide one)
+- [ ] Configure Progressive Web App (PWA) manifest, icons, and an app-shell-only service worker (API responses are never cached); verify installability with Playwright — installing on a real phone needs HTTPS and lands with Phase 5 (or a local tunnel)
+
+Deferred out of Phase 2: a derived **readiness score** (no upstream source; becomes the Phase 4 dashboard-insights experiment) and merged multi-provider views.
 
 ---
 
@@ -116,7 +127,7 @@ Create the responsive frontend accessible on desktop browsers and installable as
 
 Expose health data safely to AI assistants and agents via the Model Context Protocol.
 
-- [ ] Build `mcp/` server in Go using `modelcontextprotocol/go-sdk`
+- [ ] Build the MCP server in Go using `modelcontextprotocol/go-sdk`, moved to `backend/cmd/mcp` so it reuses `internal/readmodel` and `internal/store` (ADR-0005 §10)
 - [ ] Implement MCP Tools:
   - [ ] `get_daily_summary` (fetch daily metrics for a date or range)
   - [ ] `query_metric_timeseries` (query heart rate, steps, HRV, or sleep with aggregation buckets)
@@ -136,7 +147,7 @@ Instrument the platform for production-grade visibility and controlled feature r
 - [ ] Build & version-control **Grafana** dashboards (System Health, Sync Pipeline Telemetry, Database Performance)
 - [ ] Integrate **OpenFeature** + **Flipt** for feature flags and A/B testing:
   - [ ] Implement backend and frontend flag evaluation
-  - [ ] Create an A/B experiment on dashboard insights/visualizations and track experiment metrics in Prometheus/Grafana
+  - [ ] Create an A/B experiment on dashboard insights/visualizations (e.g. a derived readiness score, deferred from Phase 2) and track experiment metrics in Prometheus/Grafana
 
 ---
 
