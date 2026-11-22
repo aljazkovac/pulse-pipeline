@@ -80,14 +80,21 @@ Constraints:
   - `email_verified` is `true`.
 
   As in ADR-0004, this is plain `net/http` with no Google SDK.
-- **Allowlist:** `PULSE_ALLOWED_EMAILS` is a comma-separated list of emails that may sign in. Any
-  other account gets `403`, and no row is written.
-- **Identities:** the new `user_identities` table has primary key `(issuer, subject)` and also
-  stores `user_id`, `email`, `created_at` and `last_login_at`.
-  - Returning users are found by `(iss, sub)`, never by email.
-  - On an identity's first sign-in, an existing user with the same (case-insensitive) email is
-    bound to it. This is how users created by `seed-dev` or used with `connect-google` keep their
-    history. If no such user exists, one is created.
+- **Sign-in and account ownership.** Check the token email against the comma-separated
+  `PULSE_ALLOWED_EMAILS` on every sign-in. Return `403` for an unlisted email. Look up a
+  returning identity by its validated `(issuer, subject)`, using `https://accounts.google.com`
+  for both accepted issuer spellings. The `user_identities` table uses that pair as its
+  primary key and stores `user_id`, `email`, `created_at` and `last_login_at`.
+  - A new identity may create a Pulse user when the allowlisted email is unused and Google is
+    authoritative for it (Gmail, or verified Google Workspace email with an `hd` claim).
+    Create the user and identity in one transaction. If the email already belongs to a Pulse
+    user, including a case-insensitive collision during concurrent enrollment, return `403`
+    without creating a session or changing either account.
+  - To preserve a Phase 1 user's history, an operator independently verifies the owner and
+    binds the exact Google identity to the existing Pulse user ID. Third-party email addresses
+    require operator enrollment with a fresh mailbox-ownership check. Replacing an established
+    identity requires operator recovery and revokes the user's existing sessions.
+    [Google's guidance on email ownership](https://developers.google.com/identity/gsi/web/guides/verify-google-id-token)
 - **Timezone and step goal:** both come from the user's settings (§5). The web app offers the
   browser's IANA zone when `users.timezone` is still the default `UTC`.
 
@@ -115,12 +122,14 @@ Constraints:
 - **Cross-site requests:** Go's `http.CrossOriginProtection` (Go 1.25+) wraps the mux and rejects
   cross-origin non-safe requests, using `Sec-Fetch-Site` with an `Origin` fallback. With
   `SameSite=Lax` cookies, no CSRF tokens are needed.
-- **OAuth flow cookie:** login and link flows keep `state`, the PKCE verifier and the flow's
-  purpose in a short-lived cookie: `__Host-pulse_oauth` (`pulse_oauth` in development),
-  `HttpOnly`, `SameSite=Lax`, `Max-Age=600`.
-  - The callback compares `state` in constant time and deletes the cookie.
-  - A link flow also stores the hash of the session that started it. The callback refuses to
-    finish it in a different session.
+- **OAuth flow cookie.** Login and health linking store `state`, the PKCE verifier and the flow
+  purpose in a ten-minute cookie. In production, set `__Host-pulse_oauth` over HTTPS with
+  `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/` and `Max-Age=600`. Omit `Domain`. For plain
+  HTTP development, use `pulse_oauth` and omit `Secure`. [Cookie prefix requirements](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#section-4.1.3.2)
+  - The callback checks the purpose, compares `state` in constant time and expires the cookie
+    using the same name, path and security attributes.
+  - A link callback also verifies that the current session matches the session hash saved at
+    the start of the flow.
 
 ### 4. Linking Google Health from the web (amends ADR-0004 §3)
 
@@ -162,7 +171,10 @@ Constraints:
   - It also holds `user_id`-scoped store reads, tested with Testcontainers.
 - **Which provider:** the dashboards read one provider at a time. Merging providers needs
   de-duplication rules we do not have.
-  - The default is `users.primary_provider`, which is set when a user's first connection is created.
+  - Migration `000004` sets `users.primary_provider` for each existing user with connections.
+    Prefer an active connection, then the earliest `created_at`, then provider name to break
+    ties. Users without connections keep `NULL`. CLI and web linking set the default in the
+    connection transaction only when it is `NULL`. Later links preserve the user's choice.
   - Read endpoints accept an optional `provider`, limited to providers the user has a connection
     for.
 - **Daily data and trends:** they come from `daily_summaries`. The read model adds a trailing
@@ -176,11 +188,22 @@ Constraints:
   - A range is at most 7 local days.
   - The `intraday_metrics` primary key `(user_id, provider, metric_type, recorded_at)` serves
     this range scan, so no index is added.
-- **Sleep:** sleep comes from `sleep_sessions` and `sleep_stages`.
-  - Time asleep is the sum of deep, REM and light stages.
-  - Nights without stages ("classic" sleep) use `end_at − start_at` and are marked `staged: false`.
-  - Consistency is the standard deviation of main-sleep bedtimes and wake times on the local
-    clock over the window.
+- **Time asleep.** For staged sessions, sum the durations of deep, REM and light sleep. For
+  sessions without stages, return `staged: false` and use the provider's reported minutes
+  asleep when available. The Google Health adapter maps `minutesAsleep` into a nullable field
+  on the normalized sleep session and the store persists it on upsert. For historical sessions
+  with only start and end instants, return `null` for time asleep. A reported zero remains
+  zero. Overview and Sleep use the same calculation.
+- **Sleep consistency.** Compute bedtime and wake-time consistency separately for main-sleep
+  sessions in the user's current timezone. Use circular standard deviation on a 24-hour clock,
+  expressed in minutes. Bedtimes of 23:55 and 00:05 have a spread of about five minutes.
+  Return `null` for fewer than two observations or an undefined circular mean.
+- **Sleep dates.** Assign each session to the local date of its wake instant (`end_at`) in the
+  user's current timezone. For an inclusive `from`–`to` request, select `end_at` from local
+  midnight on `from` up to, but excluding, local midnight on the calendar day after `to`.
+  Convert both boundaries to UTC and scope the query by `user_id` and provider. Overview,
+  Sleep and consistency use this rule. A timezone change takes effect on the next read,
+  including across 23- and 25-hour days.
 - **Settings:** `users.step_goal` is `INTEGER NOT NULL DEFAULT 10000`, with a
   `CHECK (step_goal BETWEEN 1 AND 100000)`. `PATCH /api/v1/me` updates `timezone` (validated
   with `time.LoadLocation`), `step_goal` and `primary_provider`.
@@ -193,20 +216,25 @@ Constraints:
 first sync covers 30 days with retries, and an HTTP request should neither wait for it nor tie
 an API replica to a provider's rate limit.
 
-- **Queueing:** the endpoint sets `provider_connections.sync_requested_at = now()` and answers
-  `202` with the connection's state.
-  - It answers `409` (`relink-required`) for connections in `error` or `revoked`.
-  - It answers `202` without queueing when a run is already running.
-- **Pick-up:** `ListConnectionsDueForSync` returns connections where
-  `next_sync_at <= now OR sync_requested_at IS NOT NULL`, plus a `requested` flag.
-  - The worker runs flagged connections with trigger `manual`, and the claim clears the request.
-  - If the claim finds a run already in progress, it drops the request; that run already fetches
-    the latest data.
+- **Queueing.** Lock the signed-in user's connection. Return `409` (`relink-required`) for an
+  `error` or `revoked` connection. If a request is pending, preserve its `sync_requested_at`
+  and return `202 queued`. If a live scheduled or manual run already covers the full window
+  that an incremental sync would request now (ADR-0003 §2), return `202 running` with its run
+  ID. Otherwise set `sync_requested_at = now()` and return `202 queued`. A historical backfill
+  can finish while the manual request stays pending.
+- **Claiming.** `ListConnectionsDueForSync` returns active connections that are due or have
+  a pending request. Its `requested` flag is a hint. To claim queued work, lock the connection
+  and recheck its status and `sync_requested_at`. If the marker is absent, skip the queued claim.
+  If another live run holds the slot, leave the marker in place. Otherwise insert the `manual`
+  run and clear the marker in the same transaction. A failed insert or rollback leaves the
+  request pending. The operator CLI can still start an on-demand run without a queue marker.
 - **Outcome:** as ADR-0003 §3 defines for `manual`.
   - A successful run advances the cursor and schedules the next nightly run.
   - A failed one leaves `next_sync_at`, so the nightly run is unaffected.
-- **Latency:** at most `PULSE_SYNC_POLL_INTERVAL` (1 minute). The UI shows the request as
-  "queued" and polls `GET /api/v1/connections/{provider}/sync-runs`.
+- **Latency and status.** An idle worker polls every `PULSE_SYNC_POLL_INTERVAL` (one minute by
+  default). A running sync, retries or work ahead of the connection can delay the start beyond
+  that interval. The connections response exposes `sync_requested_at` so the UI can show
+  "queued" before a run exists. Once claimed, the run appears in `sync-runs`.
 
 ### 7. Endpoints (v1)
 
@@ -220,7 +248,7 @@ All endpoints require a session except the sign-in routes and `/healthz`.
 | `GET /api/v1/daily?from=&to=&provider=` | Daily summaries with 7-day means (trends; at most 366 days). |
 | `GET /api/v1/metrics/{metric}/series?from=&to=&provider=` | Bucketed intraday series (§5). |
 | `GET /api/v1/sleep?from=&to=&provider=` | Sessions, stages and derived durations. |
-| `GET /api/v1/connections` | The user's connections: provider, status, scopes, last and next sync. Tokens and ciphertext never appear. |
+| `GET /api/v1/connections` | The user's connections, including provider, status, scopes, last and next sync, and `sync_requested_at`. Tokens and ciphertext never appear. |
 | `GET /api/v1/connections/{provider}/sync-runs` | Recent `sync_runs` for the user. |
 | `POST /api/v1/connections/{provider}/sync` | Queue a manual sync (§6). |
 | `GET /api/v1/connections/google_health/link`, `GET …/callback` | Web linking (§4). |
@@ -256,7 +284,8 @@ The MCP server will move from the `mcp/` module to `backend/cmd/mcp` so it can i
 | :--- | :--- |
 | `user_identities` (PK `(issuer, subject)`, `user_id` FK `ON DELETE CASCADE`) | §2 |
 | `sessions` (PK `token_hash`, `user_id` FK `ON DELETE CASCADE`) | §3 |
-| `users.step_goal`, `users.primary_provider` | §5 |
+| `users.step_goal`, `users.primary_provider` with a deterministic backfill from each user's connections | §5 |
+| `sleep_sessions.minutes_asleep INTEGER NULL CHECK (minutes_asleep >= 0)`. Existing rows start at `NULL` and can acquire a value on a later sync. | §5 |
 | `provider_connections.oauth_client` (with `CHECK`), backfill `'desktop'` for `google_health` | §4 |
 | `provider_connections.sync_requested_at` | §6 |
 
@@ -273,7 +302,8 @@ The MCP server will move from the `mcp/` module to `backend/cmd/mcp` so it can i
     exposure. The API uses it only to encrypt on link.
   - Two OAuth clients to configure and rotate. Connections linked through a client that is later
     removed must be re-linked.
-  - "Sync now" waits up to one poll interval before it starts.
+  - Manual requests share the worker with scheduled syncs and backfills. The UI distinguishes
+    a queued request from a running sync.
   - Server-side sessions cost one indexed lookup per request.
   - The dashboards show one provider at a time.
   - While the Google Cloud app is in *Testing*, health refresh tokens still expire after 7 days.
