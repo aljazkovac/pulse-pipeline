@@ -3,6 +3,9 @@ package store_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -221,5 +224,23 @@ func TestLinkConnection_BlocksActiveRunAndFencesAbandonedRefresh(t *testing.T) {
 	got, err := testStore.GetConnectionTokens(ctx, u.ID, id)
 	if err != nil || !got.ExpiresAt.Equal(linked.ExpiresAt) {
 		t.Fatalf("newly linked tokens were overwritten: %v, %v", got, err)
+	}
+}
+
+func TestSealedTokens_AreRedactedWhenFormatted(t *testing.T) {
+	tok := fakeSealed(t0)
+	var jsonLog, textLog bytes.Buffer
+	slog.New(slog.NewJSONHandler(&jsonLog, nil)).Info("link", "tokens", tok)
+	slog.New(slog.NewTextHandler(&textLog, nil)).Info("link", "tokens", tok)
+	for _, s := range []string{
+		fmt.Sprint(tok), fmt.Sprintf("%v", tok), fmt.Sprintf("%+v", tok), fmt.Sprintf("%#v", tok),
+		fmt.Sprintf("%v", &tok), jsonLog.String(), textLog.String(),
+	} {
+		if strings.Contains(s, "fake-sealed") || strings.Contains(s, "ZmFrZS1zZWFsZWQ") { // raw or base64
+			t.Errorf("ciphertext leaked in %q", s)
+		}
+		if !strings.Contains(s, "key_version: 3") {
+			t.Errorf("redacted form should keep the key version: %q", s)
+		}
 	}
 }

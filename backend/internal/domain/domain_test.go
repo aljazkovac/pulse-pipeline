@@ -116,3 +116,48 @@ func TestUser_LocationFallsBackToUTC(t *testing.T) {
 		t.Errorf("got %s", got)
 	}
 }
+
+// StartIn defines where a local calendar day begins, which every provider
+// and the sync window rely on. Users may have any IANA timezone, so besides
+// ordinary days it handles DST transitions that land on midnight. Those never
+// occur in Europe, so each such branch is pinned with one past, settled
+// tzdata transition that reaches it.
+func TestDate_StartIn(t *testing.T) {
+	tests := []struct {
+		name, zone, date, want string
+	}{
+		{"UTC", "UTC", "2026-11-20", "2026-11-20T00:00:00Z"},
+		{"ordinary day", "Europe/Stockholm", "2026-11-20", "2026-11-19T23:00:00Z"},
+		{"spring forward at 02:00", "Europe/Stockholm", "2026-03-29", "2026-03-28T23:00:00Z"},
+		{"fall back at 03:00", "Europe/Stockholm", "2026-10-25", "2026-10-24T22:00:00Z"},
+		// 01:00 -> 00:00, so midnight happens twice. time.Date picks the
+		// second; StartIn must step back to the first.
+		{"repeated midnight", "Asia/Amman", "2021-10-29", "2021-10-28T21:00:00Z"},
+		// 00:00 -> 01:00; time.Date resolves into the previous day.
+		{"skipped midnight resolved backwards", "America/Sao_Paulo", "2018-11-04", "2018-11-04T03:00:00Z"},
+		// 00:00 -> 01:00; time.Date resolves forward into the day.
+		{"skipped midnight resolved forwards", "Asia/Amman", "2021-03-26", "2021-03-25T22:00:00Z"},
+		// Samoa skipped 2011-12-30 entirely; it shares 2011-12-31's start.
+		{"wholly skipped date", "Pacific/Apia", "2011-12-30", "2011-12-30T10:00:00Z"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			loc, err := time.LoadLocation(tc.zone)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d, err := domain.ParseDate(tc.date)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := d.StartIn(loc)
+			if got.Format(time.RFC3339) != tc.want || got.Location() != time.UTC {
+				t.Errorf("StartIn(%s) = %s, want %s (UTC)", tc.zone, got.Format(time.RFC3339), tc.want)
+			}
+			// Days never start out of order (a skipped date shares the next start).
+			if next := d.AddDays(1).StartIn(loc); next.Before(got) {
+				t.Errorf("next day starts at %s, before %s", next, got)
+			}
+		})
+	}
+}

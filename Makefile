@@ -1,4 +1,4 @@
-.PHONY: help setup-tools up down ps logs clean build test lint e2e db-shell generate generate-check migrate-up migrate-down
+.PHONY: help setup-tools up down ps logs clean build test cover lint e2e db-shell generate generate-check migrate-up migrate-down
 
 # web/ targets activate once web/package.json exists. The package must define the
 # scripts `build`, `typecheck` (tsc --noEmit, strict), `lint` (ESLint incl.
@@ -67,6 +67,12 @@ test: ## Run unit + Testcontainers integration tests (needs Docker), gatekeeper 
 ifneq ($(WEB_PACKAGE),)
 	cd web && $(WEB_PM) run test
 endif
+
+cover: ## Backend coverage across packages (needs Docker); report in bin/coverage.html
+	@mkdir -p bin
+	cd backend && go test -race -coverpkg=./... -coverprofile=../bin/coverage.out ./...
+	cd backend && go tool cover -html=../bin/coverage.out -o ../bin/coverage.html
+	@cd backend && go tool cover -func=../bin/coverage.out | tail -1
 
 lint: ## Run linters across backend, MCP (and web/ typecheck + ESLint when present)
 	cd backend && golangci-lint run ./...
