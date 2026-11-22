@@ -91,7 +91,7 @@ Build the multi-user, multi-provider data foundation and nightly ingestion servi
 - [x] Implement a deterministic `MockHealthProvider` generating realistic synthetic health data for local dev and automated testing
 - [x] Implement the `GoogleHealthProvider` (Google OAuth 2.0 flow + Google Health API client for Fitbit Air data, AES-256-GCM token encryption per ADR-0002 §3 — see ADR-0004; accounts are linked with `pulse-worker connect-google` until the Phase 2 web callback)
 - [x] Build the nightly sync worker (idempotent upserts, retry/backoff, backfill support, manual/backfill CLI — see ADR-0003; the HTTP manual trigger moves to Phase 2 with API auth)
-- [ ] Write Go unit tests and Testcontainers-based PostgreSQL integration tests
+- [x] Write Go unit tests and Testcontainers-based PostgreSQL integration tests (per-package suites against a real PostgreSQL 17 container via `internal/testdb`, plus `pulse-worker` command tests; `make cover` reports coverage)
 
 ---
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -35,6 +36,13 @@ var (
 func (t SealedTokens) String() string {
 	return fmt.Sprintf("store.SealedTokens{key_version: %d, expires_at: %s}", t.KeyVersion, t.ExpiresAt.Format(time.RFC3339))
 }
+
+// GoString redacts for %#v as well.
+func (t SealedTokens) GoString() string { return t.String() }
+
+// LogValue redacts in structured (slog) logs, whose JSON handler would
+// otherwise encode the ciphertext fields.
+func (t SealedTokens) LogValue() slog.Value { return slog.StringValue(t.String()) }
 
 // GetConnectionTokens returns the connection's token ciphertext. A connection
 // that never stored tokens (e.g. mock) returns zero SealedTokens. It returns

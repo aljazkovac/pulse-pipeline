@@ -377,16 +377,37 @@ func TestSleep_ResyncWithCorrectedTimesUpdatesInPlaceAndReplacesStages(t *testin
 }
 
 func TestSleep_ValidationRejectsBadInputWithoutWriting(t *testing.T) {
-	ctx := ctxT(t)
-	u := newUser(t)
-	good := night(t, "ok", t0, domain.SleepStageLight)
-	bad := night(t, "bad", t0.Add(24*time.Hour), domain.SleepStageLight)
-	bad.Stages[0].Stage = "hypnagogic"
-	if _, err := testStore.UpsertSleepSessions(ctx, u.ID, []domain.SleepSession{good, bad}); err == nil {
-		t.Fatal("expected invalid stage error")
+	tests := []struct {
+		name   string
+		mutate func(*domain.SleepSession)
+		want   string
+	}{
+		{"missing provider", func(s *domain.SleepSession) { s.Provider = "" }, "provider is required"},
+		{"missing session ID", func(s *domain.SleepSession) { s.ProviderSessionID = "" }, "session ID is required"},
+		{"ends before it starts", func(s *domain.SleepSession) { s.EndAt = s.StartAt }, "end must be after start"},
+		{"impossible sleep date", func(s *domain.SleepSession) { s.SleepDate = domain.Date{Year: 2026, Month: 2, Day: 30} }, "invalid sleep date"},
+		{"unknown stage", func(s *domain.SleepSession) { s.Stages[0].Stage = "hypnagogic" }, "unknown stage"},
+		{"empty stage", func(s *domain.SleepSession) { s.Stages[1].EndAt = s.Stages[1].StartAt }, "must end after it starts"},
+		{"duplicate stage start", func(s *domain.SleepSession) {
+			// Differs only below the database's microsecond precision.
+			s.Stages[1].StartAt = s.Stages[0].StartAt.Add(500 * time.Nanosecond)
+		}, "duplicate stage start"},
 	}
-	if n := countRows(t, "SELECT count(*) FROM sleep_sessions WHERE user_id=$1", u.ID); n != 0 {
-		t.Fatalf("batch must be all-or-nothing; sessions=%d", n)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := ctxT(t)
+			u := newUser(t)
+			good := night(t, "ok", t0, domain.SleepStageLight)
+			bad := night(t, "bad", t0.Add(24*time.Hour), domain.SleepStageLight, domain.SleepStageDeep)
+			tc.mutate(&bad)
+			_, err := testStore.UpsertSleepSessions(ctx, u.ID, []domain.SleepSession{good, bad})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+			if n := countRows(t, "SELECT count(*) FROM sleep_sessions WHERE user_id=$1", u.ID); n != 0 {
+				t.Fatalf("batch must be all-or-nothing; sessions=%d", n)
+			}
+		})
 	}
 }
 

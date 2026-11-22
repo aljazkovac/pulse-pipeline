@@ -3,6 +3,9 @@ package store_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -123,8 +126,16 @@ func TestLinkConnection_CreatesThenReactivates(t *testing.T) {
 		t.Fatalf("relink: id %s (want %s), err %v", again, id, err)
 	}
 	info, err = testStore.GetConnection(ctx, u.ID, gh)
-	if err != nil || info.Status != domain.ConnectionActive || len(info.Scopes) != 2 || info.NextSyncAt.After(time.Now()) {
+	if err != nil || info.Status != domain.ConnectionActive || len(info.Scopes) != 2 {
 		t.Fatalf("relinked connection: %v %+v", err, info)
+	}
+	// LinkConnection schedules the sync using PostgreSQL's clock.
+	var databaseNow time.Time
+	if err := testPool.QueryRow(ctx, "SELECT now()").Scan(&databaseNow); err != nil {
+		t.Fatalf("reading database time: %v", err)
+	}
+	if info.NextSyncAt.After(databaseNow) {
+		t.Fatalf("relinked connection due at %v, after database time %v", info.NextSyncAt, databaseNow)
 	}
 	raw, err := testStore.GetConnectionSyncCursor(ctx, u.ID, id)
 	if err != nil || !bytes.Contains(raw, []byte("2026-11-19")) {
@@ -221,5 +232,23 @@ func TestLinkConnection_BlocksActiveRunAndFencesAbandonedRefresh(t *testing.T) {
 	got, err := testStore.GetConnectionTokens(ctx, u.ID, id)
 	if err != nil || !got.ExpiresAt.Equal(linked.ExpiresAt) {
 		t.Fatalf("newly linked tokens were overwritten: %v, %v", got, err)
+	}
+}
+
+func TestSealedTokens_AreRedactedWhenFormatted(t *testing.T) {
+	tok := fakeSealed(t0)
+	var jsonLog, textLog bytes.Buffer
+	slog.New(slog.NewJSONHandler(&jsonLog, nil)).Info("link", "tokens", tok)
+	slog.New(slog.NewTextHandler(&textLog, nil)).Info("link", "tokens", tok)
+	for _, s := range []string{
+		fmt.Sprint(tok), fmt.Sprintf("%v", tok), fmt.Sprintf("%+v", tok), fmt.Sprintf("%#v", tok),
+		fmt.Sprintf("%v", &tok), jsonLog.String(), textLog.String(),
+	} {
+		if strings.Contains(s, "fake-sealed") || strings.Contains(s, "ZmFrZS1zZWFsZWQ") { // raw or base64
+			t.Errorf("ciphertext leaked in %q", s)
+		}
+		if !strings.Contains(s, "key_version: 3") {
+			t.Errorf("redacted form should keep the key version: %q", s)
+		}
 	}
 }
