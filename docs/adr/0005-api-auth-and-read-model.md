@@ -1,6 +1,6 @@
 # ADR 0005: Phase 2 API — Authentication, Sessions, Read Model & Queued Manual Sync
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-23)
 - **Date:** 2026-11-22
 
 ## Context
