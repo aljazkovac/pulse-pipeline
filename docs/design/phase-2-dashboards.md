@@ -1,6 +1,6 @@
 # Phase 2 dashboard design
 
-The first release lets a signed-in user answer two questions: “What did my wearable record for this day?” and “When did this provider last sync?” All dates and times use the profile timezone. Show the selected date, provider and timezone beside the data. The [API decision](../adr/0005-api-auth-and-read-model.md) defines the read model and wire formats.
+The first release lets a signed-in user answer two questions: “What did my wearable record for this day?” and “When did this provider last sync?” All dates and times use the profile timezone. Every view reads the profile's primary provider; there is no per-view provider picker, and changing the primary provider in Settings reloads the views. Show the selected date, the primary provider and the timezone beside the data. The [API decision](../adr/0005-api-auth-and-read-model.md) defines the read model and wire formats.
 
 ## Shell and tokens
 
@@ -21,7 +21,7 @@ Paths below are relative to the session-scoped API v1. Use the server's derived 
 
 | View | Read and interaction |
 | --- | --- |
-| Overview | Open on today in the profile timezone. A labelled date picker reloads GET /overview for that day. Show steps and goal as numbers beside the ring (cap the arc at 100% while retaining the actual count), sleep duration in hours and minutes, resting HR in bpm, HRV in ms and last sync. Link sync status to Connections. |
+| Overview | Open on today in the profile timezone. A labelled date picker reloads GET /overview for that day. Show steps and goal as numbers beside the ring (cap the arc at 100% while retaining the actual count), sleep duration in hours and minutes, resting HR in bpm, HRV in ms and last sync. Link sync status to Connections. While the profile timezone is still UTC and the browser's IANA zone differs, show a prompt offering the browser zone. Accepting saves it with PATCH /me and reloads today in that zone. Dismissing keeps UTC and hides the prompt in this browser. |
 | Settings | Populate from GET /me. Save timezone, primary provider and integer step goal (1–100000) with PATCH /me. Keep invalid inputs editable with inline errors. After success refresh the profile and affected day in the saved timezone. |
 | Connections | GET /connections supplies provider status and last/next sync. Show each provider's recent sync-runs in descending time order. Offer Link Google Health for a new account and Re-link when required. After returning from consent refresh the list and show the outcome. |
 | Sync now | POST to the selected connection's sync endpoint. Render the returned queued or running state immediately. Refresh connections and runs while pending, distinguish a pending request from an unrelated running backfill, and announce transitions once. Show the terminal result and time. On relink-required offer Re-link. |
@@ -32,15 +32,16 @@ Paths below are relative to the session-scoped API v1. Use the server's derived 
 
 While loading, reserve the populated card dimensions, mark the section busy and hide decorative skeletons from screen readers. For a failed read show an inline Retry for that section and retain its selected date. Offline, show a connection message and reload on reconnect. Only the app shell may be cached. A missing metric reads “No data”; a reported zero displays its value and unit.
 
-Run each scenario at 1280 × 800 and 390 × 844 with a fixed seed user and clock. Use accessible roles and names for assertions.
+Run each scenario at 1280 × 800 and 390 × 844 with a fixed clock. Each Given state uses its own fixture user, and each viewport project has its own set, so scenarios that write never share a user (ADR-0005 §8). Use accessible roles and names for assertions.
 
 | Given | When | Expected |
 | --- | --- | --- |
 | Signed out | Open Overview | Google sign-in is reachable by keyboard and no metric is visible. |
 | Signed in without connections | Open Overview | Show Link Google Health. With an active connection but no records, offer Sync now through Connections. |
 | A seeded day and a partially recorded day | Change dates | Values update for the selected date. Missing HRV leaves the other cards usable. An unstaged session with unknown duration shows No data; reported zero shows 0 min. |
-| An active connection | Submit Sync now twice before the worker claims it | One pending request is shown. After claim show Running, then the run outcome. A failed run remains visible in history. |
+| An active connection and a polling worker | Submit Sync now twice in quick succession | Exactly one manual run results. The UI shows one queued request or the running run, then Running, then the run outcome. A failed run remains visible in history. |
+| A profile timezone of UTC and a browser in another zone | Open Overview and accept the timezone prompt | The browser zone is saved and Overview shows today in that zone. A browser already in UTC shows no prompt. |
 | A revoked connection | Open Connections | Re-link is reachable without opening developer tools. Cancelling consent leaves the existing status visible. |
-| A failed request | Retry after connectivity returns | The selected date and provider persist and the affected section recovers. |
+| A failed request | Retry after connectivity returns | The selected date persists and the affected section recovers. |
 | Midnight in a different browser timezone | Open a day with overnight sleep | Overview and Sleep assign the session to the same profile-local wake date. |
 | Keyboard or touch navigation | Open each shipped view and reach its final control | Current page, focus and chart values are discernible. No horizontal page scroll or obscured control at either viewport. |
