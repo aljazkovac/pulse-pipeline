@@ -295,6 +295,10 @@ The MCP server will move from the `mcp/` module to `backend/cmd/mcp` so it can i
 | `provider_connections.oauth_client` (with `CHECK`), backfill `'desktop'` for `google_health` | §4 |
 | `provider_connections.sync_requested_at` | §6 |
 
+Implementation note (2026-11-23): migration `000004` ships the `user_identities` and `sessions`
+rows with authentication. Each later slice adds its own rows of this table as the next migration
+(`000005` onward), because an applied migration is never edited.
+
 ## Consequences
 
 - **Positive:**

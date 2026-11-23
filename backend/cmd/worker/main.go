@@ -5,11 +5,14 @@
 //	    [-from YYYY-MM-DD -to YYYY-MM-DD]    ...or backfill a date range
 //	pulse-worker seed-dev [-email E] [-tz Z] create a local user with a mock connection
 //	pulse-worker connect-google -user ID     link a Google Health account (ADR-0004 §3)
+//	pulse-worker bind-google-identity -user ID [-replace] [-mailbox-verified]
+//	                                         bind a Google sign-in identity to a user (ADR-0005 §2)
 //
 // Environment: DATABASE_URL (required), PULSE_SYNC_POLL_INTERVAL (default 1m),
 // PULSE_ENABLE_MOCK_PROVIDER (default false), ENV (seed-dev needs "development"),
-// GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET (register the Google
-// Health provider), TOKEN_ENCRYPTION_KEY, TOKEN_ENCRYPTION_KEY_VERSION and
+// GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET (the Desktop app
+// client: registers the Google Health provider and serves the loopback
+// commands), TOKEN_ENCRYPTION_KEY, TOKEN_ENCRYPTION_KEY_VERSION and
 // TOKEN_ENCRYPTION_PREVIOUS_KEYS (encrypted token storage, required with Google).
 // Every command applies pending migrations first.
 package main
@@ -24,12 +27,14 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/auth"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/credentials"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/domain"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/provider/googlehealth"
@@ -131,6 +136,21 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout 
 		return withDeps(ctx, cfg, logger, func(d deps) error {
 			return connectGoogle(ctx, d, userID, stdout)
 		})
+	case "bind-google-identity":
+		req, err := parseBindArgs(args)
+		if err != nil {
+			return err
+		}
+		if !cfg.google.enabled() {
+			return errors.New("bind-google-identity needs GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET (the Desktop app client)")
+		}
+		google, err := auth.NewGoogle(auth.GoogleOptions{ClientID: cfg.google.clientID, ClientSecret: cfg.google.clientSecret})
+		if err != nil {
+			return err
+		}
+		return withDeps(ctx, cfg, logger, func(d deps) error {
+			return bindGoogleIdentity(ctx, d.store, google, req, stdout, time.Now())
+		})
 	default:
 		return fmt.Errorf("%w: unknown command %q", errUsage, cmd)
 	}
@@ -156,6 +176,104 @@ func connectGoogle(ctx context.Context, d deps, userID uuid.UUID, stdout io.Writ
 	}
 	_, err = fmt.Fprintf(stdout, "Linked Google Health for user %s (connection %s). The worker syncs it on its next poll.\n", u.ID, connectionID)
 	return err
+}
+
+// identityBinder is the subset of *store.Store bind-google-identity needs.
+type identityBinder interface {
+	GetUser(ctx context.Context, id uuid.UUID) (domain.User, error)
+	BindIdentity(ctx context.Context, userID uuid.UUID, ident domain.Identity, replace bool, at time.Time) (store.BindResult, error)
+}
+
+// loopbackSignIn is the subset of *auth.Google bind-google-identity needs.
+type loopbackSignIn interface {
+	SignInLoopback(ctx context.Context, show func(authURL string) error) (auth.Claims, error)
+}
+
+// bindRequest is a parsed bind-google-identity invocation.
+type bindRequest struct {
+	userID          uuid.UUID
+	replace         bool
+	mailboxVerified bool
+}
+
+// bindGoogleIdentity binds the Google account the owner signs in with to an
+// existing user, so they keep that user's history (ADR-0005 §2). The owner
+// proves control of the Google account by signing in through a loopback
+// redirect; the operator is responsible for knowing the owner is the
+// person the user belongs to. For an address Google is not authoritative for,
+// the operator must also have checked the mailbox and pass -mailbox-verified.
+func bindGoogleIdentity(ctx context.Context, st identityBinder, google loopbackSignIn, req bindRequest, stdout io.Writer, now time.Time) error {
+	u, err := st.GetUser(ctx, req.userID)
+	if err != nil {
+		return err
+	}
+	claims, err := google.SignInLoopback(ctx, func(authURL string) error {
+		_, err := fmt.Fprintf(stdout, "Binding a Google sign-in identity to user %s (%s).\n"+
+			"Have the account owner open this URL in a browser on this machine and choose their Google account:\n\n  %s\n\n"+
+			"Waiting for Google to redirect back...\n", u.ID, u.Email, authURL)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	switch {
+	case !claims.EmailVerified:
+		return fmt.Errorf("the Google account's address %s is not verified; it cannot be bound", claims.Email)
+	case !claims.GoogleAuthoritative() && !req.mailboxVerified:
+		return fmt.Errorf("the address %s is not a Gmail or Google Workspace address, so Google cannot vouch for it: confirm that the account owner controls this mailbox "+
+			"(for example with a one-time code sent to it), then run again with -mailbox-verified", claims.Email)
+	}
+
+	res, err := st.BindIdentity(ctx, u.ID, claims.Identity, req.replace, now)
+	switch {
+	case errors.Is(err, store.ErrIdentityBound):
+		return fmt.Errorf("user %s already has a different Google identity; run again with -replace to replace it and sign out all the user's sessions: %w", u.ID, err)
+	case errors.Is(err, store.ErrIdentityTaken):
+		return fmt.Errorf("this Google account (%s) is already bound to another Pulse user: %w", claims.Email, err)
+	case err != nil:
+		return err
+	}
+
+	switch {
+	case !res.Changed:
+		_, err = fmt.Fprintf(stdout, "The Google account %s was already bound to user %s; nothing changed.\n", claims.Email, u.ID)
+	case req.replace:
+		_, err = fmt.Fprintf(stdout, "Replaced the Google identity of user %s with %s (subject %s) and signed out %d sessions.\n",
+			u.ID, claims.Email, claims.Subject, res.RevokedSessions)
+	default:
+		_, err = fmt.Fprintf(stdout, "Bound the Google account %s (subject %s) to user %s.\n", claims.Email, claims.Subject, u.ID)
+	}
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(claims.Email, u.Email) {
+		if _, err := fmt.Fprintf(stdout, "Note: the Google account's address differs from the user's address %s.\n", u.Email); err != nil {
+			return err
+		}
+	}
+	_, err = fmt.Fprintf(stdout, "Sign-in also requires %s in the API's PULSE_ALLOWED_EMAILS.\n", claims.Email)
+	return err
+}
+
+func parseBindArgs(args []string) (bindRequest, error) {
+	fs := flag.NewFlagSet("bind-google-identity", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	user := fs.String("user", "", "user ID")
+	var req bindRequest
+	fs.BoolVar(&req.replace, "replace", false, "replace the user's current Google identity and sign out all their sessions")
+	fs.BoolVar(&req.mailboxVerified, "mailbox-verified", false, "the operator checked mailbox ownership of a non-Google address")
+	if err := fs.Parse(args); err != nil {
+		return bindRequest{}, fmt.Errorf("%w: bind-google-identity: %v", errUsage, err)
+	}
+	if fs.NArg() > 0 {
+		return bindRequest{}, fmt.Errorf("%w: bind-google-identity: unexpected argument %q", errUsage, fs.Arg(0))
+	}
+	id, err := uuid.Parse(*user)
+	if err != nil {
+		return bindRequest{}, fmt.Errorf("%w: bind-google-identity: -user must be a UUID", errUsage)
+	}
+	req.userID = id
+	return req, nil
 }
 
 type config struct {

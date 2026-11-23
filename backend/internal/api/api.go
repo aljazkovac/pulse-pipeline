@@ -5,6 +5,12 @@
 // returns only the statuses and bodies the contract declares. Every /api
 // response is sent with Cache-Control: no-store, and every error is RFC 9457
 // problem+json.
+//
+// Authentication (ADR-0005 §2–3, auth.go): operations need a session unless
+// the contract opts them out with `security: []`; the session middleware puts
+// the signed-in user on the request context, and handlers scope every read
+// by that user. http.CrossOriginProtection rejects state-changing requests
+// from other origins.
 package api
 
 import (
@@ -27,16 +33,32 @@ type Pinger interface {
 	Ping(ctx context.Context) error
 }
 
-// Options are the dependencies of the API handler.
+// Options are the dependencies of the API handler. DB, Logger, Sessions and
+// Users are required.
 type Options struct {
-	DB     Pinger
-	Logger *slog.Logger
+	DB       Pinger
+	Logger   *slog.Logger
+	Sessions Sessions
+	Users    Users
+	// SignIn enables Google sign-in; nil leaves it unconfigured, and the
+	// sign-in routes answer 503 unavailable.
+	SignIn *SignInOptions
+	// Dev selects the development cookies (ENV=development): unprefixed
+	// names without Secure, for plain http://localhost (ADR-0005 §3).
+	Dev bool
 }
 
-// NewHandler returns the complete API handler: routing, request logging,
-// panic recovery and the /api response conventions.
+// NewHandler returns the complete API handler: routing, sessions,
+// cross-origin protection, request logging, panic recovery and the /api
+// response conventions.
 func NewHandler(opts Options) http.Handler {
-	s := &server{db: opts.DB, logger: opts.Logger}
+	s := &server{
+		db: opts.DB, logger: opts.Logger, sessions: opts.Sessions, users: opts.Users,
+		cookies: newCookies(opts.Dev),
+	}
+	if opts.SignIn != nil {
+		s.signIn = &signIn{google: opts.SignIn.Google, redirectURI: SignInCallbackURL(opts.SignIn.PublicURL)}
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", liveness)
@@ -48,16 +70,39 @@ func NewHandler(opts Options) http.Handler {
 	gen.HandlerWithOptions(strict, gen.StdHTTPServerOptions{
 		BaseURL:          BasePath,
 		BaseRouter:       mux,
+		Middlewares:      []gen.MiddlewareFunc{s.withSession},
 		ErrorHandlerFunc: s.requestError,
 	})
 
-	return observe(opts.Logger, mux)
+	// Rejects cross-origin POST, PUT, PATCH and DELETE using Sec-Fetch-Site,
+	// falling back to Origin versus Host. With SameSite=Lax cookies this
+	// replaces CSRF tokens (ADR-0005 §3).
+	cop := http.NewCrossOriginProtection()
+	cop.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, r.Pattern = mux.Handler(r) // log the route the request targeted
+		if isAPIPath(r.URL.Path) {
+			writeProblem(w, probCrossOrigin.problem("State-changing requests must come from the web app's own origin."))
+			return
+		}
+		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+	}))
+
+	return observe(opts.Logger, cop.Handler(mux))
 }
 
 // server implements gen.StrictServerInterface.
 type server struct {
-	db     Pinger
-	logger *slog.Logger
+	db       Pinger
+	logger   *slog.Logger
+	sessions Sessions
+	users    Users
+	signIn   *signIn // nil: Google sign-in is not configured
+	cookies  cookies
+}
+
+type signIn struct {
+	google      GoogleSignIn
+	redirectURI string
 }
 
 var _ gen.StrictServerInterface = (*server)(nil)

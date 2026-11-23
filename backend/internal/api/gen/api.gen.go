@@ -8,10 +8,15 @@ package gen
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 
 	"github.com/oapi-codegen/runtime"
+)
+
+const (
+	SessionScopes sessionContextKey = "session.Scopes"
 )
 
 // Defines values for HealthStatus.
@@ -37,6 +42,15 @@ type Health struct {
 // HealthStatus defines model for Health.Status.
 type HealthStatus string
 
+// Me defines model for Me.
+type Me struct {
+	// Email The account's email address.
+	Email string `json:"email"`
+
+	// Timezone IANA timezone for local days, e.g. `Europe/Stockholm`. `UTC` until the user chooses one.
+	Timezone string `json:"timezone"`
+}
+
 // Problem RFC 9457 problem details. Extension members may be added per problem type.
 type Problem struct {
 	// Detail Human-readable explanation of this occurrence. Never contains upstream or internal error text.
@@ -55,14 +69,53 @@ type Problem struct {
 	Type string `json:"type"`
 }
 
+// CrossOriginRequest RFC 9457 problem details. Extension members may be added per problem type.
+type CrossOriginRequest = Problem
+
+// SignInDenied RFC 9457 problem details. Extension members may be added per problem type.
+type SignInDenied = Problem
+
+// SignInFailed RFC 9457 problem details. Extension members may be added per problem type.
+type SignInFailed = Problem
+
+// Unauthenticated RFC 9457 problem details. Extension members may be added per problem type.
+type Unauthenticated = Problem
+
 // Unavailable RFC 9457 problem details. Extension members may be added per problem type.
 type Unavailable = Problem
 
+// sessionContextKey is the context key for session security scheme
+type sessionContextKey string
+
+// FinishGoogleSignInParams defines parameters for FinishGoogleSignIn.
+type FinishGoogleSignInParams struct {
+	// Code Google's authorization code.
+	Code *string `form:"code,omitempty" json:"code,omitempty"`
+
+	// State The state sent with the authorization request.
+	State *string `form:"state,omitempty" json:"state,omitempty"`
+
+	// Error Google's OAuth error code, such as `access_denied` when the user cancelled.
+	Error *string `form:"error,omitempty" json:"error,omitempty"`
+}
+
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
+	// FinishGoogleSignIn Finish Google sign-in
+	// (GET /auth/google/callback)
+	FinishGoogleSignIn(w http.ResponseWriter, r *http.Request, params FinishGoogleSignInParams)
+	// StartGoogleSignIn Start Google sign-in
+	// (GET /auth/google/login)
+	StartGoogleSignIn(w http.ResponseWriter, r *http.Request)
+	// SignOut Sign out
+	// (POST /auth/logout)
+	SignOut(w http.ResponseWriter, r *http.Request)
 	// GetHealth API readiness
 	// (GET /health)
 	GetHealth(w http.ResponseWriter, r *http.Request)
+	// GetMe The signed-in user's profile
+	// (GET /me)
+	GetMe(w http.ResponseWriter, r *http.Request)
 }
 
 // ServerInterfaceWrapper converts contexts to parameters.
@@ -74,11 +127,118 @@ type ServerInterfaceWrapper struct {
 
 type MiddlewareFunc func(http.Handler) http.Handler
 
+// FinishGoogleSignIn operation middleware
+func (siw *ServerInterfaceWrapper) FinishGoogleSignIn(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params FinishGoogleSignInParams
+
+	// ------------- Optional query parameter "code" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "code", r.URL.Query(), &params.Code, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "code"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "code", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "state" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "state", r.URL.Query(), &params.State, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "state"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "state", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "error" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "error", r.URL.Query(), &params.Error, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "error"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "error", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.FinishGoogleSignIn(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// StartGoogleSignIn operation middleware
+func (siw *ServerInterfaceWrapper) StartGoogleSignIn(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.StartGoogleSignIn(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// SignOut operation middleware
+func (siw *ServerInterfaceWrapper) SignOut(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.SignOut(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // GetHealth operation middleware
 func (siw *ServerInterfaceWrapper) GetHealth(w http.ResponseWriter, r *http.Request) {
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.GetHealth(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetMe operation middleware
+func (siw *ServerInterfaceWrapper) GetMe(w http.ResponseWriter, r *http.Request) {
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, SessionScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetMe(w, r)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -209,13 +369,230 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	}
 
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/health", wrapper.GetHealth)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/auth/google/login", wrapper.StartGoogleSignIn)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/auth/google/callback", wrapper.FinishGoogleSignIn)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/auth/logout", wrapper.SignOut)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/me", wrapper.GetMe)
 
 	return m
 }
 
+type CrossOriginRequestApplicationProblemPlusJSONResponse Problem
+
 type ProblemApplicationProblemPlusJSONResponse Problem
 
+type SignInDeniedApplicationProblemPlusJSONResponse Problem
+
+type SignInFailedApplicationProblemPlusJSONResponse Problem
+
+type UnauthenticatedApplicationProblemPlusJSONResponse Problem
+
 type UnavailableApplicationProblemPlusJSONResponse Problem
+
+type FinishGoogleSignInRequestObject struct {
+	Params FinishGoogleSignInParams
+}
+
+type FinishGoogleSignInResponseObject interface {
+	VisitFinishGoogleSignInResponse(w http.ResponseWriter) error
+}
+
+type FinishGoogleSignIn303ResponseHeaders struct {
+	Location *string
+}
+
+type FinishGoogleSignIn303Response struct {
+	Headers FinishGoogleSignIn303ResponseHeaders
+}
+
+func (response FinishGoogleSignIn303Response) VisitFinishGoogleSignInResponse(w http.ResponseWriter) error {
+	if response.Headers.Location != nil {
+		{
+			v, err := runtime.StyleParamWithOptions("simple", false, "Location", *response.Headers.Location, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+			if err != nil {
+				return fmt.Errorf("error styling response header Location: %w", err)
+			}
+			w.Header().Set("Location", v)
+		}
+	}
+	w.WriteHeader(303)
+	return nil
+}
+
+type FinishGoogleSignIn400ApplicationProblemPlusJSONResponse struct {
+	SignInFailedApplicationProblemPlusJSONResponse
+}
+
+func (response FinishGoogleSignIn400ApplicationProblemPlusJSONResponse) VisitFinishGoogleSignInResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := runtime.JSONMarshalWrite(&buf, response.SignInFailedApplicationProblemPlusJSONResponse); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type FinishGoogleSignIn403ApplicationProblemPlusJSONResponse struct {
+	SignInDeniedApplicationProblemPlusJSONResponse
+}
+
+func (response FinishGoogleSignIn403ApplicationProblemPlusJSONResponse) VisitFinishGoogleSignInResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := runtime.JSONMarshalWrite(&buf, response.SignInDeniedApplicationProblemPlusJSONResponse); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type FinishGoogleSignIn503ApplicationProblemPlusJSONResponse struct {
+	UnavailableApplicationProblemPlusJSONResponse
+}
+
+func (response FinishGoogleSignIn503ApplicationProblemPlusJSONResponse) VisitFinishGoogleSignInResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := runtime.JSONMarshalWrite(&buf, response.UnavailableApplicationProblemPlusJSONResponse); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(503)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type FinishGoogleSignIndefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response FinishGoogleSignIndefaultApplicationProblemPlusJSONResponse) VisitFinishGoogleSignInResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := runtime.JSONMarshalWrite(&buf, response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type StartGoogleSignInRequestObject struct {
+}
+
+type StartGoogleSignInResponseObject interface {
+	VisitStartGoogleSignInResponse(w http.ResponseWriter) error
+}
+
+type StartGoogleSignIn302ResponseHeaders struct {
+	Location *string
+}
+
+type StartGoogleSignIn302Response struct {
+	Headers StartGoogleSignIn302ResponseHeaders
+}
+
+func (response StartGoogleSignIn302Response) VisitStartGoogleSignInResponse(w http.ResponseWriter) error {
+	if response.Headers.Location != nil {
+		{
+			v, err := runtime.StyleParamWithOptions("simple", false, "Location", *response.Headers.Location, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+			if err != nil {
+				return fmt.Errorf("error styling response header Location: %w", err)
+			}
+			w.Header().Set("Location", v)
+		}
+	}
+	w.WriteHeader(302)
+	return nil
+}
+
+type StartGoogleSignIn503ApplicationProblemPlusJSONResponse struct {
+	UnavailableApplicationProblemPlusJSONResponse
+}
+
+func (response StartGoogleSignIn503ApplicationProblemPlusJSONResponse) VisitStartGoogleSignInResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := runtime.JSONMarshalWrite(&buf, response.UnavailableApplicationProblemPlusJSONResponse); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(503)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type StartGoogleSignIndefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response StartGoogleSignIndefaultApplicationProblemPlusJSONResponse) VisitStartGoogleSignInResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := runtime.JSONMarshalWrite(&buf, response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SignOutRequestObject struct {
+}
+
+type SignOutResponseObject interface {
+	VisitSignOutResponse(w http.ResponseWriter) error
+}
+
+type SignOut204Response struct {
+}
+
+func (response SignOut204Response) VisitSignOutResponse(w http.ResponseWriter) error {
+	w.WriteHeader(204)
+	return nil
+}
+
+type SignOut403ApplicationProblemPlusJSONResponse struct {
+	CrossOriginRequestApplicationProblemPlusJSONResponse
+}
+
+func (response SignOut403ApplicationProblemPlusJSONResponse) VisitSignOutResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := runtime.JSONMarshalWrite(&buf, response.CrossOriginRequestApplicationProblemPlusJSONResponse); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SignOutdefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response SignOutdefaultApplicationProblemPlusJSONResponse) VisitSignOutResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := runtime.JSONMarshalWrite(&buf, response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
 
 type GetHealthRequestObject struct {
 }
@@ -271,11 +648,77 @@ func (response GetHealthdefaultApplicationProblemPlusJSONResponse) VisitGetHealt
 	return err
 }
 
+type GetMeRequestObject struct {
+}
+
+type GetMeResponseObject interface {
+	VisitGetMeResponse(w http.ResponseWriter) error
+}
+
+type GetMe200JSONResponse Me
+
+func (response GetMe200JSONResponse) VisitGetMeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := runtime.JSONMarshalWrite(&buf, response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetMe401ApplicationProblemPlusJSONResponse struct {
+	UnauthenticatedApplicationProblemPlusJSONResponse
+}
+
+func (response GetMe401ApplicationProblemPlusJSONResponse) VisitGetMeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := runtime.JSONMarshalWrite(&buf, response.UnauthenticatedApplicationProblemPlusJSONResponse); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetMedefaultApplicationProblemPlusJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response GetMedefaultApplicationProblemPlusJSONResponse) VisitGetMeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := runtime.JSONMarshalWrite(&buf, response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 // StrictServerInterface represents all server handlers.
 type StrictServerInterface interface {
+	// FinishGoogleSignIn Finish Google sign-in
+	// (GET /auth/google/callback)
+	FinishGoogleSignIn(ctx context.Context, request FinishGoogleSignInRequestObject) (FinishGoogleSignInResponseObject, error)
+	// StartGoogleSignIn Start Google sign-in
+	// (GET /auth/google/login)
+	StartGoogleSignIn(ctx context.Context, request StartGoogleSignInRequestObject) (StartGoogleSignInResponseObject, error)
+	// SignOut Sign out
+	// (POST /auth/logout)
+	SignOut(ctx context.Context, request SignOutRequestObject) (SignOutResponseObject, error)
 	// GetHealth API readiness
 	// (GET /health)
 	GetHealth(ctx context.Context, request GetHealthRequestObject) (GetHealthResponseObject, error)
+	// GetMe The signed-in user's profile
+	// (GET /me)
+	GetMe(ctx context.Context, request GetMeRequestObject) (GetMeResponseObject, error)
 }
 
 // StrictHandlerFunc and StrictMiddlewareFunc are type aliases rather than
@@ -320,6 +763,80 @@ type strictHandler struct {
 	options     StrictHTTPServerOptions
 }
 
+// FinishGoogleSignIn operation middleware
+func (sh *strictHandler) FinishGoogleSignIn(w http.ResponseWriter, r *http.Request, params FinishGoogleSignInParams) {
+	var request FinishGoogleSignInRequestObject
+
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request any) (any, error) {
+		return sh.ssi.FinishGoogleSignIn(ctx, request.(FinishGoogleSignInRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "FinishGoogleSignIn")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(FinishGoogleSignInResponseObject); ok {
+		if err := validResponse.VisitFinishGoogleSignInResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// StartGoogleSignIn operation middleware
+func (sh *strictHandler) StartGoogleSignIn(w http.ResponseWriter, r *http.Request) {
+	var request StartGoogleSignInRequestObject
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request any) (any, error) {
+		return sh.ssi.StartGoogleSignIn(ctx, request.(StartGoogleSignInRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "StartGoogleSignIn")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(StartGoogleSignInResponseObject); ok {
+		if err := validResponse.VisitStartGoogleSignInResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// SignOut operation middleware
+func (sh *strictHandler) SignOut(w http.ResponseWriter, r *http.Request) {
+	var request SignOutRequestObject
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request any) (any, error) {
+		return sh.ssi.SignOut(ctx, request.(SignOutRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "SignOut")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(SignOutResponseObject); ok {
+		if err := validResponse.VisitSignOutResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
 // GetHealth operation middleware
 func (sh *strictHandler) GetHealth(w http.ResponseWriter, r *http.Request) {
 	var request GetHealthRequestObject
@@ -337,6 +854,30 @@ func (sh *strictHandler) GetHealth(w http.ResponseWriter, r *http.Request) {
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(GetHealthResponseObject); ok {
 		if err := validResponse.VisitGetHealthResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetMe operation middleware
+func (sh *strictHandler) GetMe(w http.ResponseWriter, r *http.Request) {
+	var request GetMeRequestObject
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request any) (any, error) {
+		return sh.ssi.GetMe(ctx, request.(GetMeRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetMe")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetMeResponseObject); ok {
+		if err := validResponse.VisitGetMeResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {

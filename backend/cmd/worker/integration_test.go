@@ -275,3 +275,53 @@ func TestWorker_DatabaseErrorsDoNotLeakThePassword(t *testing.T) {
 		t.Fatalf("error leaks the database password: %v", err)
 	}
 }
+
+// A Phase 1 user keeps their history: the operator binds the owner's Google
+// identity to the existing user, and the sign-in lookup then resolves it.
+func TestWorker_BindGoogleIdentityToAnExistingUser(t *testing.T) {
+	ctx := ctxT(t)
+	userID := seedDev(t, ctx)
+	st := store.New(testPool)
+	u, err := st.GetUser(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := googleClaims(u.Email, "", true) // seed-dev's example.com address
+	claims.Subject = "fake-sub-" + uuid.NewString()
+	req := bindRequest{userID: userID}
+
+	// example.com is not a Google-authoritative address.
+	if err := bindGoogleIdentity(ctx, st, fakeLoopback{claims: claims}, req, io.Discard, time.Now()); err == nil {
+		t.Fatal("bound a third-party address without -mailbox-verified")
+	}
+	req.mailboxVerified = true
+	var out bytes.Buffer
+	if err := bindGoogleIdentity(ctx, st, fakeLoopback{claims: claims}, req, &out, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetUserIDByIdentity(ctx, claims.Issuer, claims.Subject)
+	if err != nil || got != userID {
+		t.Fatalf("identity resolves to %s, %v; want %s", got, err, userID)
+	}
+
+	// Replacing it requires -replace and signs the user out everywhere.
+	if err := st.CreateSession(ctx, userID, bytes.Repeat([]byte{9}, 32), time.Now(), time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	other := claims
+	other.Subject = "fake-sub-" + uuid.NewString()
+	if err := bindGoogleIdentity(ctx, st, fakeLoopback{claims: other}, req, io.Discard, time.Now()); !errors.Is(err, store.ErrIdentityBound) {
+		t.Fatalf("replacing without -replace = %v, want ErrIdentityBound", err)
+	}
+	req.replace = true
+	out.Reset()
+	if err := bindGoogleIdentity(ctx, st, fakeLoopback{claims: other}, req, &out, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "signed out 1 sessions") {
+		t.Errorf("output = %q", out.String())
+	}
+	if n := count(t, ctx, `SELECT count(*) FROM sessions WHERE user_id = $1`, userID); n != 0 {
+		t.Errorf("%d sessions survived the replacement", n)
+	}
+}

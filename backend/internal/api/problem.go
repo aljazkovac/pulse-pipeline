@@ -36,6 +36,10 @@ var (
 	probMethodNotAllowed = newProblemKind("method-not-allowed", "Method not allowed", http.StatusMethodNotAllowed)
 	probInternal         = newProblemKind("internal", "Internal server error", http.StatusInternalServerError)
 	probUnavailable      = newProblemKind("unavailable", "Service unavailable", http.StatusServiceUnavailable)
+	probUnauthenticated  = newProblemKind("unauthenticated", "Sign-in required", http.StatusUnauthorized)
+	probSignInFailed     = newProblemKind("sign-in-failed", "Sign-in failed", http.StatusBadRequest)
+	probSignInDenied     = newProblemKind("sign-in-denied", "Sign-in denied", http.StatusForbidden)
+	probCrossOrigin      = newProblemKind("cross-origin-request", "Cross-origin request rejected", http.StatusForbidden)
 )
 
 // problem builds an occurrence of k. detail must be written for clients: it

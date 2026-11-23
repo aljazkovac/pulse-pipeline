@@ -35,7 +35,7 @@ func newTestHandler(t *testing.T, db Pinger) (http.Handler, *bytes.Buffer) {
 	t.Helper()
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	return NewHandler(Options{DB: db, Logger: logger}), &logs
+	return NewHandler(Options{DB: db, Logger: logger, Sessions: newFakeSessions(), Users: fakeUsers{}}), &logs
 }
 
 func do(t *testing.T, h http.Handler, method, target string) *httptest.ResponseRecorder {

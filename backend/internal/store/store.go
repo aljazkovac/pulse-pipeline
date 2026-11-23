@@ -1,9 +1,12 @@
 // Package store is Pulse Pipeline's PostgreSQL data access layer (ADR-0002 §5).
 //
 // It wraps the sqlc-generated queries in store/db, maps rows to domain types,
-// and owns transactions. Every method that touches health data takes a userID
-// and scopes its SQL by it; the one exception is ListConnectionsDueForSync,
-// which is system context only (AGENTS.md §1.1).
+// and owns transactions. Every method takes a userID and scopes its SQL by it,
+// with the exceptions AGENTS.md §1.1 allows, none of which returns health
+// data or tokens: ListConnectionsDueForSync and DeleteExpiredSessions are
+// system context for background jobs, and GetUserIDByIdentity and
+// GetSessionByTokenHash are the authentication boundary that turns a
+// validated credential into a user ID (ADR-0005 §2–3).
 package store
 
 import (
