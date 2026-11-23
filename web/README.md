@@ -4,7 +4,7 @@ Responsive frontend built with **React**, **TypeScript** (`strict`), **Vite**, a
 
 ## Local development
 
-Requires Node.js 22.12+.
+Use Node.js 22.22.2 (the CI version), 24.15+ within the 24.x series, or 26+. Later 22.x patches are also supported.
 
 ```bash
 npm ci

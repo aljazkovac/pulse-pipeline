@@ -11,7 +11,7 @@ const repoRoot = fileURLToPath(new URL('..', import.meta.url));
 // ADR-0005 §4: PULSE_PUBLIC_URL is the Vite origin in development, so the port is fixed.
 const DEV_PORT = 5173;
 
-export default defineConfig(({ mode }) => {
+function proxyServer(mode: string) {
   // Config-only read of the root .env; nothing here reaches the client bundle
   // (only VITE_-prefixed variables from web/ are exposed via import.meta.env).
   const env = { ...loadEnv(mode, repoRoot, ''), ...process.env };
@@ -24,10 +24,16 @@ export default defineConfig(({ mode }) => {
     },
   };
 
+  return { port: DEV_PORT, strictPort: true, proxy };
+}
+
+export default defineConfig(({ command, mode }) => {
+  const server = command === 'serve' ? proxyServer(mode) : {};
+
   return {
     plugins: [react(), tailwindcss()],
-    server: { port: DEV_PORT, strictPort: true, proxy },
-    preview: { port: DEV_PORT, strictPort: true, proxy },
+    server,
+    preview: server,
     test: {
       environment: 'jsdom',
       include: ['src/**/*.test.{ts,tsx}', 'config/**/*.test.ts'],
