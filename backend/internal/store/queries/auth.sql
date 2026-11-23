@@ -1,6 +1,6 @@
 -- Sign-in identities and server-side sessions (ADR-0005 §2–3). Every query is
--- scoped by user_id except the two AUTHENTICATION BOUNDARY lookups, which turn
--- a credential into a user_id, and the SYSTEM CONTEXT expiry sweep.
+-- scoped by user_id except the AUTHENTICATION BOUNDARY queries, which turn a
+-- credential into a user_id, and the two SYSTEM CONTEXT session sweeps.
 
 -- AUTHENTICATION BOUNDARY (AGENTS.md §1.1): runs before a user_id is known.
 -- Keyed by a validated OpenID (issuer, subject); returns the user ID only.
@@ -86,7 +86,7 @@ DELETE FROM sessions
 WHERE expires_at <= @now OR last_seen_at <= @idle_before;
 
 -- SYSTEM CONTEXT (AGENTS.md §1.1 exception): the API's allowlist sweep.
--- Deletes the sessions of every user whose Google identities all have an
+-- Deletes the sessions of every user whose sign-in identities all have an
 -- email outside the allowlist; users without identities are left alone.
 -- Deletes across users and returns a count only.
 -- Must not be reachable from API or MCP handlers.

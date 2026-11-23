@@ -34,6 +34,7 @@ type memStore struct {
 	allowArgs  []string
 	disallowed int64 // what DeleteSessionsOutsideAllowlist reports
 	allowErr   error
+	expiredErr error
 	failWith   error // returned by every call when set
 	enrollErr  error // returned by CreateUserWithIdentity when set
 	// raceWinner, when set, plays a concurrent first sign-in of the same
@@ -153,6 +154,9 @@ func (m *memStore) DeleteExpiredSessions(_ context.Context, now, idleBefore time
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.sweepArgs = [2]time.Time{now, idleBefore}
+	if m.expiredErr != nil {
+		return 0, m.expiredErr
+	}
 	var n int64
 	for k, s := range m.sessions {
 		if !s.ExpiresAt.After(now) || !s.LastSeenAt.After(idleBefore) {
@@ -436,9 +440,17 @@ func TestSweep_DeletesExpiredAndDisallowedSessions(t *testing.T) {
 		t.Errorf("allowlist passed = %v, want the lower-cased, sorted list", st.allowArgs)
 	}
 
+	// A failing half is reported, and the other half still runs and counts.
 	st.allowErr = errors.New("fake: connection refused")
-	if _, err := svc.Sweep(ctxT(t)); err == nil {
-		t.Error("a failed allowlist sweep was not reported")
+	st.sessions["y"] = domain.Session{ExpiresAt: now}
+	res, err = svc.Sweep(ctxT(t))
+	if err == nil || res.Expired != 1 {
+		t.Errorf("Sweep = %+v, %v; want the error and the expired count", res, err)
+	}
+	st.allowErr, st.expiredErr, st.allowArgs = nil, errors.New("fake: timeout"), nil
+	res, err = svc.Sweep(ctxT(t))
+	if err == nil || res.Disallowed != 2 || st.allowArgs == nil {
+		t.Errorf("Sweep = %+v, %v; a failed expiry delete must not skip the allowlist", res, err)
 	}
 }
 

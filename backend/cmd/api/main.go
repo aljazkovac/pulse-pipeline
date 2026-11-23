@@ -42,6 +42,9 @@ const (
 	shutdownTimeout = 15 * time.Second
 	// sessionSweepInterval is how often expired and disallowed sessions are deleted.
 	sessionSweepInterval = time.Hour
+	// sessionSweepRetry is how soon a failed sweep runs again, so a database
+	// outage at startup delays an allowlist removal by minutes, not an hour.
+	sessionSweepRetry = time.Minute
 	// sessionSweepTimeout bounds one sweep's database round trip.
 	sessionSweepTimeout = time.Minute
 )
@@ -187,6 +190,9 @@ func runWithConfig(ctx context.Context, cfg config, logger *slog.Logger, listen 
 	} else {
 		logger.Warn("Google sign-in disabled: set GOOGLE_WEB_OAUTH_CLIENT_ID to enable it")
 	}
+	if cfg.allowlist.Len() == 0 {
+		logger.Warn("PULSE_ALLOWED_EMAILS is empty: the session sweep signs out every user with a sign-in identity")
+	}
 
 	ln, err := listen(ctx, "tcp", ":"+strconv.Itoa(cfg.port))
 	if err != nil {
@@ -198,7 +204,7 @@ func runWithConfig(ctx context.Context, cfg config, logger *slog.Logger, listen 
 	swept := make(chan struct{})
 	go func() {
 		defer close(swept)
-		sweepSessions(sweepCtx, sessions.Sweep, sessionSweepInterval, logger)
+		sweepSessions(sweepCtx, sessions.Sweep, sessionSweepInterval, sessionSweepRetry, logger)
 	}()
 	defer func() {
 		stopSweep()
@@ -212,25 +218,30 @@ func runWithConfig(ctx context.Context, cfg config, logger *slog.Logger, listen 
 // longer allowlisted, at once and then every interval until ctx ends
 // (ADR-0005 §2–3). Running at startup is what makes a shortened
 // PULSE_ALLOWED_EMAILS take effect: the list only changes on restart. A
-// failed sweep is logged and retried on the next tick.
-func sweepSessions(ctx context.Context, sweep func(context.Context) (auth.SweepResult, error), interval time.Duration, logger *slog.Logger) {
-	t := time.NewTicker(interval)
-	defer t.Stop()
+// failed sweep is logged and runs again after retry.
+func sweepSessions(ctx context.Context, sweep func(context.Context) (auth.SweepResult, error), interval, retry time.Duration, logger *slog.Logger) {
 	for {
 		sctx, cancel := context.WithTimeout(ctx, sessionSweepTimeout)
 		res, err := sweep(sctx)
 		cancel()
-		if err != nil && ctx.Err() == nil {
-			logger.Warn("session sweep failed", "error", err)
-		}
 		if res.Expired > 0 {
 			logger.Info("expired sessions deleted", "count", res.Expired)
 		}
 		if res.Disallowed > 0 {
 			logger.Info("sessions of users no longer in PULSE_ALLOWED_EMAILS deleted", "count", res.Disallowed)
 		}
+		next := interval
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			logger.Warn("session sweep failed; retrying", "error", err, "retry_in", retry)
+			next = retry
+		}
+		t := time.NewTimer(next)
 		select {
 		case <-ctx.Done():
+			t.Stop()
 			return
 		case <-t.C:
 		}

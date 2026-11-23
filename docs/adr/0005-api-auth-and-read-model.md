@@ -86,11 +86,13 @@ Constraints:
   for both accepted issuer spellings. The `user_identities` table uses that pair as its
   primary key and stores `user_id`, `email`, `created_at` and `last_login_at`.
   - Amendment (2026-11-23): the allowlist also governs existing sessions. At startup and in
-    its hourly sweep, the API deletes the sessions of every user whose Google identities all
+    its hourly sweep, the API deletes the sessions of every user whose sign-in identities all
     have an email outside `PULSE_ALLOWED_EMAILS`. The list only changes on restart, so
-    removing an address signs that person out when the API restarts with the new list. Users
-    without identities, such as development fixtures, are not affected. An operator can also
-    sign one user out everywhere with `pulse-worker revoke-sessions -user ID`.
+    removing an address signs that person out once the restarted API's first sweep succeeds;
+    a failed sweep is retried after a minute. An empty list signs out every user who has an
+    identity (the API warns at startup). Users without identities, such as development
+    fixtures, are not affected. An operator can also sign one user out everywhere with
+    `pulse-worker revoke-sessions -user ID`.
   - A new identity may create a Pulse user when the allowlisted email is unused and Google is
     authoritative for it (Gmail, or verified Google Workspace email with an `hd` claim).
     Create the user and identity in one transaction. If the email already belongs to a Pulse

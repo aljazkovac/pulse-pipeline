@@ -280,12 +280,13 @@ func TestSignInAndSessionIsolationAgainstPostgres(t *testing.T) {
 	bob := account{sub: "fake-sub-bob-" + suffix, email: "fake-bob-" + suffix + "@example.com", hd: "example.com"}
 	carol := account{sub: "fake-sub-carol-" + suffix, email: "fake-carol-" + suffix + "@example.org"} // not Google-authoritative
 	mallory := account{sub: "fake-sub-mallory-" + suffix, email: "fake-mallory-" + suffix + "@gmail.com"}
+	keeperEmail := "fake-keeper-" + suffix + "@example.com" // allowlisted, signed in before startup
 
 	google := newFakeOIDC(t)
 	cfg, err := loadConfig(env(map[string]string{
 		"DATABASE_URL": testURL, "PULSE_PUBLIC_URL": testPublicOrigin,
 		"GOOGLE_WEB_OAUTH_CLIENT_ID": oidcClientID, "GOOGLE_WEB_OAUTH_CLIENT_SECRET": oidcClientSecret,
-		"PULSE_ALLOWED_EMAILS": strings.Join([]string{strings.ToUpper(alice.email), bob.email, carol.email}, ","),
+		"PULSE_ALLOWED_EMAILS": strings.Join([]string{strings.ToUpper(alice.email), bob.email, carol.email, keeperEmail}, ","),
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -295,13 +296,24 @@ func TestSignInAndSessionIsolationAgainstPostgres(t *testing.T) {
 	// A user taken off the allowlist: their live session ends at startup.
 	removedStore := store.New(testPool)
 	removed, err := removedStore.CreateUserWithIdentity(ctx, domain.Identity{
-		Issuer: "https://accounts.google.com", Subject: "fake-sub-removed-" + suffix, Email: "fake-removed-" + suffix + "@gmail.com",
+		Issuer: "https://accounts.google.com", Subject: "fake-sub-removed-" + suffix, Email: "fake-removed-" + suffix + "@example.com",
 	}, "UTC", time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
 	removedHash := sha256.Sum256([]byte("fake-removed-session-" + suffix))
 	if err := removedStore.CreateSession(ctx, removed.ID, removedHash[:], time.Now(), time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	// An allowlisted user's live session must survive the same sweep.
+	keeper, err := removedStore.CreateUserWithIdentity(ctx, domain.Identity{
+		Issuer: "https://accounts.google.com", Subject: "fake-sub-keeper-" + suffix, Email: keeperEmail,
+	}, "UTC", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	keeperHash := sha256.Sum256([]byte("fake-keeper-session-" + suffix))
+	if err := removedStore.CreateSession(ctx, keeper.ID, keeperHash[:], time.Now(), time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -354,6 +366,9 @@ func TestSignInAndSessionIsolationAgainstPostgres(t *testing.T) {
 			t.Fatalf("the API left %d expired or disallowed sessions after startup", n)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := removedStore.GetSessionByTokenHash(ctx, keeperHash[:]); err != nil {
+		t.Errorf("the startup sweep deleted an allowlisted user's session: %v", err)
 	}
 
 	// Alice (Gmail) and Bob (Workspace) enroll by signing in.

@@ -181,8 +181,10 @@ Sign-in follows [ADR-0005](../docs/adr/0005-api-auth-and-read-model.md) §2–3 
 - **Sessions** live in the `sessions` table. The cookie holds 32 random bytes; the table stores only
   their SHA-256. Sessions end after 30 days idle or 90 days after sign-in, `last_seen_at` is
   written at most hourly. At startup and hourly the API deletes expired sessions and the
-  sessions of users whose Google identities are all off `PULSE_ALLOWED_EMAILS`, so removing an
-  address and restarting the API signs that person out. Each sign-in issues a new token and ends
+  sessions of users whose sign-in identities are all off `PULSE_ALLOWED_EMAILS`, so removing an
+  address and restarting the API signs that person out (a failed sweep retries after a minute).
+  An empty allowlist therefore signs out everyone who signed in with Google; the API warns at
+  startup. Each sign-in issues a new token and ends
   the browser's previous session.
 - **Cookies** are `HttpOnly` and `SameSite=Lax`. In production they are `__Host-pulse_session`
   and `__Host-pulse_oauth` with `Secure`, so `PULSE_PUBLIC_URL` must be HTTPS. With

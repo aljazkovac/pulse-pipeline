@@ -8,7 +8,7 @@
 //	pulse-worker bind-google-identity (-user ID [-replace] | -new-user) [-mailbox-verified]
 //	                                         bind a Google sign-in identity to a user,
 //	                                         or enroll a new one (ADR-0005 §2)
-//	pulse-worker revoke-sessions -user ID    sign a user out of every session (ADR-0005 §3)
+//	pulse-worker revoke-sessions -user ID    sign a user out of every session (ADR-0005 §2)
 //
 // Environment: DATABASE_URL (required), PULSE_SYNC_POLL_INTERVAL (default 1m),
 // PULSE_ENABLE_MOCK_PROVIDER (default false), ENV (seed-dev needs "development"),
@@ -197,7 +197,7 @@ type sessionRevoker interface {
 }
 
 // revokeSessions signs a user out of every browser, for example after a
-// lost phone (ADR-0005 §3). The user can sign in again unless their address
+// lost phone (ADR-0005 §2). The user can sign in again unless their address
 // is also removed from PULSE_ALLOWED_EMAILS.
 func revokeSessions(ctx context.Context, st sessionRevoker, userID uuid.UUID, stdout io.Writer) error {
 	u, err := st.GetUser(ctx, userID)

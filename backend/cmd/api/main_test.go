@@ -156,14 +156,15 @@ func TestSweepSessionsRunsAtOnceThenEveryIntervalUntilCancelled(t *testing.T) {
 		n++
 		calls <- struct{}{}
 		if n == 2 {
-			return auth.SweepResult{}, errors.New("fake: connection refused")
+			// Half of the sweep failed: its counts are still logged.
+			return auth.SweepResult{Disallowed: 1}, errors.New("fake: connection refused")
 		}
-		return auth.SweepResult{Expired: 3, Disallowed: 1}, nil
+		return auth.SweepResult{Expired: 3}, nil
 	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		sweepSessions(ctx, sweep, 10*time.Millisecond, logger)
+		sweepSessions(ctx, sweep, 10*time.Millisecond, 10*time.Millisecond, logger)
 	}()
 	for range 3 {
 		select {
@@ -184,6 +185,40 @@ func TestSweepSessionsRunsAtOnceThenEveryIntervalUntilCancelled(t *testing.T) {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("logs = %s; want %q", logs.String(), want)
 		}
+	}
+}
+
+// A failed sweep runs again after the short retry, not the full interval;
+// a successful one waits the full interval.
+func TestSweepSessionsRetriesAFailureSooner(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := make(chan error, 10)
+	results := []error{errors.New("fake: database starting up"), nil}
+	sweep := func(context.Context) (auth.SweepResult, error) {
+		err := results[0]
+		if len(results) > 1 {
+			results = results[1:]
+		}
+		calls <- err
+		return auth.SweepResult{}, err
+	}
+	go sweepSessions(ctx, sweep, time.Hour, 10*time.Millisecond, quietLogger())
+
+	for i, want := range []bool{true, false} {
+		select {
+		case err := <-calls:
+			if failed := err != nil; failed != want {
+				t.Fatalf("sweep %d failed = %t, want %t", i, failed, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("sweep %d did not run: a failure must be retried soon", i)
+		}
+	}
+	select {
+	case err := <-calls:
+		t.Fatalf("a successful sweep was followed by another (err %v) before the interval", err)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

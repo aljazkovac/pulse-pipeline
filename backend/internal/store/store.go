@@ -4,10 +4,10 @@
 // and owns transactions. Every method takes a userID and scopes its SQL by it,
 // with the exceptions AGENTS.md §1.1 allows, none of which returns health
 // data or tokens: ListConnectionsDueForSync, DeleteExpiredSessions and
-// DeleteSessionsOutsideAllowlist are system context for background jobs, and GetUserIDByIdentity,
-// GetSessionByTokenHash and the enrollment check in CreateUserWithIdentity
-// are the authentication boundary that turns a validated credential into a
-// user ID (ADR-0005 §2–3).
+// DeleteSessionsOutsideAllowlist are system context for background jobs,
+// and GetUserIDByIdentity, GetSessionByTokenHash and the enrollment check in
+// CreateUserWithIdentity are the authentication boundary that turns a
+// validated credential into a user ID (ADR-0005 §2–3).
 package store
 
 import (

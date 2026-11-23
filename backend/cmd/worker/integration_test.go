@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -330,10 +331,9 @@ func TestWorker_RevokeSessionsSignsOneUserOutEverywhere(t *testing.T) {
 	ctx := ctxT(t)
 	target, other := seedDev(t, ctx), seedDev(t, ctx)
 	st := store.New(testPool)
-	for i, id := range []uuid.UUID{target, target, other} {
-		hash := bytes.Repeat([]byte{byte(i + 1)}, 31)
-		hash = append(hash, id[0])
-		if err := st.CreateSession(ctx, id, hash, time.Now(), time.Now().Add(time.Hour)); err != nil {
+	for _, id := range []uuid.UUID{target, target, other} {
+		hash := sha256.Sum256([]byte(uuid.NewString()))
+		if err := st.CreateSession(ctx, id, hash[:], time.Now(), time.Now().Add(time.Hour)); err != nil {
 			t.Fatal(err)
 		}
 	}

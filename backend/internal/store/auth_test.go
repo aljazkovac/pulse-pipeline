@@ -485,23 +485,34 @@ func TestDeleteSessionsOutsideAllowlist(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture := newUser(t) // no Google identity, like a development fixture
+	// Off the list with Google, but allowlisted through a second issuer's
+	// identity: "all identities off the list" is false, so the session stays.
+	multi, err := testStore.CreateUserWithIdentity(ctx, newIdentity(uniqueEmail("multi-google")), "UTC", t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondEmail := uniqueEmail("multi-passkey")
+	if _, err := testPool.Exec(ctx, `INSERT INTO user_identities (issuer, subject, user_id, email) VALUES ($1, $2, $3, $4)`,
+		"https://passkeys.example.com", "fake-sub-"+uuid.NewString(), multi.ID, secondEmail); err != nil {
+		t.Fatal(err)
+	}
+	fixture := newUser(t) // no identity, like a development fixture
 	hashes := map[uuid.UUID][]byte{}
-	for _, id := range []uuid.UUID{allowed.ID, removed.ID, fixture.ID} {
+	for _, id := range []uuid.UUID{allowed.ID, removed.ID, multi.ID, fixture.ID} {
 		hashes[id] = tokenHash(id.String())
 		if err := testStore.CreateSession(ctx, id, hashes[id], t0, t0.Add(time.Hour)); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	n, err := testStore.DeleteSessionsOutsideAllowlist(ctx, []string{allowedEmail})
+	n, err := testStore.DeleteSessionsOutsideAllowlist(ctx, []string{allowedEmail, secondEmail})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n < 1 { // other tests' identities are not allowlisted either
 		t.Errorf("deleted %d sessions, want at least the removed user's", n)
 	}
-	for id, keep := range map[uuid.UUID]bool{allowed.ID: true, removed.ID: false, fixture.ID: true} {
+	for id, keep := range map[uuid.UUID]bool{allowed.ID: true, removed.ID: false, multi.ID: true, fixture.ID: true} {
 		_, err := testStore.GetSessionByTokenHash(ctx, hashes[id])
 		if found := err == nil; found != keep {
 			t.Errorf("user %s: session found = %t (err %v), want %t", id, found, err, keep)

@@ -228,29 +228,34 @@ func (s *Service) SignOut(ctx context.Context, token string) error {
 	return nil
 }
 
-// SweepResult counts the sessions one Sweep deleted.
+// SweepResult counts the sessions one Sweep deleted. With an error, it
+// still counts what the half that succeeded deleted.
 type SweepResult struct {
 	Expired    int64 // idle or past their absolute lifetime
-	Disallowed int64 // their user's Google identities are all off the allowlist
+	Disallowed int64 // their user's sign-in identities are all off the allowlist
 }
 
-// Sweep deletes expired sessions and the sessions of users whose Google
-// identities are all off the allowlist, so removing an address from
-// PULSE_ALLOWED_EMAILS signs that person out when the API restarts with the
-// new list (ADR-0005 §2). Users without identities, such as development
-// fixtures, are not affected by the allowlist. Sweep is system context: the
-// API runs it from a background ticker, never from a request handler.
+// Sweep deletes the sessions of users whose sign-in identities all have an
+// email off the allowlist, and expired sessions. Removing an address from
+// PULSE_ALLOWED_EMAILS therefore signs that person out when the API restarts
+// with the new list (ADR-0005 §2); an empty list signs out every user who has
+// an identity. Users without identities, such as development fixtures, are
+// not affected by the allowlist. Both deletes always run; their errors are
+// joined. Sweep is system context: the API runs it from a background ticker,
+// never from a request handler.
 func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	now := s.now().UTC()
 	var res SweepResult
-	var err error
-	if res.Expired, err = s.st.DeleteExpiredSessions(ctx, now, now.Add(-IdleTimeout)); err != nil {
-		return SweepResult{}, fmt.Errorf("auth: sweeping expired sessions: %w", err)
+	// Both halves always run: a failed housekeeping delete must not keep a
+	// removed address signed in.
+	var allowErr, expiredErr error
+	if res.Disallowed, allowErr = s.st.DeleteSessionsOutsideAllowlist(ctx, s.allow.Emails()); allowErr != nil {
+		allowErr = fmt.Errorf("auth: sweeping sessions outside the allowlist: %w", allowErr)
 	}
-	if res.Disallowed, err = s.st.DeleteSessionsOutsideAllowlist(ctx, s.allow.Emails()); err != nil {
-		return res, fmt.Errorf("auth: sweeping sessions outside the allowlist: %w", err)
+	if res.Expired, expiredErr = s.st.DeleteExpiredSessions(ctx, now, now.Add(-IdleTimeout)); expiredErr != nil {
+		expiredErr = fmt.Errorf("auth: sweeping expired sessions: %w", expiredErr)
 	}
-	return res, nil
+	return res, errors.Join(allowErr, expiredErr)
 }
 
 // sessionTokenBytes is the size of a session secret (ADR-0005 §3).
