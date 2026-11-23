@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/domain"
@@ -68,28 +69,55 @@ func (s *Store) RecordIdentityLogin(ctx context.Context, userID uuid.UUID, ident
 
 // CreateUserWithIdentity enrolls a new user with ident's email and timezone
 // and binds ident to it, in one transaction. It returns ErrEmailTaken when
-// the email already belongs to a user, including one enrolled concurrently,
-// and ErrIdentityTaken when ident is already bound; neither writes anything.
+// the email already belongs to a user or to another user's identity,
+// including a user enrolled concurrently (so a racing first sign-in of the
+// same identity also gets ErrEmailTaken), and ErrIdentityTaken when ident is
+// already bound. Neither writes anything.
 func (s *Store) CreateUserWithIdentity(ctx context.Context, ident domain.Identity, timezone string, at time.Time) (domain.User, error) {
 	if err := validateIdentity(ident); err != nil {
 		return domain.User{}, fmt.Errorf("enrolling user: %w", err)
 	}
+	if _, err := time.LoadLocation(timezone); err != nil {
+		return domain.User{}, fmt.Errorf("enrolling user: invalid timezone %q: %w", timezone, err)
+	}
 	var u domain.User
 	err := s.inTx(ctx, func(tx *Store) error {
-		var err error
-		u, err = tx.CreateUser(ctx, ident.Email, timezone)
-		if err != nil {
-			if uniqueViolation(err, usersEmailKey) {
-				return ErrEmailTaken
-			}
-			return err
+		row, err := tx.q.CreateUserUnlessEmailBound(ctx, db.CreateUserUnlessEmailBoundParams{Email: ident.Email, Timezone: timezone})
+		switch {
+		case errors.Is(err, pgx.ErrNoRows), uniqueViolation(err, usersEmailKey):
+			return ErrEmailTaken
+		case err != nil:
+			return fmt.Errorf("creating user: %w", err)
 		}
+		u = domain.User{ID: row.ID, Email: row.Email, Timezone: row.Timezone, CreatedAt: row.CreatedAt.UTC()}
 		return tx.createIdentity(ctx, u.ID, ident, at, &at)
 	})
 	if err != nil {
 		return domain.User{}, fmt.Errorf("enrolling user with %s identity: %w", ident.Issuer, err)
 	}
 	return u, nil
+}
+
+// SignInIdentity records a sign-in of ident by the user it is bound to and
+// creates the session, in one transaction. It takes a key-share lock on the
+// user, which serializes it with BindIdentity's replacement: a sign-in that
+// commits first has its session revoked by the replacement, and one that
+// waits finds the identity gone and returns ErrNotFound. So a replaced
+// identity can never keep a session (ADR-0005 §2).
+func (s *Store) SignInIdentity(ctx context.Context, userID uuid.UUID, ident domain.Identity, tokenHash []byte, at, expiresAt time.Time) error {
+	err := s.inTx(ctx, func(tx *Store) error {
+		if _, err := tx.q.LockUserForSignIn(ctx, userID); err != nil {
+			return fmt.Errorf("locking user: %w", notFound(err))
+		}
+		if err := tx.RecordIdentityLogin(ctx, userID, ident, at); err != nil {
+			return err
+		}
+		return tx.CreateSession(ctx, userID, tokenHash, at, expiresAt)
+	})
+	if err != nil {
+		return fmt.Errorf("signing in user %s: %w", userID, err)
+	}
+	return nil
 }
 
 // BindResult reports what BindIdentity changed.
@@ -126,8 +154,8 @@ func (s *Store) BindIdentity(ctx context.Context, userID uuid.UUID, ident domain
 			if _, err := tx.q.DeleteUserIdentity(ctx, db.DeleteUserIdentityParams{UserID: userID, Issuer: ident.Issuer}); err != nil {
 				return fmt.Errorf("deleting the replaced identity: %w", err)
 			}
-			if res.RevokedSessions, err = tx.q.DeleteUserSessions(ctx, userID); err != nil {
-				return fmt.Errorf("revoking sessions: %w", err)
+			if res.RevokedSessions, err = tx.DeleteUserSessions(ctx, userID); err != nil {
+				return err
 			}
 		case !errors.Is(notFound(err), ErrNotFound):
 			return fmt.Errorf("reading the current identity: %w", err)

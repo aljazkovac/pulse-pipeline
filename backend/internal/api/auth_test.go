@@ -67,7 +67,7 @@ func (f *fakeSessions) SignIn(_ context.Context, c auth.Claims) (auth.SignedIn, 
 		return auth.SignedIn{}, f.signInErr
 	}
 	f.tokens[newTokenValue] = aliceID
-	return auth.SignedIn{UserID: aliceID, Token: newTokenValue, ExpiresAt: time.Now().Add(auth.AbsoluteLifetime)}, nil
+	return auth.SignedIn{UserID: aliceID, Token: newTokenValue}, nil
 }
 
 func (f *fakeSessions) Authenticate(_ context.Context, token string) (uuid.UUID, error) {
@@ -289,6 +289,9 @@ func TestFinishGoogleSignIn_SetsSessionAndExpiresFlow(t *testing.T) {
 			if !slices.Equal(a.sessions.signOuts, []string{bobToken}) {
 				t.Errorf("sign-outs = %v; the previous session should end", a.sessions.signOuts)
 			}
+			if want, _ := a.google.Exchange(context.Background(), "", "", ""); len(a.sessions.claims) != 1 || a.sessions.claims[0] != want {
+				t.Errorf("SignIn got claims %+v, want Google's %+v", a.sessions.claims, want)
+			}
 			for _, secret := range []string{fakeCode, fakeState, fakeVerifier, newTokenValue, bobToken} {
 				if strings.Contains(a.logs.String(), secret) {
 					t.Errorf("logs contain %q", secret)
@@ -326,7 +329,7 @@ func TestFinishGoogleSignIn_Failures(t *testing.T) {
 			kind: probUnavailable, detail: "Google is unavailable", wantExchange: true},
 		{name: "not allowlisted", target: callback(fakeCode, fakeState), flow: good, signInErr: auth.ErrNotAllowed, kind: probSignInDenied, detail: "not allowed", wantExchange: true},
 		{name: "unverified", target: callback(fakeCode, fakeState), flow: good, signInErr: auth.ErrEmailUnverified, kind: probSignInDenied, detail: "not verified", wantExchange: true},
-		{name: "needs enrollment", target: callback(fakeCode, fakeState), flow: good, signInErr: auth.ErrEnrollmentRequired, kind: probSignInDenied, detail: "enroll", wantExchange: true},
+		{name: "needs enrollment", target: callback(fakeCode, fakeState), flow: good, signInErr: auth.ErrEnrollmentRequired, kind: probSignInDenied, detail: "set up your account", wantExchange: true},
 		{name: "email in use", target: callback(fakeCode, fakeState), flow: good, signInErr: auth.ErrEmailInUse, kind: probSignInDenied, detail: "existing Pulse Pipeline account", wantExchange: true},
 		{name: "store failure", target: callback(fakeCode, fakeState), flow: good, signInErr: errors.New("fake: relation \"secret_table\" does not exist"), kind: probInternal, wantExchange: true},
 	}
@@ -412,6 +415,11 @@ func TestGetMe(t *testing.T) {
 	// The development cookie name is not accepted in production, and vice versa.
 	rec = a.do(t, http.MethodGet, "/api/v1/me", map[string]string{"pulse_session": aliceToken})
 	decodeProblem(t, rec, probUnauthenticated)
+	dev := newAuthHarness(t, true)
+	decodeProblem(t, dev.do(t, http.MethodGet, "/api/v1/me", map[string]string{"__Host-pulse_session": aliceToken}), probUnauthenticated)
+	if rec := dev.do(t, http.MethodGet, "/api/v1/me", map[string]string{"pulse_session": aliceToken}); rec.Code != http.StatusOK {
+		t.Errorf("development cookie in development = %d, want 200", rec.Code)
+	}
 
 	for token, want := range map[string]gen.Me{
 		aliceToken: {Email: "fake.alice@example.com", Timezone: "Europe/Stockholm"},
@@ -550,5 +558,22 @@ func TestParseFlow(t *testing.T) {
 		if _, ok := parseFlow(bad); ok {
 			t.Errorf("parseFlow(%q) accepted", bad)
 		}
+	}
+}
+
+// Failure and sign-out replies use the development cookie attributes too.
+func TestDevelopmentCookiesOnFailureAndSignOut(t *testing.T) {
+	a := newAuthHarness(t, true)
+	rec := a.do(t, http.MethodGet, callback(fakeCode, "fake-forged-state"), loginFlow(true))
+	decodeProblem(t, rec, probSignInFailed)
+	checkCookie(t, setCookies(rec)["pulse_oauth"], "pulse_oauth", false, -1)
+
+	rec = a.do(t, http.MethodPost, "/api/v1/auth/logout", map[string]string{"pulse_session": aliceToken})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("logout = %d", rec.Code)
+	}
+	checkCookie(t, setCookies(rec)["pulse_session"], "pulse_session", false, -1)
+	if !slices.Equal(a.sessions.signOuts, []string{aliceToken}) {
+		t.Errorf("sign-outs = %v", a.sessions.signOuts)
 	}
 }

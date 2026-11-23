@@ -60,6 +60,40 @@ func (q *Queries) CreateUserIdentity(ctx context.Context, arg CreateUserIdentity
 	return err
 }
 
+const createUserUnlessEmailBound = `-- name: CreateUserUnlessEmailBound :one
+INSERT INTO users (email, timezone)
+SELECT $1, $2
+WHERE NOT EXISTS (SELECT 1 FROM user_identities WHERE lower(email) = lower($1))
+RETURNING id, email, timezone, created_at
+`
+
+type CreateUserUnlessEmailBoundParams struct {
+	Email    string
+	Timezone string
+}
+
+type CreateUserUnlessEmailBoundRow struct {
+	ID        uuid.UUID
+	Email     string
+	Timezone  string
+	CreatedAt time.Time
+}
+
+// Enrollment: creates the user unless the email is already bound to another
+// user's identity. The unique index users_email_lower_key refuses emails of
+// existing users, including one enrolled concurrently.
+func (q *Queries) CreateUserUnlessEmailBound(ctx context.Context, arg CreateUserUnlessEmailBoundParams) (CreateUserUnlessEmailBoundRow, error) {
+	row := q.db.QueryRow(ctx, createUserUnlessEmailBound, arg.Email, arg.Timezone)
+	var i CreateUserUnlessEmailBoundRow
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.Timezone,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const deleteExpiredSessions = `-- name: DeleteExpiredSessions :execrows
 DELETE FROM sessions
 WHERE expires_at <= $1 OR last_seen_at <= $2
@@ -222,9 +256,25 @@ WHERE id = $1
 FOR UPDATE
 `
 
-// Serializes identity changes for one user.
+// Serializes identity changes for one user. Conflicts with LockUserForSignIn.
 func (q *Queries) LockUser(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, lockUser, id)
+	var id_2 uuid.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
+const lockUserForSignIn = `-- name: LockUserForSignIn :one
+SELECT id
+FROM users
+WHERE id = $1
+FOR KEY SHARE
+`
+
+// Lets concurrent sign-ins of one user proceed while making each wait for,
+// or be waited on by, an identity replacement (LockUser).
+func (q *Queries) LockUserForSignIn(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockUserForSignIn, id)
 	var id_2 uuid.UUID
 	err := row.Scan(&id_2)
 	return id_2, err

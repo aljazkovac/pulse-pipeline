@@ -1,10 +1,13 @@
-// Package oauthloopback runs the browser half of an OAuth 2.0
-// authorization-code flow with PKCE for a command-line tool, using a loopback
-// redirect (RFC 8252 §7.3). The caller builds the consent URL and exchanges
-// the returned code; this package owns the listener, the state check and the
-// timeout. pulse-worker uses it to link Google Health (ADR-0004 §3) and to
-// bind a Google sign-in identity (ADR-0005 §2).
-package oauthloopback
+// Package oauthflow holds the provider-neutral parts of OAuth 2.0
+// authorization-code flows: random state and PKCE verifiers, sanitizing
+// error codes from redirects, and the browser half of a command-line flow
+// with a loopback redirect (RFC 8252 §7.3).
+//
+// For Loopback the caller builds the consent URL and exchanges the returned
+// code; this package owns the listener, the state check and the timeout.
+// pulse-worker uses it to link Google Health (ADR-0004 §3) and to bind a
+// Google sign-in identity (ADR-0005 §2).
+package oauthflow
 
 import (
 	"context"
@@ -29,24 +32,24 @@ type Redirect struct {
 }
 
 // String keeps the code and verifier out of logs.
-func (Redirect) String() string { return "oauthloopback.Redirect{REDACTED}" }
+func (Redirect) String() string { return "oauthflow.Redirect{REDACTED}" }
 
 // GoString redacts for %#v as well.
 func (r Redirect) GoString() string { return r.String() }
 
-// Authorize listens on 127.0.0.1 at a random port and passes show the consent
+// Loopback listens on 127.0.0.1 at a random port and passes show the consent
 // URL that authURL builds for that redirect URI, a random state and a random
 // PKCE verifier. It waits up to timeout for a redirect carrying the same
 // state, refusing (and ignoring) any other request, and returns its code. A
 // redirect with an OAuth error, such as access_denied, ends the flow.
-func Authorize(ctx context.Context, timeout time.Duration, authURL func(redirectURI, state, verifier string) string, show func(string) error) (Redirect, error) {
+func Loopback(ctx context.Context, timeout time.Duration, authURL func(redirectURI, state, verifier string) string, show func(string) error) (Redirect, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(waitCtx, "tcp", "127.0.0.1:0")
 	if err != nil {
-		return Redirect{}, fmt.Errorf("oauthloopback: opening loopback listener: %w", err)
+		return Redirect{}, fmt.Errorf("oauthflow: opening loopback listener: %w", err)
 	}
 	defer ln.Close() //nolint:errcheck // also closed by Shutdown; covers early returns
 	redirectURI := "http://" + ln.Addr().String()
@@ -86,7 +89,7 @@ func Authorize(ctx context.Context, timeout time.Duration, authURL func(redirect
 			}
 			if e := q.Get("error"); e != "" {
 				writePage(w, "Authorization was cancelled. You can close this tab.")
-				deliver(callback{err: fmt.Errorf("oauthloopback: authorization denied: %s", SanitizeCode(e))})
+				deliver(callback{err: fmt.Errorf("oauthflow: authorization denied: %s", SanitizeCode(e))})
 				return
 			}
 			code := q.Get("code")
@@ -106,7 +109,7 @@ func Authorize(ctx context.Context, timeout time.Duration, authURL func(redirect
 	}()
 
 	if err := show(authURL(redirectURI, state, verifier)); err != nil {
-		return Redirect{}, fmt.Errorf("oauthloopback: showing consent URL: %w", err)
+		return Redirect{}, fmt.Errorf("oauthflow: showing consent URL: %w", err)
 	}
 
 	select {
@@ -116,16 +119,16 @@ func Authorize(ctx context.Context, timeout time.Duration, authURL func(redirect
 		}
 		return Redirect{Code: cb.code, RedirectURI: redirectURI, Verifier: verifier}, nil
 	case <-waitCtx.Done():
-		return Redirect{}, fmt.Errorf("oauthloopback: waiting for the redirect: %w", waitCtx.Err())
+		return Redirect{}, fmt.Errorf("oauthflow: waiting for the redirect: %w", waitCtx.Err())
 	}
 }
 
-// RandomToken returns 32 random bytes, base64url-encoded (43 characters),
-// suitable for both state and a PKCE verifier.
+// RandomToken returns 32 random bytes, base64url-encoded (43 characters):
+// an OAuth state or a PKCE code verifier.
 func RandomToken() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
-		return "", fmt.Errorf("oauthloopback: generating random value: %w", err)
+		return "", fmt.Errorf("oauthflow: generating random value: %w", err)
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }

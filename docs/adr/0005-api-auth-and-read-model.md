@@ -117,6 +117,9 @@ Constraints:
   secret, returns only `user_id` and session timestamps, and is used only by the auth middleware.
   It is a system-context query in the AGENTS.md §1.1 sense and is documented as one, like
   `ListConnectionsDueForSync`.
+  - Implementation note (2026-11-23): sign-out uses it too, through the same auth service, to
+    find and delete the session whose secret the request presents, expired or not. AGENTS.md
+    §1.1 lists it, with the identity lookup, as the authentication-boundary exception.
 - **Scoping:** handlers get the `user_id` from the request context set by the middleware. No
   endpoint accepts a `user_id` parameter. Every store call is scoped by that ID.
 - **Cross-site requests:** Go's `http.CrossOriginProtection` (Go 1.25+) wraps the mux and rejects

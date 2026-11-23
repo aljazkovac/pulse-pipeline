@@ -175,8 +175,9 @@ Sign-in follows [ADR-0005](../docs/adr/0005-api-auth-and-read-model.md) §2–3 
 - **Who may sign in:** the email must be in `PULSE_ALLOWED_EMAILS`, checked on every sign-in. A
   returning Google identity, found by its `(issuer, subject)` in `user_identities`, signs in to its
   user. A new identity creates a user only when Google is authoritative for its email (Gmail or a
-  Google Workspace account) and no user has that email yet. Every other case is refused with
-  `403 sign-in-denied` and changes nothing.
+  Google Workspace account) and neither a user nor another user's Google identity has that email
+  yet. Every other case is refused with `403 sign-in-denied` and changes nothing. ID tokens must
+  name exactly this client as their audience.
 - **Sessions** live in the `sessions` table. The cookie holds 32 random bytes; the table stores only
   their SHA-256. Sessions end after 30 days idle or 90 days after sign-in, `last_seen_at` is
   written at most hourly, and the API deletes expired rows hourly. Each sign-in issues a new
@@ -211,7 +212,12 @@ The account owner signs in to Google in a browser on the same machine (loopback 
 `connect-google`). The operator must know that person owns the Pulse user. For an address that is
 not Gmail or Google Workspace, first confirm that the owner controls the mailbox (for example with
 a one-time code sent to it) and add `-mailbox-verified`. Binding a different Google account later
-needs `-replace`, which also signs the user out of every session.
+needs `-replace`, which also signs the user out of every session; a sign-in racing the replacement
+cannot keep a session either.
+
+**Enrolling a non-Google address.** A Google account whose address is not Gmail or Workspace cannot
+create its own user. After the mailbox check, the operator enrolls it with
+`bind-google-identity -new-user -mailbox-verified`, then adds the address to `PULSE_ALLOWED_EMAILS`.
 
 ## Database Workflow
 
@@ -226,5 +232,6 @@ The schema and its rationale are in [ADR-0002](../docs/adr/0002-health-data-sche
 
 Every query must filter by `user_id`, with the exceptions `AGENTS.md` §1.1 allows, none of which
 returns health data or tokens: `ListConnectionsDueForSync` (the nightly scheduler) and
-`DeleteExpiredSessions` (the API's hourly sweep) are system context, and `GetSessionByTokenHash` and
-`GetUserIDByIdentity` are the authentication boundary that turns a credential into a user ID.
+`DeleteExpiredSessions` (the API's hourly sweep) are system context, and `GetSessionByTokenHash`,
+`GetUserIDByIdentity` and the enrollment check `CreateUserUnlessEmailBound` are the authentication
+boundary that turns a credential into a user ID.

@@ -28,12 +28,29 @@ WHERE user_id = @user_id AND issuer = @issuer;
 DELETE FROM user_identities
 WHERE user_id = @user_id AND issuer = @issuer;
 
--- Serializes identity changes for one user.
+-- Serializes identity changes for one user. Conflicts with LockUserForSignIn.
 -- name: LockUser :one
 SELECT id
 FROM users
 WHERE id = @id
 FOR UPDATE;
+
+-- Lets concurrent sign-ins of one user proceed while making each wait for,
+-- or be waited on by, an identity replacement (LockUser).
+-- name: LockUserForSignIn :one
+SELECT id
+FROM users
+WHERE id = @id
+FOR KEY SHARE;
+
+-- Enrollment: creates the user unless the email is already bound to another
+-- user's identity. The unique index users_email_lower_key refuses emails of
+-- existing users, including one enrolled concurrently.
+-- name: CreateUserUnlessEmailBound :one
+INSERT INTO users (email, timezone)
+SELECT @email, @timezone
+WHERE NOT EXISTS (SELECT 1 FROM user_identities WHERE lower(email) = lower(@email))
+RETURNING id, email, timezone, created_at;
 
 -- name: CreateSession :exec
 INSERT INTO sessions (token_hash, user_id, created_at, last_seen_at, expires_at)

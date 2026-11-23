@@ -326,3 +326,149 @@ func TestDeletingUserCascadesToIdentitiesAndSessions(t *testing.T) {
 		}
 	}
 }
+
+func TestSignInIdentity_RecordsLoginAndSessionForTheBoundUserOnly(t *testing.T) {
+	ctx := ctxT(t)
+	ident := newIdentity(uniqueEmail("signin"))
+	owner, err := testStore.CreateUserWithIdentity(ctx, ident, "UTC", t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := newUser(t)
+
+	h := tokenHash("other")
+	if err := testStore.SignInIdentity(ctx, other.ID, ident, h, t0, t0.Add(time.Hour)); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("signing in another user's identity = %v, want ErrNotFound", err)
+	}
+	if _, err := testStore.GetSessionByTokenHash(ctx, h); !errors.Is(err, store.ErrNotFound) {
+		t.Error("a refused sign-in left a session")
+	}
+
+	h = tokenHash("owner")
+	later := t0.Add(time.Hour)
+	if err := testStore.SignInIdentity(ctx, owner.ID, ident, h, later, later.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := testStore.GetSessionByTokenHash(ctx, h); err != nil || got.UserID != owner.ID {
+		t.Errorf("session = %+v, %v", got, err)
+	}
+	if n := countRows(t, `SELECT count(*) FROM user_identities WHERE user_id = $1 AND last_login_at = $2`, owner.ID, later); n != 1 {
+		t.Error("the sign-in was not recorded")
+	}
+}
+
+// A sign-in racing an identity replacement must not leave the replaced
+// identity with a session (ADR-0005 §2).
+func TestSignInIdentity_WaitsForAReplacementAndThenFails(t *testing.T) {
+	ctx := ctxT(t)
+	u := newUser(t)
+	old := newIdentity(u.Email)
+	if _, err := testStore.BindIdentity(ctx, u.ID, old, false, t0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Play the replacement by hand so the test controls when it commits.
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT id FROM users WHERE id = $1 FOR UPDATE`, u.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	h := tokenHash("racing")
+	done := make(chan error, 1)
+	go func() { done <- testStore.SignInIdentity(ctx, u.ID, old, h, t0, t0.Add(time.Hour)) }()
+	select {
+	case err := <-done:
+		t.Fatalf("the sign-in did not wait for the replacement: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM user_identities WHERE user_id = $1`, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM sessions WHERE user_id = $1`, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := <-done; !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("sign-in after the replacement = %v, want ErrNotFound", err)
+	}
+	if _, err := testStore.GetSessionByTokenHash(ctx, h); !errors.Is(err, store.ErrNotFound) {
+		t.Error("the replaced identity kept a session")
+	}
+}
+
+func TestSignInIdentity_SessionCreatedBeforeAReplacementIsRevoked(t *testing.T) {
+	ctx := ctxT(t)
+	u := newUser(t)
+	old := newIdentity(u.Email)
+	if _, err := testStore.BindIdentity(ctx, u.ID, old, false, t0); err != nil {
+		t.Fatal(err)
+	}
+	h := tokenHash("before")
+	if err := testStore.SignInIdentity(ctx, u.ID, old, h, t0, t0.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	res, err := testStore.BindIdentity(ctx, u.ID, newIdentity(u.Email), true, t0)
+	if err != nil || res.RevokedSessions != 1 {
+		t.Fatalf("replace = %+v, %v; want the session revoked", res, err)
+	}
+	if _, err := testStore.GetSessionByTokenHash(ctx, h); !errors.Is(err, store.ErrNotFound) {
+		t.Error("the replaced identity kept its session")
+	}
+}
+
+func TestEnrollment_ConcurrentFirstSignInsCreateOneUser(t *testing.T) {
+	ctx := ctxT(t)
+	ident := newIdentity(uniqueEmail("concurrent"))
+	const racers = 4
+	errs := make(chan error, racers)
+	start := make(chan struct{})
+	for range racers {
+		go func() {
+			<-start
+			_, err := testStore.CreateUserWithIdentity(ctx, ident, "UTC", t0)
+			errs <- err
+		}()
+	}
+	close(start)
+	var ok int
+	for range racers {
+		switch err := <-errs; {
+		case err == nil:
+			ok++
+		case !errors.Is(err, store.ErrEmailTaken):
+			t.Errorf("a losing enrollment = %v, want ErrEmailTaken", err)
+		}
+	}
+	if ok != 1 {
+		t.Errorf("%d enrollments succeeded, want exactly 1", ok)
+	}
+	if n := countRows(t, `SELECT count(*) FROM users WHERE email = $1`, ident.Email); n != 1 {
+		t.Errorf("users with the email = %d, want 1", n)
+	}
+}
+
+// An email bound to an operator-enrolled identity belongs to that user even
+// when the user's own address differs.
+func TestEnrollment_RefusesAnEmailBoundToAnotherUsersIdentity(t *testing.T) {
+	ctx := ctxT(t)
+	u := newUser(t)
+	bound := newIdentity(uniqueEmail("bound"))
+	if _, err := testStore.BindIdentity(ctx, u.ID, bound, false, t0); err != nil {
+		t.Fatal(err)
+	}
+	imposter := newIdentity(strings.ToUpper(bound.Email))
+	if _, err := testStore.CreateUserWithIdentity(ctx, imposter, "UTC", t0); !errors.Is(err, store.ErrEmailTaken) {
+		t.Fatalf("enrolling a bound email = %v, want ErrEmailTaken", err)
+	}
+	if n := countRows(t, `SELECT count(*) FROM users WHERE lower(email) = lower($1)`, bound.Email); n != 0 {
+		t.Errorf("a user was created for the bound email")
+	}
+}

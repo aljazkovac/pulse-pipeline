@@ -66,7 +66,8 @@ again.
 in `PULSE_ALLOWED_EMAILS`, Google has not verified it, Google is not authoritative for it (a
 non-Gmail, non-Workspace address), or it belongs to an existing Pulse user that this Google account
 is not bound to. `detail` says which; the last two need the operator
-(`pulse-worker bind-google-identity`). No session is created and no account changes.
+(`pulse-worker bind-google-identity`, with `-new-user` for a non-Google address). No session is
+created and no account changes.
 
 ## cross-origin-request
 

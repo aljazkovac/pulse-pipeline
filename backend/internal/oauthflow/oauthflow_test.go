@@ -1,4 +1,4 @@
-package oauthloopback_test
+package oauthflow_test
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aljazkovac/pulse-pipeline/backend/internal/oauthloopback"
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/oauthflow"
 )
 
 func consentURL(redirectURI, state, verifier string) string {
@@ -65,13 +65,13 @@ func browser(t *testing.T, back func(state string) url.Values) func(string) erro
 	}
 }
 
-func TestAuthorize_ReturnsCodeVerifierAndRedirect(t *testing.T) {
+func TestLoopback_ReturnsCodeVerifierAndRedirect(t *testing.T) {
 	var sentVerifier string
 	build := func(redirectURI, state, verifier string) string {
 		sentVerifier = verifier
 		return consentURL(redirectURI, state, verifier)
 	}
-	r, err := oauthloopback.Authorize(context.Background(), 5*time.Second, build, browser(t, func(state string) url.Values {
+	r, err := oauthflow.Loopback(context.Background(), 5*time.Second, build, browser(t, func(state string) url.Values {
 		return url.Values{"code": {"fake-auth-code"}, "state": {state}}
 	}))
 	if err != nil {
@@ -85,8 +85,8 @@ func TestAuthorize_ReturnsCodeVerifierAndRedirect(t *testing.T) {
 	}
 }
 
-func TestAuthorize_UserDeniedSanitizesTheCode(t *testing.T) {
-	_, err := oauthloopback.Authorize(context.Background(), 5*time.Second, consentURL, browser(t, func(state string) url.Values {
+func TestLoopback_UserDeniedSanitizesTheCode(t *testing.T) {
+	_, err := oauthflow.Loopback(context.Background(), 5*time.Second, consentURL, browser(t, func(state string) url.Values {
 		return url.Values{"error": {"access_denied<script>\n" + strings.Repeat("x", 100)}, "state": {state}}
 	}))
 	if err == nil || !strings.Contains(err.Error(), "authorization denied: access_deniedscript") {
@@ -97,14 +97,28 @@ func TestAuthorize_UserDeniedSanitizesTheCode(t *testing.T) {
 	}
 }
 
-func TestAuthorize_TimesOutAndReportsShowErrors(t *testing.T) {
-	_, err := oauthloopback.Authorize(context.Background(), 50*time.Millisecond, consentURL, func(string) error { return nil })
+func TestLoopback_TimesOutAndReportsShowErrors(t *testing.T) {
+	_, err := oauthflow.Loopback(context.Background(), 50*time.Millisecond, consentURL, func(string) error { return nil })
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("err = %v, want deadline exceeded", err)
 	}
 	boom := errors.New("fake: no terminal")
-	_, err = oauthloopback.Authorize(context.Background(), time.Second, consentURL, func(string) error { return boom })
+	_, err = oauthflow.Loopback(context.Background(), time.Second, consentURL, func(string) error { return boom })
 	if !errors.Is(err, boom) {
 		t.Errorf("err = %v, want the show error", err)
+	}
+}
+
+func TestRandomToken_IsRandomBase64URL(t *testing.T) {
+	a, err := oauthflow.RandomToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := oauthflow.RandomToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(a) != 43 || a == b || strings.ContainsAny(a, "+/=") {
+		t.Errorf("tokens %q, %q: want two distinct 43-character base64url values", a, b)
 	}
 }

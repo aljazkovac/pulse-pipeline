@@ -291,12 +291,12 @@ func TestWorker_BindGoogleIdentityToAnExistingUser(t *testing.T) {
 	req := bindRequest{userID: userID}
 
 	// example.com is not a Google-authoritative address.
-	if err := bindGoogleIdentity(ctx, st, fakeLoopback{claims: claims}, req, io.Discard, time.Now()); err == nil {
+	if err := bindGoogleIdentity(ctx, st, fakeLoopback{claims: claims}, req, io.Discard, time.Now); err == nil {
 		t.Fatal("bound a third-party address without -mailbox-verified")
 	}
 	req.mailboxVerified = true
 	var out bytes.Buffer
-	if err := bindGoogleIdentity(ctx, st, fakeLoopback{claims: claims}, req, &out, time.Now()); err != nil {
+	if err := bindGoogleIdentity(ctx, st, fakeLoopback{claims: claims}, req, &out, time.Now); err != nil {
 		t.Fatal(err)
 	}
 	got, err := st.GetUserIDByIdentity(ctx, claims.Issuer, claims.Subject)
@@ -310,12 +310,12 @@ func TestWorker_BindGoogleIdentityToAnExistingUser(t *testing.T) {
 	}
 	other := claims
 	other.Subject = "fake-sub-" + uuid.NewString()
-	if err := bindGoogleIdentity(ctx, st, fakeLoopback{claims: other}, req, io.Discard, time.Now()); !errors.Is(err, store.ErrIdentityBound) {
+	if err := bindGoogleIdentity(ctx, st, fakeLoopback{claims: other}, req, io.Discard, time.Now); !errors.Is(err, store.ErrIdentityBound) {
 		t.Fatalf("replacing without -replace = %v, want ErrIdentityBound", err)
 	}
 	req.replace = true
 	out.Reset()
-	if err := bindGoogleIdentity(ctx, st, fakeLoopback{claims: other}, req, &out, time.Now()); err != nil {
+	if err := bindGoogleIdentity(ctx, st, fakeLoopback{claims: other}, req, &out, time.Now); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "signed out 1 sessions") {

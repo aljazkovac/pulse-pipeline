@@ -71,7 +71,7 @@ func Denied(err error) bool {
 // DeleteExpiredSessions (AGENTS.md §1.1).
 type Store interface {
 	GetUserIDByIdentity(ctx context.Context, issuer, subject string) (uuid.UUID, error)
-	RecordIdentityLogin(ctx context.Context, userID uuid.UUID, ident domain.Identity, at time.Time) error
+	SignInIdentity(ctx context.Context, userID uuid.UUID, ident domain.Identity, tokenHash []byte, at, expiresAt time.Time) error
 	CreateUserWithIdentity(ctx context.Context, ident domain.Identity, timezone string, at time.Time) (domain.User, error)
 	CreateSession(ctx context.Context, userID uuid.UUID, tokenHash []byte, createdAt, expiresAt time.Time) error
 	GetSessionByTokenHash(ctx context.Context, tokenHash []byte) (domain.Session, error)
@@ -98,11 +98,11 @@ func NewService(st Store, allow Allowlist, now func() time.Time) *Service {
 	return &Service{st: st, allow: allow, now: now}
 }
 
-// SignedIn is a new session. Token is the cookie secret: never log it.
+// SignedIn is a new session, which lasts at most AbsoluteLifetime. Token is
+// the cookie secret: never log it.
 type SignedIn struct {
-	UserID    uuid.UUID
-	Token     string
-	ExpiresAt time.Time
+	UserID uuid.UUID
+	Token  string
 }
 
 // String keeps the token out of logs.
@@ -127,38 +127,57 @@ func (s *Service) SignIn(ctx context.Context, c Claims) (SignedIn, error) {
 		return SignedIn{}, ErrNotAllowed
 	}
 	now := s.now().UTC()
-	userID, err := s.st.GetUserIDByIdentity(ctx, c.Issuer, c.Subject)
-	switch {
-	case err == nil:
-		if err := s.st.RecordIdentityLogin(ctx, userID, c.Identity, now); err != nil {
-			return SignedIn{}, fmt.Errorf("auth: signing in: %w", err)
-		}
-	case !errors.Is(err, store.ErrNotFound):
-		return SignedIn{}, fmt.Errorf("auth: signing in: %w", err)
-	case !c.GoogleAuthoritative():
-		return SignedIn{}, ErrEnrollmentRequired
-	default:
-		u, err := s.st.CreateUserWithIdentity(ctx, c.Identity, NewUserTimezone, now)
-		switch {
-		case errors.Is(err, store.ErrEmailTaken), errors.Is(err, store.ErrIdentityTaken):
-			// ErrIdentityTaken: a concurrent first sign-in of the same
-			// identity won the race; retrying signs in normally.
-			return SignedIn{}, ErrEmailInUse
-		case err != nil:
-			return SignedIn{}, fmt.Errorf("auth: enrolling a new user: %w", err)
-		}
-		userID = u.ID
-	}
-
 	token, hash, err := newSessionToken()
 	if err != nil {
 		return SignedIn{}, err
 	}
 	expires := now.Add(AbsoluteLifetime)
-	if err := s.st.CreateSession(ctx, userID, hash, now, expires); err != nil {
-		return SignedIn{}, fmt.Errorf("auth: creating session: %w", err)
+
+	userID, err := s.st.GetUserIDByIdentity(ctx, c.Issuer, c.Subject)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		userID, err = s.enroll(ctx, c, now)
+		if err != nil {
+			return SignedIn{}, err
+		}
+		if err := s.st.CreateSession(ctx, userID, hash, now, expires); err != nil {
+			return SignedIn{}, fmt.Errorf("auth: creating session: %w", err)
+		}
+		return SignedIn{UserID: userID, Token: token}, nil
+	case err != nil:
+		return SignedIn{}, fmt.Errorf("auth: signing in: %w", err)
 	}
-	return SignedIn{UserID: userID, Token: token, ExpiresAt: expires}, nil
+	// One transaction that serializes with an operator replacing the
+	// identity, so a replaced identity never keeps a session.
+	if err := s.st.SignInIdentity(ctx, userID, c.Identity, hash, now, expires); err != nil {
+		return SignedIn{}, fmt.Errorf("auth: signing in: %w", err)
+	}
+	return SignedIn{UserID: userID, Token: token}, nil
+}
+
+// enroll creates a user for a new identity when Google is authoritative for
+// its email (ADR-0005 §2). If the email is taken because a concurrent first
+// sign-in of the same identity just enrolled it, it returns that user.
+func (s *Service) enroll(ctx context.Context, c Claims, now time.Time) (uuid.UUID, error) {
+	if !c.GoogleAuthoritative() {
+		return uuid.Nil, ErrEnrollmentRequired
+	}
+	u, err := s.st.CreateUserWithIdentity(ctx, c.Identity, NewUserTimezone, now)
+	if err == nil {
+		return u.ID, nil
+	}
+	if !errors.Is(err, store.ErrEmailTaken) && !errors.Is(err, store.ErrIdentityTaken) {
+		return uuid.Nil, fmt.Errorf("auth: enrolling a new user: %w", err)
+	}
+	userID, lookupErr := s.st.GetUserIDByIdentity(ctx, c.Issuer, c.Subject)
+	switch {
+	case lookupErr == nil:
+		return userID, nil // lost the race to our own first sign-in
+	case errors.Is(lookupErr, store.ErrNotFound):
+		return uuid.Nil, ErrEmailInUse
+	default:
+		return uuid.Nil, fmt.Errorf("auth: enrolling a new user: %w", lookupErr)
+	}
 }
 
 // Authenticate returns the user of a live session, or ErrNoSession. It
@@ -245,16 +264,6 @@ func hashSessionToken(token string) ([]byte, bool) {
 	}
 	sum := sha256.Sum256(b)
 	return sum[:], true
-}
-
-// NewSecret returns 32 random bytes, base64url-encoded: an OAuth state or a
-// PKCE code verifier.
-func NewSecret() (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", fmt.Errorf("auth: generating secret: %w", err)
-	}
-	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 // Allowlist is the set of email addresses allowed to sign in

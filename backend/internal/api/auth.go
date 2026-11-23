@@ -14,7 +14,7 @@ import (
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/api/gen"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/auth"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/domain"
-	"github.com/aljazkovac/pulse-pipeline/backend/internal/oauthloopback"
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/oauthflow"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/store"
 )
 
@@ -160,24 +160,46 @@ func (s *server) withSession(next http.Handler) http.Handler {
 	})
 }
 
-// cookieReply sends cookies ahead of a generated response. Strict handlers
-// cannot reach the ResponseWriter, so this is how they set cookies; the
-// status, headers and body still come from the contract's generated type.
-type cookieReply struct {
+// Strict handlers cannot reach the ResponseWriter, so the operations that set
+// cookies wrap their generated response in one of these types, which sends
+// the cookies first. Each embeds its own operation's response interface, so
+// the status, headers and body still come from that operation's contract.
+
+type startSignInWithCookies struct {
+	gen.StartGoogleSignInResponseObject
 	cookies []*http.Cookie
-	reply   func(http.ResponseWriter) error
 }
 
-func (c cookieReply) send(w http.ResponseWriter) error {
-	for _, ck := range c.cookies {
-		http.SetCookie(w, ck)
+func (r startSignInWithCookies) VisitStartGoogleSignInResponse(w http.ResponseWriter) error {
+	writeCookies(w, r.cookies)
+	return r.StartGoogleSignInResponseObject.VisitStartGoogleSignInResponse(w)
+}
+
+type finishSignInWithCookies struct {
+	gen.FinishGoogleSignInResponseObject
+	cookies []*http.Cookie
+}
+
+func (r finishSignInWithCookies) VisitFinishGoogleSignInResponse(w http.ResponseWriter) error {
+	writeCookies(w, r.cookies)
+	return r.FinishGoogleSignInResponseObject.VisitFinishGoogleSignInResponse(w)
+}
+
+type signOutWithCookies struct {
+	gen.SignOutResponseObject
+	cookies []*http.Cookie
+}
+
+func (r signOutWithCookies) VisitSignOutResponse(w http.ResponseWriter) error {
+	writeCookies(w, r.cookies)
+	return r.SignOutResponseObject.VisitSignOutResponse(w)
+}
+
+func writeCookies(w http.ResponseWriter, cookies []*http.Cookie) {
+	for _, c := range cookies {
+		http.SetCookie(w, c)
 	}
-	return c.reply(w)
 }
-
-func (c cookieReply) VisitStartGoogleSignInResponse(w http.ResponseWriter) error  { return c.send(w) }
-func (c cookieReply) VisitFinishGoogleSignInResponse(w http.ResponseWriter) error { return c.send(w) }
-func (c cookieReply) VisitSignOutResponse(w http.ResponseWriter) error            { return c.send(w) }
 
 const signInNotConfigured = "Google sign-in is not configured on this server."
 
@@ -189,19 +211,19 @@ func (s *server) StartGoogleSignIn(_ context.Context, _ gen.StartGoogleSignInReq
 			UnavailableApplicationProblemPlusJSONResponse: gen.UnavailableApplicationProblemPlusJSONResponse(probUnavailable.problem(signInNotConfigured)),
 		}, nil
 	}
-	state, err := auth.NewSecret()
+	state, err := oauthflow.RandomToken()
 	if err != nil {
 		return nil, err
 	}
-	verifier, err := auth.NewSecret()
+	verifier, err := oauthflow.RandomToken()
 	if err != nil {
 		return nil, err
 	}
 	flow := oauthFlow{purpose: flowLogin, state: state, verifier: verifier}
 	location := s.signIn.google.AuthCodeURL(s.signIn.redirectURI, state, verifier)
-	return cookieReply{
-		cookies: []*http.Cookie{s.cookies.make(s.cookies.flow, flow.encode(), flowMaxAge)},
-		reply:   gen.StartGoogleSignIn302Response{Headers: gen.StartGoogleSignIn302ResponseHeaders{Location: &location}}.VisitStartGoogleSignInResponse,
+	return startSignInWithCookies{
+		StartGoogleSignInResponseObject: gen.StartGoogleSignIn302Response{Headers: gen.StartGoogleSignIn302ResponseHeaders{Location: &location}},
+		cookies:                         []*http.Cookie{s.cookies.make(s.cookies.flow, flow.encode(), flowMaxAge)},
 	}, nil
 }
 
@@ -210,18 +232,18 @@ func (s *server) StartGoogleSignIn(_ context.Context, _ gen.StartGoogleSignInReq
 func (s *server) FinishGoogleSignIn(ctx context.Context, req gen.FinishGoogleSignInRequestObject) (gen.FinishGoogleSignInResponseObject, error) {
 	expireFlow := s.cookies.expire(s.cookies.flow)
 	problem := func(p gen.Problem) gen.FinishGoogleSignInResponseObject {
-		var reply func(http.ResponseWriter) error
+		var reply gen.FinishGoogleSignInResponseObject
 		switch p.Status {
 		case http.StatusBadRequest:
-			reply = gen.FinishGoogleSignIn400ApplicationProblemPlusJSONResponse{SignInFailedApplicationProblemPlusJSONResponse: gen.SignInFailedApplicationProblemPlusJSONResponse(p)}.VisitFinishGoogleSignInResponse
+			reply = gen.FinishGoogleSignIn400ApplicationProblemPlusJSONResponse{SignInFailedApplicationProblemPlusJSONResponse: gen.SignInFailedApplicationProblemPlusJSONResponse(p)}
 		case http.StatusForbidden:
-			reply = gen.FinishGoogleSignIn403ApplicationProblemPlusJSONResponse{SignInDeniedApplicationProblemPlusJSONResponse: gen.SignInDeniedApplicationProblemPlusJSONResponse(p)}.VisitFinishGoogleSignInResponse
+			reply = gen.FinishGoogleSignIn403ApplicationProblemPlusJSONResponse{SignInDeniedApplicationProblemPlusJSONResponse: gen.SignInDeniedApplicationProblemPlusJSONResponse(p)}
 		case http.StatusServiceUnavailable:
-			reply = gen.FinishGoogleSignIn503ApplicationProblemPlusJSONResponse{UnavailableApplicationProblemPlusJSONResponse: gen.UnavailableApplicationProblemPlusJSONResponse(p)}.VisitFinishGoogleSignInResponse
+			reply = gen.FinishGoogleSignIn503ApplicationProblemPlusJSONResponse{UnavailableApplicationProblemPlusJSONResponse: gen.UnavailableApplicationProblemPlusJSONResponse(p)}
 		default:
-			reply = gen.FinishGoogleSignIndefaultApplicationProblemPlusJSONResponse{Body: p, StatusCode: p.Status}.VisitFinishGoogleSignInResponse
+			reply = gen.FinishGoogleSignIndefaultApplicationProblemPlusJSONResponse{Body: p, StatusCode: p.Status}
 		}
-		return cookieReply{cookies: []*http.Cookie{expireFlow}, reply: reply}
+		return finishSignInWithCookies{FinishGoogleSignInResponseObject: reply, cookies: []*http.Cookie{expireFlow}}
 	}
 	failed := func(detail string) (gen.FinishGoogleSignInResponseObject, error) {
 		return problem(probSignInFailed.problem(detail)), nil
@@ -238,7 +260,7 @@ func (s *server) FinishGoogleSignIn(ctx context.Context, req gen.FinishGoogleSig
 		return failed("The sign-in expired or was started in another browser. Start again.")
 	}
 	if e := deref(req.Params.Error); e != "" {
-		s.logger.InfoContext(ctx, "sign-in cancelled at Google", "oauth_error", oauthloopback.SanitizeCode(e))
+		s.logger.InfoContext(ctx, "sign-in cancelled at Google", "oauth_error", oauthflow.SanitizeCode(e))
 		return failed("Google sign-in was cancelled or refused. Start again.")
 	}
 	code := deref(req.Params.Code)
@@ -274,9 +296,11 @@ func (s *server) FinishGoogleSignIn(ctx context.Context, req gen.FinishGoogleSig
 		}
 	}
 	location := afterSignIn
-	return cookieReply{
+	return finishSignInWithCookies{
+		FinishGoogleSignInResponseObject: gen.FinishGoogleSignIn303Response{Headers: gen.FinishGoogleSignIn303ResponseHeaders{Location: &location}},
+		// The cookie lasts as long as the session can (AbsoluteLifetime);
+		// idle expiry is enforced on the server.
 		cookies: []*http.Cookie{expireFlow, s.cookies.make(s.cookies.session, signed.Token, auth.AbsoluteLifetime)},
-		reply:   gen.FinishGoogleSignIn303Response{Headers: gen.FinishGoogleSignIn303ResponseHeaders{Location: &location}}.VisitFinishGoogleSignInResponse,
 	}, nil
 }
 
@@ -287,7 +311,7 @@ func denialDetail(err error) string {
 	case errors.Is(err, auth.ErrEmailUnverified):
 		return "Google has not verified this account's email address."
 	case errors.Is(err, auth.ErrEnrollmentRequired):
-		return "Google cannot confirm who owns this account's email address. Ask the operator to enroll this Google account."
+		return "Google cannot confirm who owns this account's email address. Ask the operator to set up your account."
 	case errors.Is(err, auth.ErrEmailInUse):
 		return "This email address belongs to an existing Pulse Pipeline account. Ask the operator to link this Google account to it."
 	default:
@@ -302,9 +326,9 @@ func (s *server) SignOut(ctx context.Context, _ gen.SignOutRequestObject) (gen.S
 			return nil, fmt.Errorf("signing out: %w", err)
 		}
 	}
-	return cookieReply{
-		cookies: []*http.Cookie{s.cookies.expire(s.cookies.session)},
-		reply:   gen.SignOut204Response{}.VisitSignOutResponse,
+	return signOutWithCookies{
+		SignOutResponseObject: gen.SignOut204Response{},
+		cookies:               []*http.Cookie{s.cookies.expire(s.cookies.session)},
 	}, nil
 }
 

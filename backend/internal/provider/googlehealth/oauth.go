@@ -12,7 +12,7 @@ import (
 	"strings"
 
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/domain"
-	"github.com/aljazkovac/pulse-pipeline/backend/internal/oauthloopback"
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/oauthflow"
 )
 
 // Grant holds the credentials and scopes from an authorization. AuthorizeLoopback
@@ -110,7 +110,7 @@ func (p *Provider) CheckIdentity(ctx context.Context, creds domain.Credentials) 
 func (p *Provider) AuthorizeLoopback(ctx context.Context, show func(authURL string) error) (Grant, error) {
 	// The timeout bounds waiting for the user only; the code exchange below
 	// runs on ctx, bounded by the HTTP client's timeout.
-	redirect, err := oauthloopback.Authorize(ctx, p.loopbackTimeout, p.AuthCodeURL, show)
+	redirect, err := oauthflow.Loopback(ctx, p.loopbackTimeout, p.AuthCodeURL, show)
 	if err != nil {
 		return Grant{}, fmt.Errorf("googlehealth: %w", err)
 	}

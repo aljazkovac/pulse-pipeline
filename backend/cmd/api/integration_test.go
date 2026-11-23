@@ -198,6 +198,14 @@ func cookieNamed(resp *http.Response, name string) *http.Cookie {
 // callback's response.
 func (c apiClient) signIn(google *fakeOIDC, a account) *http.Response {
 	c.t.Helper()
+	resp, _ := c.signInReplayable(google, a)
+	return resp
+}
+
+// signInReplayable also returns a function that sends the same callback
+// again with the same flow cookie, as a replayed or reloaded callback would.
+func (c apiClient) signInReplayable(google *fakeOIDC, a account) (*http.Response, func() *http.Response) {
+	c.t.Helper()
 	login := c.do(http.MethodGet, "/api/v1/auth/google/login", nil)
 	if login.StatusCode != http.StatusFound {
 		c.t.Fatalf("login = %d, want 302", login.StatusCode)
@@ -219,11 +227,19 @@ func (c apiClient) signIn(google *fakeOIDC, a account) *http.Response {
 		c.t.Fatal("login set no flow cookie")
 	}
 	code := google.issue(q.Get("state"), a)
-	return c.do(http.MethodGet, "/api/v1/auth/google/callback?"+url.Values{"code": {code}, "state": {q.Get("state")}}.Encode(),
-		[]*http.Cookie{flow})
+	callback := "/api/v1/auth/google/callback?" + url.Values{"code": {code}, "state": {q.Get("state")}}.Encode()
+	return c.do(http.MethodGet, callback, []*http.Cookie{flow}), func() *http.Response {
+		return c.do(http.MethodGet, callback, []*http.Cookie{flow})
+	}
 }
 
 func (c apiClient) me(session *http.Cookie) (int, string) {
+	c.t.Helper()
+	code, email, _ := c.profile(session)
+	return code, email
+}
+
+func (c apiClient) profile(session *http.Cookie) (code int, email, timezone string) {
 	c.t.Helper()
 	resp := c.do(http.MethodGet, "/api/v1/me", []*http.Cookie{session})
 	var body struct {
@@ -235,7 +251,7 @@ func (c apiClient) me(session *http.Cookie) (int, string) {
 			c.t.Fatal(err)
 		}
 	}
-	return resp.StatusCode, body.Email
+	return resp.StatusCode, body.Email, body.Timezone
 }
 
 func problemType(t *testing.T, resp *http.Response) string {
@@ -274,6 +290,17 @@ func TestSignInAndSessionIsolationAgainstPostgres(t *testing.T) {
 	}
 	cfg.googleAuthURL, cfg.googleTokenURL = "https://accounts.example.com/auth", google.srv.URL+"/token"
 
+	// An expired session the API's startup sweep must delete.
+	var staleUser uuid.UUID
+	if err := testPool.QueryRow(ctx, `INSERT INTO users (email) VALUES ($1) RETURNING id`, "fake-stale-"+suffix+"@example.com").Scan(&staleUser); err != nil {
+		t.Fatal(err)
+	}
+	staleHash := sha256.Sum256([]byte("fake-stale-session-" + suffix))
+	if _, err := testPool.Exec(ctx, `INSERT INTO sessions (token_hash, user_id, created_at, last_seen_at, expires_at)
+		VALUES ($1, $2, now() - interval '100 days', now() - interval '100 days', now() - interval '10 days')`, staleHash[:], staleUser); err != nil {
+		t.Fatal(err)
+	}
+
 	var lc net.ListenConfig
 	listening := make(chan net.Addr, 1)
 	listen := func(ctx context.Context, network, _ string) (net.Listener, error) {
@@ -297,10 +324,29 @@ func TestSignInAndSessionIsolationAgainstPostgres(t *testing.T) {
 		t.Fatalf("run exited before listening: %v", err)
 	}
 
+	// The sweeper runs at startup.
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		var n int
+		if err := testPool.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE token_hash = $1`, staleHash[:]).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the API did not sweep an expired session at startup")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
 	// Alice (Gmail) and Bob (Workspace) enroll by signing in.
 	sessions := map[string]*http.Cookie{}
+	var replayAlice func() *http.Response
 	for name, a := range map[string]account{"alice": alice, "bob": bob} {
-		resp := c.signIn(google, a)
+		resp, replay := c.signInReplayable(google, a)
+		if name == "alice" {
+			replayAlice = replay
+		}
 		if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/" {
 			t.Fatalf("%s sign-in = %d to %q, want 303 to /", name, resp.StatusCode, resp.Header.Get("Location"))
 		}
@@ -311,11 +357,27 @@ func TestSignInAndSessionIsolationAgainstPostgres(t *testing.T) {
 		sessions[name] = s
 	}
 
-	// Each session reaches its own user only.
+	// Each session reaches its own user only; new users start in UTC.
 	for name, want := range map[string]string{"alice": alice.email, "bob": bob.email} {
-		if code, email := c.me(sessions[name]); code != http.StatusOK || email != want {
-			t.Errorf("%s /me = %d %q, want 200 %q", name, code, email, want)
+		if code, email, tz := c.profile(sessions[name]); code != http.StatusOK || email != want || tz != "UTC" {
+			t.Errorf("%s /me = %d %q %q, want 200 %q UTC", name, code, email, tz, want)
 		}
+	}
+
+	// Replaying a callback (same code, same flow cookie) signs nobody in.
+	var before int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM sessions`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	replayed := replayAlice()
+	if replayed.StatusCode != http.StatusBadRequest || cookieNamed(replayed, "__Host-pulse_session") != nil {
+		t.Errorf("replayed callback = %d, want 400 without a session", replayed.StatusCode)
+	} else if got := problemType(t, replayed); got != "sign-in-failed" {
+		t.Errorf("replayed callback problem = %q, want sign-in-failed", got)
+	}
+	var after int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM sessions`).Scan(&after); err != nil || after != before {
+		t.Errorf("sessions %d → %d (%v): the replay created one", before, after, err)
 	}
 	var users int
 	if err := testPool.QueryRow(ctx, `SELECT count(DISTINCT user_id) FROM user_identities WHERE subject = ANY($1)`,

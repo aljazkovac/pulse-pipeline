@@ -5,8 +5,9 @@
 //	    [-from YYYY-MM-DD -to YYYY-MM-DD]    ...or backfill a date range
 //	pulse-worker seed-dev [-email E] [-tz Z] create a local user with a mock connection
 //	pulse-worker connect-google -user ID     link a Google Health account (ADR-0004 §3)
-//	pulse-worker bind-google-identity -user ID [-replace] [-mailbox-verified]
-//	                                         bind a Google sign-in identity to a user (ADR-0005 §2)
+//	pulse-worker bind-google-identity (-user ID [-replace] | -new-user) [-mailbox-verified]
+//	                                         bind a Google sign-in identity to a user,
+//	                                         or enroll a new one (ADR-0005 §2)
 //
 // Environment: DATABASE_URL (required), PULSE_SYNC_POLL_INTERVAL (default 1m),
 // PULSE_ENABLE_MOCK_PROVIDER (default false), ENV (seed-dev needs "development"),
@@ -68,7 +69,8 @@ const usage = `usage:
   pulse-worker [run]
   pulse-worker sync -user ID -provider PROVIDER [-from YYYY-MM-DD -to YYYY-MM-DD]
   pulse-worker seed-dev [-email EMAIL] [-tz IANA_ZONE]
-  pulse-worker connect-google -user ID`
+  pulse-worker connect-google -user ID
+  pulse-worker bind-google-identity (-user ID [-replace] | -new-user) [-mailbox-verified]`
 
 func run(ctx context.Context, args []string, getenv func(string) string, stdout io.Writer, logger *slog.Logger) error {
 	cmd := "run"
@@ -149,7 +151,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout 
 			return err
 		}
 		return withDeps(ctx, cfg, logger, func(d deps) error {
-			return bindGoogleIdentity(ctx, d.store, google, req, stdout, time.Now())
+			return bindGoogleIdentity(ctx, d.store, google, req, stdout, time.Now)
 		})
 	default:
 		return fmt.Errorf("%w: unknown command %q", errUsage, cmd)
@@ -182,6 +184,7 @@ func connectGoogle(ctx context.Context, d deps, userID uuid.UUID, stdout io.Writ
 type identityBinder interface {
 	GetUser(ctx context.Context, id uuid.UUID) (domain.User, error)
 	BindIdentity(ctx context.Context, userID uuid.UUID, ident domain.Identity, replace bool, at time.Time) (store.BindResult, error)
+	CreateUserWithIdentity(ctx context.Context, ident domain.Identity, timezone string, at time.Time) (domain.User, error)
 }
 
 // loopbackSignIn is the subset of *auth.Google bind-google-identity needs.
@@ -189,28 +192,36 @@ type loopbackSignIn interface {
 	SignInLoopback(ctx context.Context, show func(authURL string) error) (auth.Claims, error)
 }
 
-// bindRequest is a parsed bind-google-identity invocation.
+// bindRequest is a parsed bind-google-identity invocation: either userID or
+// newUser is set.
 type bindRequest struct {
 	userID          uuid.UUID
+	newUser         bool
 	replace         bool
 	mailboxVerified bool
 }
 
-// bindGoogleIdentity binds the Google account the owner signs in with to an
-// existing user, so they keep that user's history (ADR-0005 §2). The owner
-// proves control of the Google account by signing in through a loopback
-// redirect; the operator is responsible for knowing the owner is the
-// person the user belongs to. For an address Google is not authoritative for,
-// the operator must also have checked the mailbox and pass -mailbox-verified.
-func bindGoogleIdentity(ctx context.Context, st identityBinder, google loopbackSignIn, req bindRequest, stdout io.Writer, now time.Time) error {
-	u, err := st.GetUser(ctx, req.userID)
-	if err != nil {
-		return err
+// bindGoogleIdentity is the operator path of ADR-0005 §2. The account owner
+// proves control of a Google account by signing in through a loopback
+// redirect, and the identity is then either bound to an existing user, so
+// the owner keeps that user's history, or (-new-user) enrolled as a new user.
+// The operator is responsible for knowing the owner is the right person. For
+// an address Google is not authoritative for, the operator must also have
+// checked the mailbox and pass -mailbox-verified.
+func bindGoogleIdentity(ctx context.Context, st identityBinder, google loopbackSignIn, req bindRequest, stdout io.Writer, now func() time.Time) error {
+	target := "a new user"
+	var u domain.User
+	if !req.newUser {
+		var err error
+		if u, err = st.GetUser(ctx, req.userID); err != nil {
+			return err
+		}
+		target = fmt.Sprintf("user %s (%s)", u.ID, u.Email)
 	}
 	claims, err := google.SignInLoopback(ctx, func(authURL string) error {
-		_, err := fmt.Fprintf(stdout, "Binding a Google sign-in identity to user %s (%s).\n"+
+		_, err := fmt.Fprintf(stdout, "Binding a Google sign-in identity to %s.\n"+
 			"Have the account owner open this URL in a browser on this machine and choose their Google account:\n\n  %s\n\n"+
-			"Waiting for Google to redirect back...\n", u.ID, u.Email, authURL)
+			"Waiting for Google to redirect back...\n", target, authURL)
 		return err
 	})
 	if err != nil {
@@ -223,8 +234,27 @@ func bindGoogleIdentity(ctx context.Context, st identityBinder, google loopbackS
 		return fmt.Errorf("the address %s is not a Gmail or Google Workspace address, so Google cannot vouch for it: confirm that the account owner controls this mailbox "+
 			"(for example with a one-time code sent to it), then run again with -mailbox-verified", claims.Email)
 	}
+	// Taken after the interactive wait, which can last minutes.
+	at := now()
 
-	res, err := st.BindIdentity(ctx, u.ID, claims.Identity, req.replace, now)
+	if req.newUser {
+		created, err := st.CreateUserWithIdentity(ctx, claims.Identity, auth.NewUserTimezone, at)
+		switch {
+		case errors.Is(err, store.ErrEmailTaken):
+			return fmt.Errorf("%s already belongs to a Pulse user; bind the identity to that user with -user instead: %w", claims.Email, err)
+		case errors.Is(err, store.ErrIdentityTaken):
+			return fmt.Errorf("this Google account (%s) is already bound to a Pulse user: %w", claims.Email, err)
+		case err != nil:
+			return err
+		}
+		_, err = fmt.Fprintf(stdout, "Enrolled user %s for the Google account %s (subject %s).\n", created.ID, claims.Email, claims.Subject)
+		if err != nil {
+			return err
+		}
+		return allowlistReminder(stdout, claims.Email)
+	}
+
+	res, err := st.BindIdentity(ctx, u.ID, claims.Identity, req.replace, at)
 	switch {
 	case errors.Is(err, store.ErrIdentityBound):
 		return fmt.Errorf("user %s already has a different Google identity; run again with -replace to replace it and sign out all the user's sessions: %w", u.ID, err)
@@ -251,15 +281,20 @@ func bindGoogleIdentity(ctx context.Context, st identityBinder, google loopbackS
 			return err
 		}
 	}
-	_, err = fmt.Fprintf(stdout, "Sign-in also requires %s in the API's PULSE_ALLOWED_EMAILS.\n", claims.Email)
+	return allowlistReminder(stdout, claims.Email)
+}
+
+func allowlistReminder(stdout io.Writer, email string) error {
+	_, err := fmt.Fprintf(stdout, "Sign-in also requires %s in the API's PULSE_ALLOWED_EMAILS.\n", email)
 	return err
 }
 
 func parseBindArgs(args []string) (bindRequest, error) {
 	fs := flag.NewFlagSet("bind-google-identity", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	user := fs.String("user", "", "user ID")
+	user := fs.String("user", "", "ID of the existing user to bind to")
 	var req bindRequest
+	fs.BoolVar(&req.newUser, "new-user", false, "enroll a new user for the Google account instead")
 	fs.BoolVar(&req.replace, "replace", false, "replace the user's current Google identity and sign out all their sessions")
 	fs.BoolVar(&req.mailboxVerified, "mailbox-verified", false, "the operator checked mailbox ownership of a non-Google address")
 	if err := fs.Parse(args); err != nil {
@@ -268,9 +303,15 @@ func parseBindArgs(args []string) (bindRequest, error) {
 	if fs.NArg() > 0 {
 		return bindRequest{}, fmt.Errorf("%w: bind-google-identity: unexpected argument %q", errUsage, fs.Arg(0))
 	}
+	if req.newUser {
+		if *user != "" || req.replace {
+			return bindRequest{}, fmt.Errorf("%w: bind-google-identity: -new-user takes neither -user nor -replace", errUsage)
+		}
+		return req, nil
+	}
 	id, err := uuid.Parse(*user)
 	if err != nil {
-		return bindRequest{}, fmt.Errorf("%w: bind-google-identity: -user must be a UUID", errUsage)
+		return bindRequest{}, fmt.Errorf("%w: bind-google-identity: -user must be a UUID (or use -new-user)", errUsage)
 	}
 	req.userID = id
 	return req, nil

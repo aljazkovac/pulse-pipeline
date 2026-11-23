@@ -176,7 +176,8 @@ func TestExchange_ReturnsCheckedClaims(t *testing.T) {
 			c.EmailVerified = false
 			return c
 		}()},
-		{"audience array with azp", func(c map[string]any) { c["aud"] = []string{"fake-other-client", fakeClientID} }, gmailClaims()},
+		{"audience as a one-element array", func(c map[string]any) { c["aud"] = []string{fakeClientID} }, gmailClaims()},
+		{"no azp", func(c map[string]any) { delete(c, "azp") }, gmailClaims()},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -208,16 +209,16 @@ func gmailClaims() auth.Claims {
 
 func TestExchange_RejectsInvalidIDTokens(t *testing.T) {
 	tests := map[string]func(map[string]any){
-		"wrong issuer":   func(c map[string]any) { c["iss"] = "https://accounts.example.com" },
-		"wrong audience": func(c map[string]any) { c["aud"] = "fake-other-client" },
-		"audience array, other azp": func(c map[string]any) {
-			c["aud"], c["azp"] = []string{fakeClientID, "fake-other-client"}, "fake-other-client"
-		},
-		"audience of wrong type": func(c map[string]any) { c["aud"] = 42 },
-		"expired":                func(c map[string]any) { c["exp"] = now.Unix() },
-		"no expiry":              func(c map[string]any) { delete(c, "exp") },
-		"no subject":             func(c map[string]any) { c["sub"] = " " },
-		"no email":               func(c map[string]any) { delete(c, "email") },
+		"wrong issuer":            func(c map[string]any) { c["iss"] = "https://accounts.example.com" },
+		"wrong audience":          func(c map[string]any) { c["aud"] = "fake-other-client" },
+		"extra audience":          func(c map[string]any) { c["aud"] = []string{"fake-other-client", fakeClientID} },
+		"extra audience, our azp": func(c map[string]any) { c["aud"] = []string{fakeClientID, "fake-other-client"} },
+		"other azp":               func(c map[string]any) { c["azp"] = "fake-other-client" },
+		"audience of wrong type":  func(c map[string]any) { c["aud"] = 42 },
+		"expired":                 func(c map[string]any) { c["exp"] = now.Unix() },
+		"no expiry":               func(c map[string]any) { delete(c, "exp") },
+		"no subject":              func(c map[string]any) { c["sub"] = " " },
+		"no email":                func(c map[string]any) { delete(c, "email") },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {

@@ -32,10 +32,17 @@ type memStore struct {
 	sweepArgs  [2]time.Time
 	failWith   error // returned by every call when set
 	enrollErr  error // returned by CreateUserWithIdentity when set
+	// raceWinner, when set, plays a concurrent first sign-in of the same
+	// identity that enrolls just before CreateUserWithIdentity runs.
+	raceWinner uuid.UUID
+	timezones  map[uuid.UUID]string
 }
 
 func newMemStore() *memStore {
-	return &memStore{identities: map[[2]string]uuid.UUID{}, emails: map[string]uuid.UUID{}, sessions: map[string]domain.Session{}}
+	return &memStore{
+		identities: map[[2]string]uuid.UUID{}, emails: map[string]uuid.UUID{},
+		sessions: map[string]domain.Session{}, timezones: map[uuid.UUID]string{},
+	}
 }
 
 func (m *memStore) GetUserIDByIdentity(_ context.Context, issuer, subject string) (uuid.UUID, error) {
@@ -51,13 +58,19 @@ func (m *memStore) GetUserIDByIdentity(_ context.Context, issuer, subject string
 	return id, nil
 }
 
-func (m *memStore) RecordIdentityLogin(_ context.Context, userID uuid.UUID, ident domain.Identity, _ time.Time) error {
+// SignInIdentity mirrors the store: the login is recorded and the session
+// created only while the identity is bound to the user.
+func (m *memStore) SignInIdentity(_ context.Context, userID uuid.UUID, ident domain.Identity, hash []byte, at, expiresAt time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.failWith != nil {
+		return m.failWith
+	}
 	if m.identities[[2]string{ident.Issuer, ident.Subject}] != userID {
-		return store.ErrNotFound
+		return fmt.Errorf("signing in: %w", store.ErrNotFound)
 	}
 	m.logins = append(m.logins, ident)
+	m.sessions[string(hash)] = domain.Session{UserID: userID, CreatedAt: at, LastSeenAt: at, ExpiresAt: expiresAt}
 	return nil
 }
 
@@ -67,12 +80,17 @@ func (m *memStore) CreateUserWithIdentity(_ context.Context, ident domain.Identi
 	if m.enrollErr != nil {
 		return domain.User{}, m.enrollErr
 	}
+	if m.raceWinner != uuid.Nil {
+		m.emails[strings.ToLower(ident.Email)] = m.raceWinner
+		m.identities[[2]string{ident.Issuer, ident.Subject}] = m.raceWinner
+	}
 	if _, taken := m.emails[strings.ToLower(ident.Email)]; taken {
 		return domain.User{}, fmt.Errorf("enrolling: %w", store.ErrEmailTaken)
 	}
 	u := domain.User{ID: uuid.New(), Email: ident.Email, Timezone: timezone, CreatedAt: at}
 	m.emails[strings.ToLower(ident.Email)] = u.ID
 	m.identities[[2]string{ident.Issuer, ident.Subject}] = u.ID
+	m.timezones[u.ID] = timezone
 	return u, nil
 }
 
@@ -187,8 +205,11 @@ func TestSignIn_EnrollsGoogleAuthoritativeAccounts(t *testing.T) {
 				t.Fatal("no session stored under the token's SHA-256")
 			}
 			want := domain.Session{UserID: got.UserID, CreatedAt: now, LastSeenAt: now, ExpiresAt: now.Add(90 * 24 * time.Hour)}
-			if sess != want || !got.ExpiresAt.Equal(want.ExpiresAt) {
-				t.Errorf("session = %+v (expires %s), want %+v", sess, got.ExpiresAt, want)
+			if sess != want {
+				t.Errorf("session = %+v, want %+v", sess, want)
+			}
+			if tz := st.timezones[got.UserID]; tz != "UTC" {
+				t.Errorf("new user's timezone = %q, want UTC until they choose one", tz)
 			}
 			for k := range st.sessions {
 				if strings.Contains(k, got.Token) {
@@ -245,9 +266,6 @@ func TestSignIn_Refusals(t *testing.T) {
 		{"third-party email", thirdParty, thirdParty.Email, nil, auth.ErrEnrollmentRequired},
 		{"email of an existing user", gmailClaims(), "fake-user@gmail.com", func(st *memStore, _ auth.Claims) {
 			st.emails["fake-user@gmail.com"] = uuid.New()
-		}, auth.ErrEmailInUse},
-		{"concurrent enrollment of the same identity", gmailClaims(), "fake-user@gmail.com", func(st *memStore, _ auth.Claims) {
-			st.enrollErr = fmt.Errorf("enrolling: %w", store.ErrIdentityTaken)
 		}, auth.ErrEmailInUse},
 	}
 	for _, tt := range tests {
@@ -418,16 +436,56 @@ func TestParseAllowlist(t *testing.T) {
 	}
 }
 
-func TestNewSecret_IsRandomBase64URL(t *testing.T) {
-	a, err := auth.NewSecret()
+// The real store answers a racing first sign-in of the same identity with
+// ErrEmailTaken; SignIn then finds the identity its twin just enrolled.
+func TestSignIn_LosingAFirstSignInRaceSignsInToTheWinner(t *testing.T) {
+	svc, st, _ := newService(t, "fake-user@gmail.com")
+	winner := uuid.New()
+	st.raceWinner = winner
+
+	got, err := svc.SignIn(ctxT(t), gmailClaims())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("SignIn = %v, want the winner's user", err)
 	}
-	b, err := auth.NewSecret()
-	if err != nil {
-		t.Fatal(err)
+	if got.UserID != winner || len(st.emails) != 1 {
+		t.Errorf("signed in to %s (users %d), want the winner %s", got.UserID, len(st.emails), winner)
 	}
-	if len(a) != 43 || a == b || strings.ContainsAny(a, "+/=") {
-		t.Errorf("secrets %q, %q: want two distinct 43-character base64url values", a, b)
+	if _, ok := st.sessions[string(hashOf(t, got.Token))]; !ok {
+		t.Error("no session for the losing sign-in")
 	}
+}
+
+func TestSignIn_ReplacedIdentityGetsNoSession(t *testing.T) {
+	st := newMemStore()
+	c := gmailClaims()
+	// The lookup still sees the identity, but an operator replaced it before
+	// the sign-in transaction ran: the store no longer has it bound.
+	stale := map[[2]string]uuid.UUID{{c.Issuer, c.Subject}: uuid.New()}
+	svc := auth.NewService(lookupThen(st, stale), allow(t, "fake-user@gmail.com"), func() time.Time { return now })
+
+	_, err := svc.SignIn(ctxT(t), c)
+	if err == nil || auth.Denied(err) || !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("err = %v, want a non-denial failure wrapping ErrNotFound", err)
+	}
+	if len(st.sessions) != 0 {
+		t.Error("the replaced identity got a session")
+	}
+}
+
+// lookupThen answers identity lookups from a stale snapshot, as a lookup
+// that ran just before a replacement would.
+func lookupThen(m *memStore, snapshot map[[2]string]uuid.UUID) auth.Store {
+	return staleLookup{memStore: m, snapshot: snapshot}
+}
+
+type staleLookup struct {
+	*memStore
+	snapshot map[[2]string]uuid.UUID
+}
+
+func (s staleLookup) GetUserIDByIdentity(_ context.Context, issuer, subject string) (uuid.UUID, error) {
+	if id, ok := s.snapshot[[2]string{issuer, subject}]; ok {
+		return id, nil
+	}
+	return uuid.Nil, store.ErrNotFound
 }

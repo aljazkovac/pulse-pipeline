@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/domain"
-	"github.com/aljazkovac/pulse-pipeline/backend/internal/oauthloopback"
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/oauthflow"
 )
 
 // Google's OpenID Connect endpoints and identity (ADR-0005 §2).
@@ -151,8 +151,9 @@ func (g *Google) AuthCodeURL(redirectURI, state, codeVerifier string) string {
 //
 // The ID token comes straight from Google's token endpoint over TLS, so under
 // OpenID Connect Core §3.1.3.7 its claims are checked without verifying the
-// signature (ADR-0005 §2): iss, aud (and azp with several audiences), exp,
-// sub and email. email_verified is returned for the caller's policy.
+// signature (ADR-0005 §2): iss, aud (exactly this client, and azp when
+// present), exp, sub and email. email_verified is returned for the caller's
+// policy.
 func (g *Google) Exchange(ctx context.Context, code, codeVerifier, redirectURI string) (Claims, error) {
 	form := url.Values{
 		"grant_type":    {"authorization_code"},
@@ -201,7 +202,7 @@ func (g *Google) Exchange(ctx context.Context, code, codeVerifier, redirectURI s
 // claims. The operator command that binds an identity to an existing user
 // uses it (ADR-0005 §2).
 func (g *Google) SignInLoopback(ctx context.Context, show func(authURL string) error) (Claims, error) {
-	redirect, err := oauthloopback.Authorize(ctx, g.loopbackTimeout, g.AuthCodeURL, show)
+	redirect, err := oauthflow.Loopback(ctx, g.loopbackTimeout, g.AuthCodeURL, show)
 	if err != nil {
 		return Claims{}, fmt.Errorf("auth: %w", err)
 	}
@@ -239,9 +240,11 @@ func (g *Google) checkIDToken(raw string) (Claims, error) {
 	switch {
 	case !slices.Contains(googleIssuers, c.Iss):
 		return invalid("unexpected issuer")
-	case !slices.Contains(c.Aud, g.clientID):
-		return invalid("audience is not this client")
-	case len(c.Aud) > 1 && c.Azp != g.clientID:
+	case len(c.Aud) != 1 || c.Aud[0] != g.clientID:
+		// OIDC Core §3.1.3.7: reject audiences we do not trust. Google
+		// names only the client the code was issued to.
+		return invalid("audience is not exactly this client")
+	case c.Azp != "" && c.Azp != g.clientID:
 		return invalid("authorized party is not this client")
 	case c.Exp <= 0 || !g.now().Before(time.Unix(int64(c.Exp), 0)):
 		return invalid("expired")
@@ -292,7 +295,7 @@ func tokenError(status int, body []byte) error {
 	}
 	_ = json.Unmarshal(body, &e) // unparseable bodies (proxy HTML) leave Error empty
 	msg := fmt.Sprintf("token endpoint: HTTP %d", status)
-	if code := oauthloopback.SanitizeCode(e.Error); code != "" {
+	if code := oauthflow.SanitizeCode(e.Error); code != "" {
 		msg += " " + code
 	}
 	if status == http.StatusTooManyRequests || status >= http.StatusInternalServerError {
