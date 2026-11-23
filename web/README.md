@@ -18,7 +18,8 @@ The dev server (and `npm run preview`) proxies `/api` to the Go API, so the brow
 | Path | Contents |
 | :--- | :--- |
 | `src/` | React app. `index.css` holds the design tokens (`bg-canvas`, `bg-surface`, `text-fg`, `text-fg-muted`, `border-line`, metric accents `text-steps` / `text-heart` / `text-hrv` / `text-sleep`, `text-metric`); dark is the default and light follows `prefers-color-scheme`. |
-| `src/**/*.test.tsx` | Vitest + Testing Library component tests (jsdom). |
+| `src/api/` | Typed API client (`createApiClient`, `openapi-fetch`) and `schema.d.ts`, generated from [`backend/api/openapi.yaml`](../backend/api/openapi.yaml) — never edit it by hand; run `npm run generate:api` or `make generate`. |
+| `src/**/*.test.{ts,tsx}` | Vitest + Testing Library component tests (jsdom). |
 | `config/` | Node-side helpers for the Vite config, with their Vitest specs. |
 | `e2e/` | Playwright specs; each runs in the `desktop` (`1280x800`) and `mobile` (`390x844`, touch) projects. |
 
@@ -35,5 +36,7 @@ Because `web/package.json` exists, the root `make build`, `make test`, `make lin
 | `lint` | ESLint (`typescript-eslint` strict type-checked, React Hooks), `@typescript-eslint/no-explicit-any` as an error, zero warnings. |
 | `test` | Vitest unit/component tests. |
 | `test:e2e` | Playwright specs across the desktop (`1280x800`) and mobile (`390x844`) projects; starts the Vite dev server itself. Install the browser once with `npx playwright install chromium`. |
+
+`generate:api` regenerates `src/api/schema.d.ts` from the OpenAPI contract; `make generate-check` fails CI when it is stale. `openapi-typescript` declares a TypeScript 5 peer; `package.json` `overrides` points it at the project's TypeScript 6, which it only uses to print declarations.
 
 The package manager defaults to `npm`; override with `make test WEB_PM=pnpm`.

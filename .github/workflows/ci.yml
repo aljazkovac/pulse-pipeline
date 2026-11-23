@@ -62,10 +62,10 @@ jobs:
           PUSH_BEFORE: ${{ github.event.before }}
           BASE_REF: ${{ github.base_ref || 'main' }}
 
-  sqlc-drift:
-    name: sqlc generated code up to date
+  generated-code:
+    name: Generated code up to date
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -77,8 +77,29 @@ jobs:
         with:
           sqlc-version: ${{ env.SQLC_VERSION }}
 
-      # Fails when backend/internal/store/db differs from what the SQL queries
-      # and migrations generate, i.e. someone forgot `make generate`.
+      # oapi-codegen runs as a Go tool pinned in backend/go.mod.
+      - name: Set up Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.mod
+
+      # openapi-typescript is a web/ devDependency.
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+
+      # Fails when backend/internal/store/db differs from what the SQL queries and
+      # migrations generate, or backend/internal/api/gen / web/src/api/schema.d.ts
+      # differ from what backend/api/openapi.yaml generates, i.e. someone forgot
+      # `make generate`.
       - name: Check for drift
         run: make generate-check
 

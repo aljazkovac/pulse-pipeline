@@ -6,7 +6,8 @@ import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
 export default defineConfig([
-  globalIgnores(['dist', 'playwright-report', 'test-results', 'blob-report']),
+  // src/api/schema.d.ts is generated from backend/api/openapi.yaml (npm run generate:api).
+  globalIgnores(['dist', 'playwright-report', 'test-results', 'blob-report', 'src/api/schema.d.ts']),
   {
     files: ['**/*.{ts,tsx}'],
     extends: [

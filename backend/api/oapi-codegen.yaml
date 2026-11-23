@@ -1,0 +1,12 @@
+# oapi-codegen configuration for the /api/v1 contract (ADR-0005 §1).
+# Run `make generate` from the repository root. The output path is passed with -o
+# (a config `output` would override -o, and `make generate-check` writes to a temp dir).
+package: gen
+generate:
+  models: true
+  std-http-server: true
+  # The strict layer gives every handler typed, per-status response objects, so a
+  # handler cannot return a status or body the contract does not declare.
+  strict-server: true
+output-options:
+  skip-prune: false

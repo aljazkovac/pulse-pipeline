@@ -38,11 +38,26 @@ clean: ## Stop containers and remove local volumes
 db-shell: ## Open a psql interactive shell in the local PostgreSQL container
 	docker compose exec postgres psql -U $${POSTGRES_USER:-pulse} -d $${POSTGRES_DB:-pulse_pipeline}
 
-generate: ## Regenerate sqlc code in backend/internal/store/db from SQL queries + migrations
-	cd backend && sqlc generate
+# The OpenAPI contract (backend/api/openapi.yaml) generates the Go server types in
+# backend/internal/api/gen (oapi-codegen, pinned as a Go tool in backend/go.mod) and
+# the TypeScript types in web/src/api/schema.d.ts (openapi-typescript, in web/).
+OAPI_CODEGEN := go tool oapi-codegen -config api/oapi-codegen.yaml
+OPENAPI_TS := $(WEB_PM) exec -- openapi-typescript ../backend/api/openapi.yaml
 
-generate-check: ## Fail if committed sqlc code is out of date with the SQL (run in CI)
+generate: ## Regenerate sqlc code, the OpenAPI Go server types and the web/ TypeScript API types
+	cd backend && sqlc generate
+	cd backend && $(OAPI_CODEGEN) -o internal/api/gen/api.gen.go api/openapi.yaml
+	cd web && $(OPENAPI_TS) -o src/api/schema.d.ts
+
+generate-check: ## Fail if committed generated code (sqlc, OpenAPI Go + TypeScript) is out of date (run in CI)
 	cd backend && sqlc diff
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	(cd backend && $(OAPI_CODEGEN) -o "$$tmp/api.gen.go" api/openapi.yaml) && \
+	(cd web && $(OPENAPI_TS) -o "$$tmp/schema.d.ts" >/dev/null) || exit 1; \
+	if ! diff -u backend/internal/api/gen/api.gen.go "$$tmp/api.gen.go" || \
+	   ! diff -u web/src/api/schema.d.ts "$$tmp/schema.d.ts"; then \
+		echo "OpenAPI generated code is out of date: run 'make generate' and commit the result" >&2; exit 1; \
+	fi
 
 migrate-up migrate-down: export PULSE_MIGRATION_DATABASE_URL := $(value DATABASE_URL)
 

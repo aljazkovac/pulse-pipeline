@@ -1,0 +1,94 @@
+openapi: 3.1.0
+info:
+  title: Pulse Pipeline API
+  version: 1.0.0
+  summary: Session-scoped read API for the Pulse Pipeline web and PWA dashboards.
+  description: |
+    The contract for `/api/v1` (ADR-0005). Go server types are generated with
+    `oapi-codegen` into `backend/internal/api/gen` and TypeScript types with
+    `openapi-typescript` into `web/src/api/schema.d.ts`; run `make generate` after
+    editing this file. CI fails when the generated code is out of date.
+
+    Conventions (ADR-0005 §1):
+    - Local calendar days are `YYYY-MM-DD` in the user's timezone; instants are RFC 3339 UTC.
+    - Missing values are `null`, never zero-filled.
+    - Every response carries `Cache-Control: no-store`.
+    - Errors are RFC 9457 `application/problem+json` with a stable `type` per error;
+      the types are listed in `docs/api/problems.md`.
+servers:
+  - url: /api/v1
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: API readiness
+      description: |
+        Reports whether the API can serve requests, including a database round trip.
+        Needs no session. Container liveness probes use `/healthz` outside `/api` instead,
+        which does not touch the database.
+      tags: [system]
+      responses:
+        '200':
+          description: The API and its database are reachable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        default:
+          $ref: '#/components/responses/Problem'
+
+components:
+  schemas:
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+
+    Problem:
+      description: RFC 9457 problem details. Extension members may be added per problem type.
+      type: object
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: Stable identifier of the problem type, documented in docs/api/problems.md.
+        title:
+          type: string
+          description: Short, human-readable summary of the problem type; the same for every occurrence.
+        status:
+          type: integer
+          minimum: 100
+          maximum: 599
+          description: The HTTP status code of this occurrence.
+        detail:
+          type: string
+          description: Human-readable explanation of this occurrence. Never contains upstream or internal error text.
+        instance:
+          type: string
+          description: URI reference identifying this occurrence.
+
+  responses:
+    Problem:
+      description: Any other error, as RFC 9457 problem details.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unavailable:
+      description: A dependency such as the database is unreachable; retry later.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+tags:
+  - name: system
+    description: Operational endpoints.
