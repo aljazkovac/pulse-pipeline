@@ -1,9 +1,12 @@
 // Command pulse-api serves the Pulse Pipeline HTTP API (ADR-0005): the
 // /api/v1 contract in backend/api/openapi.yaml and the /healthz liveness probe.
 //
-// Environment: DATABASE_URL (required), API_PORT (default 8080). Pending
-// migrations are applied on startup. SIGINT/SIGTERM drain in-flight requests
-// for up to shutdownTimeout before exiting.
+// Environment: DATABASE_URL (required), API_PORT (default 8080).
+//
+// The API does not migrate the schema: its database role needs no DDL rights.
+// Migrations run from pulse-worker on startup or `make migrate-up`.
+// SIGINT/SIGTERM drain in-flight requests for up to shutdownTimeout; a second
+// signal exits immediately.
 package main
 
 import (
@@ -22,7 +25,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/api"
-	"github.com/aljazkovac/pulse-pipeline/backend/internal/store"
 )
 
 // shutdownTimeout bounds how long a stopping API waits for in-flight requests.
@@ -31,6 +33,10 @@ const shutdownTimeout = 15 * time.Second
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go func() {
+		<-ctx.Done()
+		stop() // restore default handling: a second signal kills the process
+	}()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	if err := run(ctx, os.Getenv, logger, nil); err != nil {
@@ -65,14 +71,11 @@ func loadConfig(getenv func(string) string) (config, error) {
 	return cfg, nil
 }
 
-// run migrates, connects and serves until ctx is cancelled. listening, when
+// run connects and serves until ctx is cancelled. listening, when
 // non-nil, receives the bound address once the API accepts connections.
 func run(ctx context.Context, getenv func(string) string, logger *slog.Logger, listening func(net.Addr)) error {
 	cfg, err := loadConfig(getenv)
 	if err != nil {
-		return err
-	}
-	if err := store.MigrateUp(cfg.databaseURL); err != nil {
 		return err
 	}
 	pool, err := pgxpool.New(ctx, cfg.databaseURL)

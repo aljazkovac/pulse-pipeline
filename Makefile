@@ -54,8 +54,10 @@ generate-check: ## Fail if committed generated code (sqlc, OpenAPI Go + TypeScri
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 	(cd backend && $(OAPI_CODEGEN) -o "$$tmp/api.gen.go" api/openapi.yaml) && \
 	(cd web && $(OPENAPI_TS) -o "$$tmp/schema.d.ts" >/dev/null) || exit 1; \
-	if ! diff -u backend/internal/api/gen/api.gen.go "$$tmp/api.gen.go" || \
-	   ! diff -u web/src/api/schema.d.ts "$$tmp/schema.d.ts"; then \
+	stale=0; \
+	diff -u backend/internal/api/gen/api.gen.go "$$tmp/api.gen.go" || stale=1; \
+	diff -u web/src/api/schema.d.ts "$$tmp/schema.d.ts" || stale=1; \
+	if [ $$stale -ne 0 ]; then \
 		echo "OpenAPI generated code is out of date: run 'make generate' and commit the result" >&2; exit 1; \
 	fi
 

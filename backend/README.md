@@ -126,7 +126,10 @@ Conventions every endpoint gets from `internal/api`:
 - Every `/api` response carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
 - One log line per request with method, route pattern, status and duration only: no URLs (OAuth
   callbacks carry `code` and `state` in the query), cookies, headers or bodies.
-- A handler panic becomes a `500` `internal` problem and is logged with its stack.
+- A handler panic becomes a `500` `internal` problem (dropping any headers the handler had set,
+  such as `Set-Cookie`) and is logged with its stack. If the reply had already started, the
+  connection is aborted instead, so a truncated body cannot pass as complete.
+- Non-canonical paths (`//`, `..`) under `/api` are `not-found`, not redirected.
 
 | Endpoint | Purpose |
 | :--- | :--- |
@@ -135,17 +138,22 @@ Conventions every endpoint gets from `internal/api`:
 
 ```bash
 export DATABASE_URL=postgres://pulse:pulse_dev_password@localhost:5432/pulse_pipeline?sslmode=disable
-go run ./cmd/api   # applies migrations, then listens on :8080
+make migrate-up    # from the repository root; the API never migrates (see below)
+go run ./cmd/api   # listens on :8080
 curl -i localhost:8080/api/v1/health
 ```
 
 | Variable | Default | Meaning |
 | :--- | :--- | :--- |
-| `DATABASE_URL` | — (required) | PostgreSQL URL; migrations are applied on startup. |
+| `DATABASE_URL` | — (required) | PostgreSQL URL. |
 | `API_PORT` | `8080` | Listen port. The web dev server proxies `/api` here. |
 
+The API does not apply migrations, so its database role needs no DDL rights: `pulse-worker`
+migrates on startup, or run `make migrate-up`. `/api/v1/health` checks database connectivity only,
+not the schema version.
+
 On `SIGINT`/`SIGTERM` the API stops accepting connections and drains in-flight requests for up to
-15 seconds before exiting.
+15 seconds before exiting (a second signal exits at once).
 
 ## Database Workflow
 

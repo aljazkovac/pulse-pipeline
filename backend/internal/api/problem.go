@@ -21,12 +21,21 @@ type problemKind struct {
 	status int
 }
 
+// problemKinds lists every defined type; a test checks each is documented.
+var problemKinds []problemKind
+
+func newProblemKind(slug, title string, status int) problemKind {
+	k := problemKind{slug: slug, title: title, status: status}
+	problemKinds = append(problemKinds, k)
+	return k
+}
+
 var (
-	probInvalidRequest   = problemKind{"invalid-request", "Invalid request", http.StatusBadRequest}
-	probNotFound         = problemKind{"not-found", "Not found", http.StatusNotFound}
-	probMethodNotAllowed = problemKind{"method-not-allowed", "Method not allowed", http.StatusMethodNotAllowed}
-	probInternal         = problemKind{"internal", "Internal server error", http.StatusInternalServerError}
-	probUnavailable      = problemKind{"unavailable", "Service unavailable", http.StatusServiceUnavailable}
+	probInvalidRequest   = newProblemKind("invalid-request", "Invalid request", http.StatusBadRequest)
+	probNotFound         = newProblemKind("not-found", "Not found", http.StatusNotFound)
+	probMethodNotAllowed = newProblemKind("method-not-allowed", "Method not allowed", http.StatusMethodNotAllowed)
+	probInternal         = newProblemKind("internal", "Internal server error", http.StatusInternalServerError)
+	probUnavailable      = newProblemKind("unavailable", "Service unavailable", http.StatusServiceUnavailable)
 )
 
 // problem builds an occurrence of k. detail must be written for clients: it

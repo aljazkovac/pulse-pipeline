@@ -1,7 +1,7 @@
 package main
 
-// Integration test for pulse-api against a real PostgreSQL 17 (Testcontainers):
-// run() migrates, connects, serves the contract and shuts down cleanly.
+// Integration test for pulse-api against a real PostgreSQL 17 (Testcontainers,
+// migrated by testdb): run() connects, serves the contract and shuts down cleanly.
 
 import (
 	"context"

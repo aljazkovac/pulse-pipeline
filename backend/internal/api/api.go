@@ -95,5 +95,7 @@ func (s *server) responseError(w http.ResponseWriter, r *http.Request, err error
 	if headerWritten(w) {
 		return
 	}
+	resetHeaders(w)
+	setAPIHeaders(w)
 	writeProblem(w, probInternal.problem(""))
 }

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -74,12 +75,15 @@ func startServe(t *testing.T, ctx context.Context, h http.Handler, drain time.Du
 	return "http://" + ln.Addr().String(), done
 }
 
-// blockingHandler signals when a request arrives and answers once released.
+// blockingHandler holds requests to /slow until released; any other path
+// answers at once.
 func blockingHandler() (h http.Handler, entered <-chan struct{}, release chan<- struct{}) {
 	in, out := make(chan struct{}, 1), make(chan struct{})
-	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		in <- struct{}{}
-		<-out
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slow" {
+			in <- struct{}{}
+			<-out
+		}
 		_, _ = io.WriteString(w, "done")
 	}), in, out
 }
@@ -121,8 +125,13 @@ func TestServeDrainsInFlightRequestsOnShutdown(t *testing.T) {
 	// The listener closes: new connections are refused while the request drains.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if _, err := get(context.Background(), base+"/new"); err != nil {
+		resp, err := get(context.Background(), base+"/new")
+		if err == nil {
+			_ = resp.Body.Close()
+		} else if errors.Is(err, syscall.ECONNREFUSED) {
 			break
+		} else {
+			t.Fatalf("GET /new during shutdown: %v, want connection refused", err)
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("server still accepted new requests after shutdown began")
@@ -152,7 +161,7 @@ func TestServeGivesUpAfterDrainTimeout(t *testing.T) {
 	base, done := startServe(t, ctx, h, 50*time.Millisecond)
 
 	go func() {
-		if resp, err := get(context.Background(), base+"/stuck"); err == nil {
+		if resp, err := get(context.Background(), base+"/slow"); err == nil {
 			_ = resp.Body.Close()
 		}
 	}()

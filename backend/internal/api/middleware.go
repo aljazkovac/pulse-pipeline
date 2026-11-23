@@ -4,38 +4,42 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"path"
 	"runtime/debug"
 	"strings"
 	"time"
 )
 
-// statusWriter records the status code so the request log and the error
-// paths know what, if anything, has been sent.
+// statusWriter records the final status code so the request log and the
+// error paths know what, if anything, has been sent.
 type statusWriter struct {
 	http.ResponseWriter
 	status int
 }
 
 func (w *statusWriter) WriteHeader(code int) {
-	if w.status == 0 {
+	// 1xx informational responses (e.g. 103 Early Hints) precede the real one.
+	if w.status == 0 && code >= http.StatusOK {
 		w.status = code
 	}
 	w.ResponseWriter.WriteHeader(code)
 }
 
+// Write passes errors through unwrapped: callers compare them with
+// sentinels such as http.ErrBodyNotAllowed.
 func (w *statusWriter) Write(b []byte) (int, error) {
 	if w.status == 0 {
 		w.status = http.StatusOK
 	}
-	n, err := w.ResponseWriter.Write(b)
-	if err != nil {
-		return n, fmt.Errorf("writing response: %w", err)
-	}
-	return n, nil
+	return w.ResponseWriter.Write(b) //nolint:wrapcheck // transparent ResponseWriter decorator
 }
 
-// Unwrap lets http.ResponseController reach the underlying writer (Flush,
-// deadlines).
+// Flush supports handlers that assert http.Flusher directly.
+func (w *statusWriter) Flush() {
+	_ = http.NewResponseController(w.ResponseWriter).Flush() // unsupported: nothing to flush
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer.
 func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // headerWritten reports whether a response has started on w, so an error
@@ -52,6 +56,15 @@ func headerWritten(w http.ResponseWriter) bool {
 		w = u.Unwrap()
 	}
 	return false
+}
+
+// resetHeaders drops every header a failed handler may have set (Set-Cookie,
+// Location, Content-Length, ...) before an error response replaces its reply.
+func resetHeaders(w http.ResponseWriter) {
+	h := w.Header()
+	for k := range h {
+		delete(h, k)
+	}
 }
 
 // routeKey carries the matched route pattern from dispatch back out to observe.
@@ -72,19 +85,25 @@ func observe(logger *slog.Logger, next http.Handler) http.Handler {
 		sw := &statusWriter{ResponseWriter: w}
 
 		defer func() {
+			aborted := false
 			if v := recover(); v != nil {
-				if v == http.ErrAbortHandler { // re-panic so net/http aborts the response silently
+				if v == http.ErrAbortHandler { // net/http aborts the response silently
 					panic(v)
 				}
-				logger.Error("handler panic", "method", r.Method, "route", routeLabel(slot.pattern),
+				logger.ErrorContext(r.Context(), "handler panic", "method", r.Method, "route", routeLabel(slot.pattern),
 					"panic", fmt.Sprint(v), "stack", string(debug.Stack()))
 				if sw.status == 0 {
+					resetHeaders(sw)
 					if isAPIPath(r.URL.Path) {
 						setAPIHeaders(sw)
 						writeProblem(sw, probInternal.problem(""))
 					} else {
 						http.Error(sw, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 					}
+				} else {
+					// Part of the reply is already on the wire: abort the
+					// connection so the client cannot mistake it for complete.
+					aborted = true
 				}
 			}
 
@@ -93,15 +112,23 @@ func observe(logger *slog.Logger, next http.Handler) http.Handler {
 				status = http.StatusOK // handler returned without writing
 			}
 			level := slog.LevelInfo
-			if status >= http.StatusInternalServerError {
+			if status >= http.StatusInternalServerError || aborted {
 				level = slog.LevelError
 			}
-			logger.LogAttrs(r.Context(), level, "http request",
+			attrs := []slog.Attr{
 				slog.String("method", r.Method),
 				slog.String("route", routeLabel(slot.pattern)),
 				slog.Int("status", status),
 				slog.Duration("duration", time.Since(start)),
-			)
+			}
+			if aborted {
+				attrs = append(attrs, slog.Bool("aborted", true))
+			}
+			logger.LogAttrs(r.Context(), level, "http request", attrs...)
+
+			if aborted {
+				panic(http.ErrAbortHandler)
+			}
 		}()
 
 		next.ServeHTTP(sw, r)
@@ -121,15 +148,23 @@ func routeLabel(pattern string) string {
 func dispatch(mux *http.ServeMux) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h, pattern := mux.Handler(r)
-		if slot := routeSlotFrom(r.Context()); slot != nil {
-			slot.pattern = pattern
-		}
 
 		if !isAPIPath(r.URL.Path) {
+			setRoute(r, pattern)
 			mux.ServeHTTP(w, r)
 			return
 		}
 		setAPIHeaders(w)
+
+		// The mux would redirect a non-canonical path ("//", "..") and report
+		// the target's pattern. API clients build canonical paths, so treat
+		// these as unknown endpoints rather than redirecting.
+		if r.URL.Path != cleanPath(r.URL.Path) {
+			setRoute(r, "")
+			writeProblem(w, probNotFound.problem("No such API endpoint."))
+			return
+		}
+		setRoute(r, pattern)
 		if pattern != "" {
 			// ServeHTTP (not h) so the request gets its path values.
 			mux.ServeHTTP(w, r)
@@ -140,20 +175,34 @@ func dispatch(mux *http.ServeMux) http.Handler {
 		// answer with the matching problem.
 		rec := &headerRecorder{header: http.Header{}}
 		h.ServeHTTP(rec, r)
-		switch rec.status {
-		case http.StatusMethodNotAllowed:
+		if rec.status == http.StatusMethodNotAllowed {
 			w.Header().Set("Allow", rec.header.Get("Allow"))
 			writeProblem(w, probMethodNotAllowed.problem(""))
-		case http.StatusNotFound, 0:
-			writeProblem(w, probNotFound.problem("No such API endpoint."))
-		default:
-			// Redirects for unclean paths: replay as-is.
-			for k, v := range rec.header {
-				w.Header()[k] = v
-			}
-			w.WriteHeader(rec.status)
+			return
 		}
+		writeProblem(w, probNotFound.problem("No such API endpoint."))
 	})
+}
+
+func setRoute(r *http.Request, pattern string) {
+	if slot := routeSlotFrom(r.Context()); slot != nil {
+		slot.pattern = pattern
+	}
+}
+
+// cleanPath is net/http's canonical form: path.Clean, keeping a trailing slash.
+func cleanPath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	if p[0] != '/' {
+		p = "/" + p
+	}
+	np := path.Clean(p)
+	if p[len(p)-1] == '/' && np != "/" {
+		np += "/"
+	}
+	return np
 }
 
 // isAPIPath reports whether p is served by the /api/v1 contract.
@@ -189,4 +238,3 @@ func (r *headerRecorder) WriteHeader(code int) {
 		r.status = code
 	}
 }
-
