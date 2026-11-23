@@ -1,0 +1,75 @@
+@import 'tailwindcss';
+
+/*
+ * Design tokens from docs/design/phase-2-dashboards.md ("Shell and tokens").
+ * Components use the semantic names (bg-canvas, bg-surface, text-fg, border-line,
+ * text-steps, …) rather than raw palette colours, so light/dark is decided here only.
+ * Dark is the default; light applies when the OS prefers it.
+ */
+@theme inline {
+  --color-canvas: var(--pp-canvas);
+  --color-surface: var(--pp-surface);
+  --color-fg: var(--pp-fg);
+  --color-fg-muted: var(--pp-fg-muted);
+  --color-line: var(--pp-line);
+  --color-focus: var(--pp-focus);
+
+  /* Metric accents: always paired with a text label and unit. */
+  --color-steps: var(--color-emerald-500);
+  --color-heart: var(--color-rose-500);
+  --color-hrv: var(--color-sky-500);
+  --color-sleep: var(--color-indigo-500);
+
+  /* 32 px tabular metric values (body 16 px = text-base, headings 24 px = text-2xl). */
+  --text-metric: 2rem;
+  --text-metric--line-height: 2.5rem;
+}
+
+:root {
+  color-scheme: dark;
+  --pp-canvas: var(--color-slate-950);
+  --pp-surface: var(--color-slate-900);
+  --pp-fg: var(--color-slate-100);
+  --pp-fg-muted: var(--color-slate-400);
+  --pp-line: var(--color-slate-800);
+  --pp-focus: var(--color-sky-300);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --pp-canvas: var(--color-slate-50);
+    --pp-surface: var(--color-white);
+    --pp-fg: var(--color-slate-900);
+    --pp-fg-muted: var(--color-slate-600);
+    --pp-line: var(--color-slate-200);
+    --pp-focus: var(--color-sky-700);
+  }
+}
+
+@layer base {
+  body {
+    @apply min-h-dvh bg-canvas text-base text-fg antialiased;
+  }
+
+  /* Visible, contrasting focus ring on every interactive element. */
+  :focus-visible {
+    outline: 2px solid var(--pp-focus);
+    outline-offset: 2px;
+  }
+
+  a {
+    @apply underline underline-offset-2;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -1,5 +1,4 @@
-# Keeps SHA-pinned GitHub Actions and Go modules up to date.
-# Add an `npm` entry for /web once web/package.json exists.
+# Keeps SHA-pinned GitHub Actions, Go modules and web/ npm packages up to date.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -19,3 +18,13 @@ updates:
     groups:
       go-modules:
         patterns: ["*"]
+
+  # Minor and patch bumps arrive as one grouped PR; each major bump gets its own PR.
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+    groups:
+      web-dependencies:
+        patterns: ["*"]
+        update-types: [minor, patch]

@@ -133,10 +133,11 @@ jobs:
       - name: Lint
         run: make lint
 
+      # Both Playwright projects (desktop and mobile) run on Chromium.
       - name: Install Playwright browsers (web/)
         if: hashFiles('web/package.json') != ''
         working-directory: web
-        run: npx playwright install --with-deps
+        run: npx playwright install --with-deps chromium
 
       - name: E2E (desktop + mobile viewports)
         if: hashFiles('web/package.json') != ''
