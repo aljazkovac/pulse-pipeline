@@ -110,7 +110,7 @@ func TestServeDrainsInFlightRequestsOnShutdown(t *testing.T) {
 			inFlight <- result{err: err}
 			return
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		b, err := io.ReadAll(resp.Body)
 		inFlight <- result{string(b), err}
 	}()
