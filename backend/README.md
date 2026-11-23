@@ -1,7 +1,7 @@
 # Pulse Pipeline — Backend & Sync Worker (`backend/`)
 
 Go service containing:
-- `cmd/api`: HTTP/REST API serving the Web/PWA frontend (the Google OAuth web callback arrives with Phase 2 auth; until then accounts are linked with `pulse-worker connect-google`).
+- `cmd/api`: HTTP/REST API serving the Web/PWA frontend under `/api/v1` (see [API](#api); the Google OAuth web callback arrives with Phase 2 auth, until then accounts are linked with `pulse-worker connect-google`).
 - `cmd/worker`: Nightly health data ingestion service pulling from the Google Health API (`HealthProvider` adapter).
 - `internal/`: Domain models, provider adapters, `sqlc` database repositories, and OpenTelemetry / OpenFeature integration.
 - `migrations/`: PostgreSQL schema migrations (`golang-migrate`).
@@ -101,6 +101,59 @@ go run ./cmd/worker sync -user <ID> -provider mock -from 2026-01-01 -to 2026-01-
 | `TOKEN_ENCRYPTION_KEY` | — | Base64 of 32 random bytes; encrypts OAuth tokens at rest. Required with the Google provider. |
 | `TOKEN_ENCRYPTION_KEY_VERSION` | `1` | Version stored with each ciphertext; raise it when rotating. |
 | `TOKEN_ENCRYPTION_PREVIOUS_KEYS` | — | `version:base64key,…` of retired keys still needed to read older rows. |
+
+## API
+
+`cmd/api` serves the `/api/v1` contract in [`api/openapi.yaml`](api/openapi.yaml) (OpenAPI 3.1,
+[ADR-0005](../docs/adr/0005-api-auth-and-read-model.md)) on the standard library's `http.ServeMux`.
+The contract is the source of truth for both sides:
+
+- `oapi-codegen` (a Go tool pinned in `go.mod`, configured by `api/oapi-codegen.yaml`) generates the
+  request/response types and a strict server interface into `internal/api/gen`. Handlers in
+  `internal/api` implement `gen.StrictServerInterface`, so each can only return the statuses and
+  bodies the contract declares.
+- `openapi-typescript` generates `web/src/api/schema.d.ts` for the web client (`openapi-fetch`).
+
+After editing the contract, run `make generate` from the repository root and commit the result;
+`make generate-check` (CI) fails when either generated file is stale.
+
+Conventions every endpoint gets from `internal/api`:
+
+- Errors are RFC 9457 `application/problem+json` with a stable `type` from
+  [docs/api/problems.md](../docs/api/problems.md); unknown `/api` paths and methods answer with
+  `not-found` / `method-not-allowed` problems. Internal and upstream error text is logged, never
+  sent.
+- Every `/api` response carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+- One log line per request with method, route pattern, status and duration only: no URLs (OAuth
+  callbacks carry `code` and `state` in the query), cookies, headers or bodies.
+- A handler panic becomes a `500` `internal` problem (dropping any headers the handler had set,
+  such as `Set-Cookie`) and is logged with its stack. If the reply had already started, the
+  connection is aborted instead, so a truncated body cannot pass as complete.
+- Non-canonical paths (`//`, `..`) under `/api` are `not-found`, not redirected.
+
+| Endpoint | Purpose |
+| :--- | :--- |
+| `GET /healthz` | Liveness probe; does not touch the database. |
+| `GET /api/v1/health` | Readiness: pings the database, `503` `unavailable` problem when it is down. |
+
+```bash
+export DATABASE_URL=postgres://pulse:pulse_dev_password@localhost:5432/pulse_pipeline?sslmode=disable
+make migrate-up    # from the repository root; the API never migrates (see below)
+go run ./cmd/api   # listens on :8080
+curl -i localhost:8080/api/v1/health
+```
+
+| Variable | Default | Meaning |
+| :--- | :--- | :--- |
+| `DATABASE_URL` | — (required) | PostgreSQL URL. |
+| `API_PORT` | `8080` | Listen port. The web dev server proxies `/api` here. |
+
+The API does not apply migrations, so its database role needs no DDL rights: `pulse-worker`
+migrates on startup, or run `make migrate-up`. `/api/v1/health` checks database connectivity only,
+not the schema version.
+
+On `SIGINT`/`SIGTERM` the API stops accepting connections and drains in-flight requests for up to
+15 seconds before exiting (a second signal exits at once).
 
 ## Database Workflow
 
