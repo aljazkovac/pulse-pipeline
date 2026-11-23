@@ -102,7 +102,7 @@ Add the authenticated read API the dashboards need, then build the responsive fr
 **2a — Foundation**
 
 - [x] Accept ADR-0005 (API shape, Google sign-in + sessions, read model, queued manual sync, E2E auth) and write the [Designer spec](docs/design/phase-2-dashboards.md) for the layout shell and dashboards (tokens, loading/empty/error states, a11y)
-- [ ] Scaffold `web/` (React, TypeScript `strict`, Vite, Tailwind CSS) with all five Make scripts from day one (`build`, `typecheck`, `lint`, `test`, `test:e2e`) and a dev proxy from `/api` to the API, so CI gates the frontend immediately
+- [x] Scaffold `web/` (React, TypeScript `strict`, Vite, Tailwind CSS) with all five Make scripts from day one (`build`, `typecheck`, `lint`, `test`, `test:e2e`) and a dev proxy from `/api` to the API, so CI gates the frontend immediately
 - [ ] API foundation: `/api/v1` on `net/http`, OpenAPI contract with generated Go and TypeScript types (drift-checked in CI like `sqlc`), RFC 9457 errors, `Cache-Control: no-store`, graceful shutdown, no query strings or cookies in logs
 - [ ] Authentication: Google sign-in (OIDC + PKCE) for `PULSE_ALLOWED_EMAILS`, `user_identities` + server-side `sessions` (migration `000004`), `HttpOnly` session cookie, `http.CrossOriginProtection`; every handler scoped to the session's `user_id` with cross-user isolation tests
 - [ ] Deterministic E2E stack: `seed-dev -user-id -connection` fixture users per state and viewport project, a polling worker, `PULSE_DEV_NOW` fixed clock and a development-only login (`ENV=development` + `PULSE_ENABLE_DEV_LOGIN`); Playwright desktop (`1280x800`) and mobile (`390x844`) projects
