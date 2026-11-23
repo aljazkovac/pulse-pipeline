@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -30,6 +31,9 @@ type memStore struct {
 	touches    int
 	lookups    int
 	sweepArgs  [2]time.Time
+	allowArgs  []string
+	disallowed int64 // what DeleteSessionsOutsideAllowlist reports
+	allowErr   error
 	failWith   error // returned by every call when set
 	enrollErr  error // returned by CreateUserWithIdentity when set
 	// raceWinner, when set, plays a concurrent first sign-in of the same
@@ -136,6 +140,13 @@ func (m *memStore) DeleteSession(_ context.Context, userID uuid.UUID, hash []byt
 		delete(m.sessions, string(hash))
 	}
 	return nil
+}
+
+func (m *memStore) DeleteSessionsOutsideAllowlist(_ context.Context, allowed []string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.allowArgs = allowed
+	return m.disallowed, m.allowErr
 }
 
 func (m *memStore) DeleteExpiredSessions(_ context.Context, now, idleBefore time.Time) (int64, error) {
@@ -407,13 +418,27 @@ func TestSignOut_DeletesTheSessionAndIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestSweepExpired_UsesTheIdleCutoff(t *testing.T) {
-	svc, st, _ := newService(t, "fake-user@gmail.com")
-	if _, err := svc.SweepExpired(ctxT(t)); err != nil {
+func TestSweep_DeletesExpiredAndDisallowedSessions(t *testing.T) {
+	svc, st, _ := newService(t, "Fake-B@example.com, fake-a@example.com")
+	st.disallowed = 2
+	st.sessions["x"] = domain.Session{ExpiresAt: now} // expired
+	res, err := svc.Sweep(ctxT(t))
+	if err != nil {
 		t.Fatal(err)
 	}
+	if res != (auth.SweepResult{Expired: 1, Disallowed: 2}) {
+		t.Errorf("result = %+v", res)
+	}
 	if st.sweepArgs != [2]time.Time{now, now.Add(-30 * 24 * time.Hour)} {
-		t.Errorf("sweep args = %v", st.sweepArgs)
+		t.Errorf("expiry cutoffs = %v", st.sweepArgs)
+	}
+	if !slices.Equal(st.allowArgs, []string{"fake-a@example.com", "fake-b@example.com"}) {
+		t.Errorf("allowlist passed = %v, want the lower-cased, sorted list", st.allowArgs)
+	}
+
+	st.allowErr = errors.New("fake: connection refused")
+	if _, err := svc.Sweep(ctxT(t)); err == nil {
+		t.Error("a failed allowlist sweep was not reported")
 	}
 }
 
@@ -421,6 +446,9 @@ func TestParseAllowlist(t *testing.T) {
 	a, err := auth.ParseAllowlist(" Fake.One@Example.com ,, fake-two@gmail.com,")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !slices.Equal(a.Emails(), []string{"fake-two@gmail.com", "fake.one@example.com"}) {
+		t.Errorf("Emails = %v", a.Emails())
 	}
 	if a.Len() != 2 || !a.Allows("fake.one@example.COM") || !a.Allows(" fake-two@gmail.com ") || a.Allows("fake-three@gmail.com") {
 		t.Errorf("allowlist = %+v", a)

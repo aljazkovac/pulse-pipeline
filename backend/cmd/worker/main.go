@@ -8,6 +8,7 @@
 //	pulse-worker bind-google-identity (-user ID [-replace] | -new-user) [-mailbox-verified]
 //	                                         bind a Google sign-in identity to a user,
 //	                                         or enroll a new one (ADR-0005 §2)
+//	pulse-worker revoke-sessions -user ID    sign a user out of every session (ADR-0005 §3)
 //
 // Environment: DATABASE_URL (required), PULSE_SYNC_POLL_INTERVAL (default 1m),
 // PULSE_ENABLE_MOCK_PROVIDER (default false), ENV (seed-dev needs "development"),
@@ -70,7 +71,8 @@ const usage = `usage:
   pulse-worker sync -user ID -provider PROVIDER [-from YYYY-MM-DD -to YYYY-MM-DD]
   pulse-worker seed-dev [-email EMAIL] [-tz IANA_ZONE]
   pulse-worker connect-google -user ID
-  pulse-worker bind-google-identity (-user ID [-replace] | -new-user) [-mailbox-verified]`
+  pulse-worker bind-google-identity (-user ID [-replace] | -new-user) [-mailbox-verified]
+  pulse-worker revoke-sessions -user ID`
 
 func run(ctx context.Context, args []string, getenv func(string) string, stdout io.Writer, logger *slog.Logger) error {
 	cmd := "run"
@@ -153,6 +155,14 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout 
 		return withDeps(ctx, cfg, logger, func(d deps) error {
 			return bindGoogleIdentity(ctx, d.store, google, req, stdout, time.Now)
 		})
+	case "revoke-sessions":
+		userID, err := parseUserArgs("revoke-sessions", args)
+		if err != nil {
+			return err
+		}
+		return withDeps(ctx, cfg, logger, func(d deps) error {
+			return revokeSessions(ctx, d.store, userID, stdout)
+		})
 	default:
 		return fmt.Errorf("%w: unknown command %q", errUsage, cmd)
 	}
@@ -177,6 +187,28 @@ func connectGoogle(ctx context.Context, d deps, userID uuid.UUID, stdout io.Writ
 		return err
 	}
 	_, err = fmt.Fprintf(stdout, "Linked Google Health for user %s (connection %s). The worker syncs it on its next poll.\n", u.ID, connectionID)
+	return err
+}
+
+// sessionRevoker is the subset of *store.Store revoke-sessions needs.
+type sessionRevoker interface {
+	GetUser(ctx context.Context, id uuid.UUID) (domain.User, error)
+	DeleteUserSessions(ctx context.Context, userID uuid.UUID) (int64, error)
+}
+
+// revokeSessions signs a user out of every browser, for example after a
+// lost phone (ADR-0005 §3). The user can sign in again unless their address
+// is also removed from PULSE_ALLOWED_EMAILS.
+func revokeSessions(ctx context.Context, st sessionRevoker, userID uuid.UUID, stdout io.Writer) error {
+	u, err := st.GetUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	n, err := st.DeleteUserSessions(ctx, u.ID)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(stdout, "Signed user %s (%s) out of %d sessions.\n", u.ID, u.Email, n)
 	return err
 }
 
@@ -439,19 +471,22 @@ func parseSeedArgs(args []string) (email, tz string, err error) {
 	return email, tz, nil
 }
 
-func parseConnectArgs(args []string) (uuid.UUID, error) {
-	fs := flag.NewFlagSet("connect-google", flag.ContinueOnError)
+func parseConnectArgs(args []string) (uuid.UUID, error) { return parseUserArgs("connect-google", args) }
+
+// parseUserArgs parses the arguments of a command that takes only -user ID.
+func parseUserArgs(cmd string, args []string) (uuid.UUID, error) {
+	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	user := fs.String("user", "", "user ID")
 	if err := fs.Parse(args); err != nil {
-		return uuid.Nil, fmt.Errorf("%w: connect-google: %v", errUsage, err)
+		return uuid.Nil, fmt.Errorf("%w: %s: %v", errUsage, cmd, err)
 	}
 	if fs.NArg() > 0 {
-		return uuid.Nil, fmt.Errorf("%w: connect-google: unexpected argument %q", errUsage, fs.Arg(0))
+		return uuid.Nil, fmt.Errorf("%w: %s: unexpected argument %q", errUsage, cmd, fs.Arg(0))
 	}
 	id, err := uuid.Parse(*user)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("%w: connect-google: -user must be a UUID", errUsage)
+		return uuid.Nil, fmt.Errorf("%w: %s: -user must be a UUID", errUsage, cmd)
 	}
 	return id, nil
 }

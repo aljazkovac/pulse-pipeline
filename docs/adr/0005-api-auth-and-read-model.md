@@ -85,6 +85,12 @@ Constraints:
   returning identity by its validated `(issuer, subject)`, using `https://accounts.google.com`
   for both accepted issuer spellings. The `user_identities` table uses that pair as its
   primary key and stores `user_id`, `email`, `created_at` and `last_login_at`.
+  - Amendment (2026-11-23): the allowlist also governs existing sessions. At startup and in
+    its hourly sweep, the API deletes the sessions of every user whose Google identities all
+    have an email outside `PULSE_ALLOWED_EMAILS`. The list only changes on restart, so
+    removing an address signs that person out when the API restarts with the new list. Users
+    without identities, such as development fixtures, are not affected. An operator can also
+    sign one user out everywhere with `pulse-worker revoke-sessions -user ID`.
   - A new identity may create a Pulse user when the allowlisted email is unused and Google is
     authoritative for it (Gmail, or verified Google Workspace email with an `hd` claim).
     Create the user and identity in one transaction. If the email already belongs to a Pulse
@@ -322,7 +328,10 @@ rows with authentication. Each later slice adds its own rows of this table as th
   - While the Google Cloud app is in *Testing*, health refresh tokens still expire after 7 days.
     Web linking makes the weekly re-link a button instead of a terminal session.
 - **Follow-ups:**
-  - Rate-limiting the sign-in routes if sign-up ever opens.
+  - Rate-limiting: at the Phase 5 ingress, per client, for `/api/v1/auth/*`; in the API itself
+    only if sign-up ever opens. Session secrets are 256-bit random values and the callback
+    exchanges codes only for the browser's own flow, so limits guard against floods rather than
+    guessing.
   - Passkeys as a second sign-in method.
   - A merged multi-provider view.
   - The Phase 4 readiness experiment.

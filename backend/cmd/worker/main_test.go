@@ -153,6 +153,8 @@ func TestRunRejectsBadInvocationsBeforeTouchingTheDatabase(t *testing.T) {
 		"bind bad user":     {[]string{"bind-google-identity", "-user", "me"}, true, "-user must be a UUID"},
 		"bind unknown flag": {[]string{"bind-google-identity", "-user", "00000000-0000-4000-8000-000000000001", "-force"}, true, "-force"},
 		"bind no google":    {[]string{"bind-google-identity", "-user", "00000000-0000-4000-8000-000000000001"}, false, "GOOGLE_OAUTH_CLIENT_ID"},
+		"revoke bad user":   {[]string{"revoke-sessions", "-user", "me"}, true, "revoke-sessions: -user must be a UUID"},
+		"revoke extra arg":  {[]string{"revoke-sessions", "-user", "00000000-0000-4000-8000-000000000001", "all"}, true, "unexpected argument"},
 	} {
 		err := run(context.Background(), tc.args, e, io.Discard, logger)
 		if err == nil || errors.Is(err, errUsage) != tc.usage || !strings.Contains(err.Error(), tc.want) {

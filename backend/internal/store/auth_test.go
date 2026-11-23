@@ -472,3 +472,50 @@ func TestEnrollment_RefusesAnEmailBoundToAnotherUsersIdentity(t *testing.T) {
 		t.Errorf("a user was created for the bound email")
 	}
 }
+
+func TestDeleteSessionsOutsideAllowlist(t *testing.T) {
+	ctx := ctxT(t)
+	allowedEmail := uniqueEmail("allowed")
+	removedEmail := uniqueEmail("removed")
+	allowed, err := testStore.CreateUserWithIdentity(ctx, newIdentity(strings.ToUpper(allowedEmail)), "UTC", t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed, err := testStore.CreateUserWithIdentity(ctx, newIdentity(removedEmail), "UTC", t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := newUser(t) // no Google identity, like a development fixture
+	hashes := map[uuid.UUID][]byte{}
+	for _, id := range []uuid.UUID{allowed.ID, removed.ID, fixture.ID} {
+		hashes[id] = tokenHash(id.String())
+		if err := testStore.CreateSession(ctx, id, hashes[id], t0, t0.Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	n, err := testStore.DeleteSessionsOutsideAllowlist(ctx, []string{allowedEmail})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n < 1 { // other tests' identities are not allowlisted either
+		t.Errorf("deleted %d sessions, want at least the removed user's", n)
+	}
+	for id, keep := range map[uuid.UUID]bool{allowed.ID: true, removed.ID: false, fixture.ID: true} {
+		_, err := testStore.GetSessionByTokenHash(ctx, hashes[id])
+		if found := err == nil; found != keep {
+			t.Errorf("user %s: session found = %t (err %v), want %t", id, found, err, keep)
+		}
+	}
+
+	// An empty allowlist revokes every Google-signed-in session.
+	if _, err := testStore.DeleteSessionsOutsideAllowlist(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testStore.GetSessionByTokenHash(ctx, hashes[allowed.ID]); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("an empty allowlist kept a session: %v", err)
+	}
+	if _, err := testStore.GetSessionByTokenHash(ctx, hashes[fixture.ID]); err != nil {
+		t.Errorf("a user without identities lost their session: %v", err)
+	}
+}

@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/auth"
 )
 
 func env(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
@@ -147,16 +149,16 @@ func TestSweepSessionsRunsAtOnceThenEveryIntervalUntilCancelled(t *testing.T) {
 
 	calls := make(chan struct{}, 10)
 	n := 0
-	sweep := func(sctx context.Context) (int64, error) {
+	sweep := func(sctx context.Context) (auth.SweepResult, error) {
 		if _, ok := sctx.Deadline(); !ok {
 			t.Error("a sweep runs without a deadline")
 		}
 		n++
 		calls <- struct{}{}
 		if n == 2 {
-			return 0, errors.New("fake: connection refused")
+			return auth.SweepResult{}, errors.New("fake: connection refused")
 		}
-		return 3, nil
+		return auth.SweepResult{Expired: 3, Disallowed: 1}, nil
 	}
 	done := make(chan struct{})
 	go func() {
@@ -178,8 +180,10 @@ func TestSweepSessionsRunsAtOnceThenEveryIntervalUntilCancelled(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if !strings.Contains(logs.String(), "expired sessions deleted") || !strings.Contains(logs.String(), "expired session sweep failed") {
-		t.Errorf("logs = %s; want the deletions and the failure", logs.String())
+	for _, want := range []string{"expired sessions deleted", "no longer in PULSE_ALLOWED_EMAILS deleted", "session sweep failed"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("logs = %s; want %q", logs.String(), want)
+		}
 	}
 }
 

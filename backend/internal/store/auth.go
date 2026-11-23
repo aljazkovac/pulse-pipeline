@@ -253,6 +253,22 @@ func (s *Store) DeleteUserSessions(ctx context.Context, userID uuid.UUID) (int64
 	return n, nil
 }
 
+// DeleteSessionsOutsideAllowlist is SYSTEM CONTEXT ONLY (AGENTS.md §1.1):
+// the API's allowlist sweep. It deletes the sessions of every user who has
+// Google identities but none whose email is in allowed (lower-cased), and
+// returns only the count. Users without identities keep their sessions. API
+// and MCP handlers must not call it.
+func (s *Store) DeleteSessionsOutsideAllowlist(ctx context.Context, allowed []string) (int64, error) {
+	if allowed == nil {
+		allowed = []string{}
+	}
+	n, err := s.q.DeleteSessionsOutsideAllowlist(ctx, allowed)
+	if err != nil {
+		return 0, fmt.Errorf("deleting sessions outside the allowlist: %w", err)
+	}
+	return n, nil
+}
+
 // DeleteExpiredSessions is SYSTEM CONTEXT ONLY (AGENTS.md §1.1): the API's
 // background sweep. It deletes, across users, sessions past their absolute
 // expiry (expires_at <= now) or idle since idleBefore, and returns only the

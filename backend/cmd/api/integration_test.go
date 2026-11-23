@@ -24,6 +24,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/domain"
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/store"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/testdb"
 )
 
@@ -290,6 +292,19 @@ func TestSignInAndSessionIsolationAgainstPostgres(t *testing.T) {
 	}
 	cfg.googleAuthURL, cfg.googleTokenURL = "https://accounts.example.com/auth", google.srv.URL+"/token"
 
+	// A user taken off the allowlist: their live session ends at startup.
+	removedStore := store.New(testPool)
+	removed, err := removedStore.CreateUserWithIdentity(ctx, domain.Identity{
+		Issuer: "https://accounts.google.com", Subject: "fake-sub-removed-" + suffix, Email: "fake-removed-" + suffix + "@gmail.com",
+	}, "UTC", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	removedHash := sha256.Sum256([]byte("fake-removed-session-" + suffix))
+	if err := removedStore.CreateSession(ctx, removed.ID, removedHash[:], time.Now(), time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
 	// An expired session the API's startup sweep must delete.
 	var staleUser uuid.UUID
 	if err := testPool.QueryRow(ctx, `INSERT INTO users (email) VALUES ($1) RETURNING id`, "fake-stale-"+suffix+"@example.com").Scan(&staleUser); err != nil {
@@ -324,17 +339,19 @@ func TestSignInAndSessionIsolationAgainstPostgres(t *testing.T) {
 		t.Fatalf("run exited before listening: %v", err)
 	}
 
-	// The sweeper runs at startup.
+	// The sweeper runs at startup: it deletes the expired session and the
+	// session of the user who is no longer allowlisted.
 	for deadline := time.Now().Add(5 * time.Second); ; {
 		var n int
-		if err := testPool.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE token_hash = $1`, staleHash[:]).Scan(&n); err != nil {
+		if err := testPool.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE token_hash = ANY($1)`,
+			[][]byte{staleHash[:], removedHash[:]}).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		if n == 0 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("the API did not sweep an expired session at startup")
+			t.Fatalf("the API left %d expired or disallowed sessions after startup", n)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

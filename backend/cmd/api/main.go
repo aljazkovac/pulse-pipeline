@@ -7,7 +7,8 @@
 // and PULSE_ALLOWED_EMAILS. Without a client ID the API serves, but the
 // sign-in routes answer 503 and nobody can sign in.
 //
-// A background ticker deletes expired sessions hourly (ADR-0005 §3).
+// A background ticker deletes expired sessions, and the sessions of users no
+// longer in PULSE_ALLOWED_EMAILS, at startup and hourly (ADR-0005 §2–3).
 //
 // The API does not migrate the schema: its database role needs no DDL rights.
 // Migrations run from pulse-worker on startup or `make migrate-up`.
@@ -39,7 +40,7 @@ import (
 const (
 	// shutdownTimeout bounds how long a stopping API waits for in-flight requests.
 	shutdownTimeout = 15 * time.Second
-	// sessionSweepInterval is how often expired sessions are deleted.
+	// sessionSweepInterval is how often expired and disallowed sessions are deleted.
 	sessionSweepInterval = time.Hour
 	// sessionSweepTimeout bounds one sweep's database round trip.
 	sessionSweepTimeout = time.Minute
@@ -197,7 +198,7 @@ func runWithConfig(ctx context.Context, cfg config, logger *slog.Logger, listen 
 	swept := make(chan struct{})
 	go func() {
 		defer close(swept)
-		sweepSessions(sweepCtx, sessions.SweepExpired, sessionSweepInterval, logger)
+		sweepSessions(sweepCtx, sessions.Sweep, sessionSweepInterval, logger)
 	}()
 	defer func() {
 		stopSweep()
@@ -207,22 +208,26 @@ func runWithConfig(ctx context.Context, cfg config, logger *slog.Logger, listen 
 	return serve(ctx, ln, api.NewHandler(opts), logger, shutdownTimeout)
 }
 
-// sweepSessions deletes expired sessions at once and then every interval
-// until ctx ends (ADR-0005 §3). Sessions are checked for expiry on every
-// request anyway; the sweep only keeps the table small. A failed sweep is
-// logged and retried on the next tick.
-func sweepSessions(ctx context.Context, sweep func(context.Context) (int64, error), interval time.Duration, logger *slog.Logger) {
+// sweepSessions deletes expired sessions and those of users who are no
+// longer allowlisted, at once and then every interval until ctx ends
+// (ADR-0005 §2–3). Running at startup is what makes a shortened
+// PULSE_ALLOWED_EMAILS take effect: the list only changes on restart. A
+// failed sweep is logged and retried on the next tick.
+func sweepSessions(ctx context.Context, sweep func(context.Context) (auth.SweepResult, error), interval time.Duration, logger *slog.Logger) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		sctx, cancel := context.WithTimeout(ctx, sessionSweepTimeout)
-		n, err := sweep(sctx)
+		res, err := sweep(sctx)
 		cancel()
-		switch {
-		case err != nil && ctx.Err() == nil:
-			logger.Warn("expired session sweep failed", "error", err)
-		case n > 0:
-			logger.Info("expired sessions deleted", "count", n)
+		if err != nil && ctx.Err() == nil {
+			logger.Warn("session sweep failed", "error", err)
+		}
+		if res.Expired > 0 {
+			logger.Info("expired sessions deleted", "count", res.Expired)
+		}
+		if res.Disallowed > 0 {
+			logger.Info("sessions of users no longer in PULSE_ALLOWED_EMAILS deleted", "count", res.Disallowed)
 		}
 		select {
 		case <-ctx.Done():

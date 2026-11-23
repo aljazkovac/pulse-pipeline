@@ -180,8 +180,10 @@ Sign-in follows [ADR-0005](../docs/adr/0005-api-auth-and-read-model.md) §2–3 
   name exactly this client as their audience.
 - **Sessions** live in the `sessions` table. The cookie holds 32 random bytes; the table stores only
   their SHA-256. Sessions end after 30 days idle or 90 days after sign-in, `last_seen_at` is
-  written at most hourly, and the API deletes expired rows hourly. Each sign-in issues a new
-  token and ends the browser's previous session.
+  written at most hourly. At startup and hourly the API deletes expired sessions and the
+  sessions of users whose Google identities are all off `PULSE_ALLOWED_EMAILS`, so removing an
+  address and restarting the API signs that person out. Each sign-in issues a new token and ends
+  the browser's previous session.
 - **Cookies** are `HttpOnly` and `SameSite=Lax`. In production they are `__Host-pulse_session`
   and `__Host-pulse_oauth` with `Secure`, so `PULSE_PUBLIC_URL` must be HTTPS. With
   `ENV=development` they are `pulse_session` and `pulse_oauth` without `Secure`, for plain
@@ -215,6 +217,10 @@ a one-time code sent to it) and add `-mailbox-verified`. Binding a different Goo
 needs `-replace`, which also signs the user out of every session; a sign-in racing the replacement
 cannot keep a session either.
 
+**Signing someone out.** `go run ./cmd/worker revoke-sessions -user PULSE_USER_ID` ends every
+session of one user, for example after a lost phone. They can sign in again unless you also remove
+their address from `PULSE_ALLOWED_EMAILS`, which by itself signs them out at the next API restart.
+
 **Enrolling a non-Google address.** A Google account whose address is not Gmail or Workspace cannot
 create its own user. After the mailbox check, the operator enrolls it with
 `bind-google-identity -new-user -mailbox-verified`, then adds the address to `PULSE_ALLOWED_EMAILS`.
@@ -232,6 +238,7 @@ The schema and its rationale are in [ADR-0002](../docs/adr/0002-health-data-sche
 
 Every query must filter by `user_id`, with the exceptions `AGENTS.md` §1.1 allows, none of which
 returns health data or tokens: `ListConnectionsDueForSync` (the nightly scheduler) and
-`DeleteExpiredSessions` (the API's hourly sweep) are system context, and `GetSessionByTokenHash`,
+`DeleteExpiredSessions` and `DeleteSessionsOutsideAllowlist` (the API's session sweeps) are system
+context, and `GetSessionByTokenHash`,
 `GetUserIDByIdentity` and the enrollment check `CreateUserUnlessEmailBound` are the authentication
 boundary that turns a credential into a user ID.

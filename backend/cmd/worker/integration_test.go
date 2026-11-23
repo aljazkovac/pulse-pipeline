@@ -325,3 +325,33 @@ func TestWorker_BindGoogleIdentityToAnExistingUser(t *testing.T) {
 		t.Errorf("%d sessions survived the replacement", n)
 	}
 }
+
+func TestWorker_RevokeSessionsSignsOneUserOutEverywhere(t *testing.T) {
+	ctx := ctxT(t)
+	target, other := seedDev(t, ctx), seedDev(t, ctx)
+	st := store.New(testPool)
+	for i, id := range []uuid.UUID{target, target, other} {
+		hash := bytes.Repeat([]byte{byte(i + 1)}, 31)
+		hash = append(hash, id[0])
+		if err := st.CreateSession(ctx, id, hash, time.Now(), time.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var out bytes.Buffer
+	if err := run(ctx, []string{"revoke-sessions", "-user", target.String()}, devEnv(nil), &out, quietLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "out of 2 sessions") {
+		t.Errorf("output = %q", out.String())
+	}
+	if n := count(t, ctx, `SELECT count(*) FROM sessions WHERE user_id = $1`, target); n != 0 {
+		t.Errorf("%d sessions survived", n)
+	}
+	if n := count(t, ctx, `SELECT count(*) FROM sessions WHERE user_id = $1`, other); n != 1 {
+		t.Errorf("another user's sessions = %d, want 1 untouched", n)
+	}
+	if err := run(ctx, []string{"revoke-sessions", "-user", uuid.NewString()}, devEnv(nil), io.Discard, quietLogger()); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("unknown user = %v, want ErrNotFound", err)
+	}
+}

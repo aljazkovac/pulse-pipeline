@@ -133,6 +133,28 @@ func (q *Queries) DeleteSession(ctx context.Context, arg DeleteSessionParams) (i
 	return result.RowsAffected(), nil
 }
 
+const deleteSessionsOutsideAllowlist = `-- name: DeleteSessionsOutsideAllowlist :execrows
+DELETE FROM sessions
+WHERE user_id IN (SELECT user_id FROM user_identities)
+  AND user_id NOT IN (
+    SELECT user_id FROM user_identities
+    WHERE lower(email) = ANY($1::text[])
+  )
+`
+
+// SYSTEM CONTEXT (AGENTS.md §1.1 exception): the API's allowlist sweep.
+// Deletes the sessions of every user whose Google identities all have an
+// email outside the allowlist; users without identities are left alone.
+// Deletes across users and returns a count only.
+// Must not be reachable from API or MCP handlers.
+func (q *Queries) DeleteSessionsOutsideAllowlist(ctx context.Context, allowedEmails []string) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteSessionsOutsideAllowlist, allowedEmails)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteUserIdentity = `-- name: DeleteUserIdentity :execrows
 DELETE FROM user_identities
 WHERE user_id = $1 AND issuer = $2

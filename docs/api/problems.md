@@ -49,7 +49,7 @@ OAuth client configured, which retrying does not fix.
 ## unauthenticated
 
 **401 Unauthorized.** The operation needs a session and the request has none, or its session is
-unknown, signed out or expired (30 days idle or 90 days after sign-in). Sign in again with
+unknown, signed out, revoked or expired (30 days idle or 90 days after sign-in). Sign in again with
 `GET /api/v1/auth/google/login`. When the request carried a dead session cookie, the response also
 expires it.
 

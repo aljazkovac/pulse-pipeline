@@ -104,7 +104,7 @@ Add the authenticated read API the dashboards need, then build the responsive fr
 - [x] Accept ADR-0005 (API shape, Google sign-in + sessions, read model, queued manual sync, E2E auth) and write the [Designer spec](docs/design/phase-2-dashboards.md) for the layout shell and dashboards (tokens, loading/empty/error states, a11y)
 - [x] Scaffold `web/` (React, TypeScript `strict`, Vite, Tailwind CSS) with all five Make scripts from day one (`build`, `typecheck`, `lint`, `test`, `test:e2e`) and a dev proxy from `/api` to the API, so CI gates the frontend immediately
 - [x] API foundation: `/api/v1` on `net/http`, OpenAPI contract with generated Go and TypeScript types (drift-checked in CI like `sqlc`), RFC 9457 errors, `Cache-Control: no-store`, graceful shutdown, no query strings or cookies in logs
-- [x] Authentication: Google sign-in (OIDC + PKCE) for `PULSE_ALLOWED_EMAILS`, `user_identities` + server-side `sessions` (migration `000004`), `HttpOnly` session cookie, `http.CrossOriginProtection`; every handler scoped to the session's `user_id` with cross-user isolation tests; `pulse-worker bind-google-identity` keeps a Phase 1 user's history
+- [x] Authentication: Google sign-in (OIDC + PKCE) for `PULSE_ALLOWED_EMAILS`, `user_identities` + server-side `sessions` (migration `000004`), `HttpOnly` session cookie, `http.CrossOriginProtection`; every handler scoped to the session's `user_id` with cross-user isolation tests; `pulse-worker bind-google-identity` keeps a Phase 1 user's history; removing an address from the allowlist (or `pulse-worker revoke-sessions`) signs that user out
 - [ ] Deterministic E2E stack: `seed-dev -user-id -connection` fixture users per state and viewport project, a polling worker, `PULSE_DEV_NOW` fixed clock and a development-only login (`ENV=development` + `PULSE_ENABLE_DEV_LOGIN`); Playwright desktop (`1280x800`) and mobile (`390x844`) projects
 - [ ] Build responsive layout shell (desktop sidebar navigation + mobile bottom tab bar with safe-area support, signed-in/out states)
 
@@ -160,6 +160,7 @@ Document the system for developers and users, and deploy to Kubernetes via Terra
   - [ ] **User Docs:** Connecting Google Health / Fitbit, Installing the Mobile PWA, Understanding Dashboard Metrics
 - [ ] Create production multi-stage `Dockerfile`s for `backend`, `mcp`, `web`, and `docs`
 - [ ] Author Kubernetes manifests / Helm charts and **ArgoCD** Application definitions (validate locally on `k3d`)
+- [ ] Ingress: HTTPS, `/api` routed to the API and everything else to the web bundle (ADR-0005), with per-client rate limits on `/api/v1/auth/*`
 - [ ] Build **Terraform + Terragrunt** infrastructure modules in `infra/`:
   - [ ] DigitalOcean Kubernetes (DOKS) cluster, Container Registry, and PostgreSQL storage
   - [ ] Bootstrap ArgoCD for GitOps continuous delivery of the application, observability stack, and docs site

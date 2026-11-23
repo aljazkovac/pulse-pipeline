@@ -14,6 +14,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -67,8 +68,8 @@ func Denied(err error) bool {
 
 // Store is the subset of *store.Store the service needs. Every method is
 // scoped by user ID except the authentication-boundary lookups
-// GetUserIDByIdentity and GetSessionByTokenHash and the system-context sweep
-// DeleteExpiredSessions (AGENTS.md §1.1).
+// GetUserIDByIdentity and GetSessionByTokenHash and the system-context sweeps
+// DeleteExpiredSessions and DeleteSessionsOutsideAllowlist (AGENTS.md §1.1).
 type Store interface {
 	GetUserIDByIdentity(ctx context.Context, issuer, subject string) (uuid.UUID, error)
 	SignInIdentity(ctx context.Context, userID uuid.UUID, ident domain.Identity, tokenHash []byte, at, expiresAt time.Time) error
@@ -78,6 +79,7 @@ type Store interface {
 	TouchSession(ctx context.Context, userID uuid.UUID, tokenHash []byte, at time.Time) error
 	DeleteSession(ctx context.Context, userID uuid.UUID, tokenHash []byte) error
 	DeleteExpiredSessions(ctx context.Context, now, idleBefore time.Time) (int64, error)
+	DeleteSessionsOutsideAllowlist(ctx context.Context, allowed []string) (int64, error)
 }
 
 var _ Store = (*store.Store)(nil)
@@ -226,16 +228,29 @@ func (s *Service) SignOut(ctx context.Context, token string) error {
 	return nil
 }
 
-// SweepExpired deletes every expired session and returns how many. It is
-// system context: the API runs it from a background ticker, never from a
-// request handler.
-func (s *Service) SweepExpired(ctx context.Context) (int64, error) {
+// SweepResult counts the sessions one Sweep deleted.
+type SweepResult struct {
+	Expired    int64 // idle or past their absolute lifetime
+	Disallowed int64 // their user's Google identities are all off the allowlist
+}
+
+// Sweep deletes expired sessions and the sessions of users whose Google
+// identities are all off the allowlist, so removing an address from
+// PULSE_ALLOWED_EMAILS signs that person out when the API restarts with the
+// new list (ADR-0005 §2). Users without identities, such as development
+// fixtures, are not affected by the allowlist. Sweep is system context: the
+// API runs it from a background ticker, never from a request handler.
+func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	now := s.now().UTC()
-	n, err := s.st.DeleteExpiredSessions(ctx, now, now.Add(-IdleTimeout))
-	if err != nil {
-		return 0, fmt.Errorf("auth: sweeping expired sessions: %w", err)
+	var res SweepResult
+	var err error
+	if res.Expired, err = s.st.DeleteExpiredSessions(ctx, now, now.Add(-IdleTimeout)); err != nil {
+		return SweepResult{}, fmt.Errorf("auth: sweeping expired sessions: %w", err)
 	}
-	return n, nil
+	if res.Disallowed, err = s.st.DeleteSessionsOutsideAllowlist(ctx, s.allow.Emails()); err != nil {
+		return res, fmt.Errorf("auth: sweeping sessions outside the allowlist: %w", err)
+	}
+	return res, nil
 }
 
 // sessionTokenBytes is the size of a session secret (ADR-0005 §3).
@@ -298,3 +313,13 @@ func (a Allowlist) Allows(email string) bool {
 
 // Len returns the number of distinct addresses on the list.
 func (a Allowlist) Len() int { return len(a.emails) }
+
+// Emails returns the lower-cased addresses on the list, sorted.
+func (a Allowlist) Emails() []string {
+	out := make([]string, 0, len(a.emails))
+	for e := range a.emails {
+		out = append(out, e)
+	}
+	slices.Sort(out)
+	return out
+}
