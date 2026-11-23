@@ -1,6 +1,6 @@
 # ADR 0005: Phase 2 API — Authentication, Sessions, Read Model & Queued Manual Sync
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-23)
 - **Date:** 2026-11-22
 
 ## Context
@@ -258,11 +258,17 @@ All endpoints require a session except the sign-in routes and `/healthz`.
 - **Dev login:** `POST /api/v1/dev/login` with `{"email": …}` creates a session for an existing
   user. The route is registered only when both `ENV=development` and `PULSE_ENABLE_DEV_LOGIN=true`
   are set. A test asserts it returns `404` under production configuration.
-- **Fixed test data:** `seed-dev` gains `-user-id` (a fixed UUID).
+- **Fixed test data:** `seed-dev` gains `-user-id` (a fixed UUID) and `-connection`, which sets
+  the fixture's connection state: `synced` (the default: a mock connection with data), `empty`
+  (an active mock connection without records), `revoked`, or `none` (no connection).
   - Both binaries honour `PULSE_DEV_NOW` (an RFC 3339 instant) only when `ENV=development`.
   - Mock data depends on the user ID and the clock, so this pins every number on the dashboards.
-- **E2E stack:** Playwright starts compose PostgreSQL, the API, the worker (one seed and sync) and
-  Vite. The desktop (`1280x800`) and mobile (`390x844`) projects share one seeded user.
+- **E2E stack:** Playwright starts compose PostgreSQL, the API and Vite, seeds the fixture users,
+  syncs the `synced` ones once, then runs the worker in poll mode with
+  `PULSE_SYNC_POLL_INTERVAL=1s` so queued manual syncs are claimed during a test.
+  - Each acceptance state has its own fixture user (fixed user ID and email).
+  - Each Playwright project (desktop `1280x800`, mobile `390x844`) gets its own set of fixture
+    users, so scenarios that write (Sync now, Settings) never share a user across projects.
 
 ### 9. PWA caching
 
