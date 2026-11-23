@@ -51,7 +51,7 @@ func NewHandler(opts Options) http.Handler {
 		ErrorHandlerFunc: s.requestError,
 	})
 
-	return observe(opts.Logger, dispatch(mux))
+	return observe(opts.Logger, mux)
 }
 
 // server implements gen.StrictServerInterface.

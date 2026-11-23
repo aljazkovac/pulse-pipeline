@@ -125,13 +125,14 @@ func TestServeDrainsInFlightRequestsOnShutdown(t *testing.T) {
 	// The listener closes: new connections are refused while the request drains.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		resp, err := get(context.Background(), base+"/new")
+		var dialer net.Dialer
+		conn, err := dialer.DialContext(context.Background(), "tcp", strings.TrimPrefix(base, "http://"))
 		if err == nil {
-			_ = resp.Body.Close()
+			_ = conn.Close()
 		} else if errors.Is(err, syscall.ECONNREFUSED) {
 			break
 		} else {
-			t.Fatalf("GET /new during shutdown: %v, want connection refused", err)
+			t.Fatalf("dial during shutdown: %v, want connection refused", err)
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("server still accepted new requests after shutdown began")

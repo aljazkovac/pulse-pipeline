@@ -6,10 +6,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
-	"strconv"
 	"testing"
 	"time"
 
@@ -27,38 +27,30 @@ func TestMain(m *testing.M) {
 	os.Exit(testdb.Main(m, func(url string, pool *pgxpool.Pool) { testURL, testPool = url, pool }))
 }
 
-// freePort returns a loopback port that was free a moment ago.
-func freePort(t *testing.T) int {
-	t.Helper()
-	var lc net.ListenConfig
-	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	if err := ln.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	return port
-}
-
 func TestRunServesHealthAgainstPostgres(t *testing.T) {
 	testdb.Require(t, testPool)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	port := freePort(t)
+	var lc net.ListenConfig
 	listening := make(chan net.Addr, 1)
+	listen := func(ctx context.Context, network, _ string) (net.Listener, error) {
+		ln, err := lc.Listen(ctx, network, "127.0.0.1:0")
+		if err != nil {
+			return nil, fmt.Errorf("binding test listener: %w", err)
+		}
+		listening <- ln.Addr()
+		return ln, nil
+	}
 	done := make(chan error, 1)
 	go func() {
-		done <- run(ctx, env(map[string]string{"DATABASE_URL": testURL, "API_PORT": strconv.Itoa(port)}),
-			quietLogger(), func(a net.Addr) { listening <- a })
+		done <- run(ctx, env(map[string]string{"DATABASE_URL": testURL}), quietLogger(), listen)
 	}()
 
 	var base string
 	select {
-	case <-listening:
-		base = "http://127.0.0.1:" + strconv.Itoa(port)
+	case addr := <-listening:
+		base = "http://" + addr.String()
 	case err := <-done:
 		t.Fatalf("run exited before listening: %v", err)
 	}

@@ -256,6 +256,12 @@ func panicky(t *testing.T) (http.Handler, *bytes.Buffer) {
 		_, _ = io.WriteString(w, `{"partial":`)
 		panic("kaboom")
 	})
+	mux.HandleFunc("GET /api/v1/flush-boom", func(w http.ResponseWriter, _ *http.Request) {
+		if err := http.NewResponseController(w).Flush(); err != nil {
+			t.Errorf("flush: %v", err)
+		}
+		panic("kaboom")
+	})
 	setHeadersThenPanic := func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Set-Cookie", "pulse_session=abc; HttpOnly")
 		w.Header().Set("Location", "/elsewhere")
@@ -265,7 +271,7 @@ func panicky(t *testing.T) (http.Handler, *bytes.Buffer) {
 	mux.HandleFunc("GET /api/v1/header-boom", setHeadersThenPanic)
 	mux.HandleFunc("GET /header-boom", setHeadersThenPanic)
 	mux.HandleFunc("GET /api/v1/abort", func(http.ResponseWriter, *http.Request) { panic(http.ErrAbortHandler) })
-	return observe(logger, dispatch(mux)), &logs
+	return observe(logger, mux), &logs
 }
 
 // serveExpectingAbort runs a request whose handler must end in
@@ -280,6 +286,14 @@ func serveExpectingAbort(t *testing.T, h http.Handler, target string) {
 	}()
 	h.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, target, nil))
 	t.Fatalf("handler returned normally; want the connection aborted")
+}
+
+func TestPanicAfterFlushAbortsConnection(t *testing.T) {
+	h, logs := panicky(t)
+	serveExpectingAbort(t, h, "/api/v1/flush-boom")
+	if line := requestLog(t, logs); line["status"] != float64(http.StatusOK) || line["aborted"] != true {
+		t.Errorf("request log = %v, want aborted 200", line)
+	}
 }
 
 func TestPanicBecomesProblem(t *testing.T) {

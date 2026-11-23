@@ -39,7 +39,8 @@ func main() {
 	}()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	if err := run(ctx, os.Getenv, logger, nil); err != nil {
+	var lc net.ListenConfig
+	if err := run(ctx, os.Getenv, logger, lc.Listen); err != nil {
 		logger.Error("pulse-api failed", "error", err)
 		os.Exit(1)
 	}
@@ -71,9 +72,8 @@ func loadConfig(getenv func(string) string) (config, error) {
 	return cfg, nil
 }
 
-// run connects and serves until ctx is cancelled. listening, when
-// non-nil, receives the bound address once the API accepts connections.
-func run(ctx context.Context, getenv func(string) string, logger *slog.Logger, listening func(net.Addr)) error {
+// run opens the database pool and serves until ctx is cancelled.
+func run(ctx context.Context, getenv func(string) string, logger *slog.Logger, listen func(context.Context, string, string) (net.Listener, error)) error {
 	cfg, err := loadConfig(getenv)
 	if err != nil {
 		return err
@@ -84,13 +84,9 @@ func run(ctx context.Context, getenv func(string) string, logger *slog.Logger, l
 	}
 	defer pool.Close()
 
-	var lc net.ListenConfig
-	ln, err := lc.Listen(ctx, "tcp", ":"+strconv.Itoa(cfg.port))
+	ln, err := listen(ctx, "tcp", ":"+strconv.Itoa(cfg.port))
 	if err != nil {
 		return fmt.Errorf("listening on port %d: %w", cfg.port, err)
-	}
-	if listening != nil {
-		listening(ln.Addr())
 	}
 	return serve(ctx, ln, api.NewHandler(api.Options{DB: pool, Logger: logger}), logger, shutdownTimeout)
 }
