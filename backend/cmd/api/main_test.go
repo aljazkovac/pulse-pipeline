@@ -112,7 +112,7 @@ func TestLoadConfigSignIn(t *testing.T) {
 		{"no secret", signIn(map[string]string{"GOOGLE_WEB_OAUTH_CLIENT_SECRET": ""}), "without GOOGLE_WEB_OAUTH_CLIENT_SECRET", false, false, ""},
 		{"secret without ID", map[string]string{"DATABASE_URL": db, "GOOGLE_WEB_OAUTH_CLIENT_SECRET": "fake-client-secret"}, "without GOOGLE_WEB_OAUTH_CLIENT_ID", false, false, ""},
 		{"no public URL", signIn(map[string]string{"PULSE_PUBLIC_URL": ""}), "PULSE_PUBLIC_URL", false, false, ""},
-		{"empty allowlist", signIn(map[string]string{"PULSE_ALLOWED_EMAILS": " , "}), "nobody can sign in", false, false, ""},
+		{"empty allowlist", signIn(map[string]string{"PULSE_ALLOWED_EMAILS": " , "}), "", true, false, "https://pulse.example.com"},
 		{"malformed allowlist", signIn(map[string]string{"PULSE_ALLOWED_EMAILS": "fake-owner"}), "PULSE_ALLOWED_EMAILS", false, false, ""},
 	}
 	for _, tt := range tests {
@@ -133,7 +133,11 @@ func TestLoadConfigSignIn(t *testing.T) {
 			if cfg.google.enabled() != tt.wantSignIn || cfg.dev != tt.wantDev || cfg.publicURL != tt.wantPublic {
 				t.Errorf("cfg = %v, want sign-in %t, dev %t, public URL %q", cfg, tt.wantSignIn, tt.wantDev, tt.wantPublic)
 			}
-			if tt.wantSignIn && (!cfg.allowlist.Allows("FAKE-PARTNER@example.com") || cfg.allowlist.Len() != 2) {
+			if tt.name == "empty allowlist" {
+				if cfg.allowlist.Len() != 0 {
+					t.Fatal("expected an empty allowlist")
+				}
+			} else if tt.wantSignIn && (!cfg.allowlist.Allows("FAKE-PARTNER@example.com") || cfg.allowlist.Len() != 2) {
 				t.Errorf("allowlist = %v", cfg.allowlist)
 			}
 		})

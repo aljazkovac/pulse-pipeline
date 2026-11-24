@@ -136,8 +136,6 @@ func loadConfig(getenv func(string) string) (config, error) {
 		return config{}, errors.New("GOOGLE_WEB_OAUTH_CLIENT_ID is set without GOOGLE_WEB_OAUTH_CLIENT_SECRET")
 	case cfg.publicURL == "":
 		return config{}, errors.New("sign-in with GOOGLE_WEB_OAUTH_CLIENT_ID needs PULSE_PUBLIC_URL to build its redirect URI")
-	case cfg.allowlist.Len() == 0:
-		return config{}, errors.New("sign-in with GOOGLE_WEB_OAUTH_CLIENT_ID needs PULSE_ALLOWED_EMAILS: with an empty allowlist nobody can sign in")
 	}
 	return cfg, nil
 }

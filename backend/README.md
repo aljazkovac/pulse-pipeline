@@ -156,7 +156,7 @@ curl -i localhost:8080/api/v1/health
 | `ENV` | — | `development` selects the unprefixed, non-`Secure` cookies for plain HTTP. |
 | `GOOGLE_WEB_OAUTH_CLIENT_ID` / `GOOGLE_WEB_OAUTH_CLIENT_SECRET` | — | Web-application OAuth client for sign-in. Without the ID the API runs, but the sign-in routes answer `503` and nobody can sign in. |
 | `PULSE_PUBLIC_URL` | — | Origin browsers use (development: `http://localhost:5173`); redirect URIs are derived from it. Required with sign-in; must be HTTPS unless `ENV=development`. |
-| `PULSE_ALLOWED_EMAILS` | — | Comma-separated addresses allowed to sign in, compared case-insensitively. Required with sign-in. |
+| `PULSE_ALLOWED_EMAILS` | — | Comma-separated addresses allowed to sign in, compared case-insensitively. An empty list denies all Google sign-ins. |
 
 The API does not apply migrations, so its database role needs no DDL rights: `pulse-worker`
 migrates on startup, or run `make migrate-up`. `/api/v1/health` checks database connectivity only,

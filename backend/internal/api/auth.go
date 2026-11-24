@@ -292,7 +292,11 @@ func (s *server) FinishGoogleSignIn(ctx context.Context, req gen.FinishGoogleSig
 	// than leave it valid until it expires.
 	if old := cookieValue(ctx, s.cookies.session); old != "" {
 		if err := s.sessions.SignOut(ctx, old); err != nil {
-			s.logger.WarnContext(ctx, "sign-in: ending the previous session failed", "error", err)
+			s.logger.ErrorContext(ctx, "sign-in: ending the previous session failed", "error", err)
+			if cleanupErr := s.sessions.SignOut(ctx, signed.Token); cleanupErr != nil {
+				s.logger.ErrorContext(ctx, "sign-in: discarding the unissued session failed", "error", cleanupErr)
+			}
+			return problem(probUnavailable.problem("Could not replace your session. Try signing in again.")), nil
 		}
 	}
 	location := afterSignIn

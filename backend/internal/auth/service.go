@@ -74,7 +74,6 @@ type Store interface {
 	GetUserIDByIdentity(ctx context.Context, issuer, subject string) (uuid.UUID, error)
 	SignInIdentity(ctx context.Context, userID uuid.UUID, ident domain.Identity, tokenHash []byte, at, expiresAt time.Time) error
 	CreateUserWithIdentity(ctx context.Context, ident domain.Identity, timezone string, at time.Time) (domain.User, error)
-	CreateSession(ctx context.Context, userID uuid.UUID, tokenHash []byte, createdAt, expiresAt time.Time) error
 	GetSessionByTokenHash(ctx context.Context, tokenHash []byte) (domain.Session, error)
 	TouchSession(ctx context.Context, userID uuid.UUID, tokenHash []byte, at time.Time) error
 	DeleteSession(ctx context.Context, userID uuid.UUID, tokenHash []byte) error
@@ -142,10 +141,6 @@ func (s *Service) SignIn(ctx context.Context, c Claims) (SignedIn, error) {
 		if err != nil {
 			return SignedIn{}, err
 		}
-		if err := s.st.CreateSession(ctx, userID, hash, now, expires); err != nil {
-			return SignedIn{}, fmt.Errorf("auth: creating session: %w", err)
-		}
-		return SignedIn{UserID: userID, Token: token}, nil
 	case err != nil:
 		return SignedIn{}, fmt.Errorf("auth: signing in: %w", err)
 	}

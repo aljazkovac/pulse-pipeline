@@ -79,6 +79,32 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout 
 	if len(args) > 0 {
 		cmd, args = args[0], args[1:]
 	}
+	switch cmd {
+	case "bind-google-identity":
+		req, err := parseBindArgs(args)
+		if err != nil {
+			return err
+		}
+		clientID, secret := getenv("GOOGLE_OAUTH_CLIENT_ID"), getenv("GOOGLE_OAUTH_CLIENT_SECRET")
+		if clientID == "" || secret == "" {
+			return errors.New("bind-google-identity needs GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET (the Desktop app client)")
+		}
+		google, err := auth.NewGoogle(auth.GoogleOptions{ClientID: clientID, ClientSecret: secret})
+		if err != nil {
+			return err
+		}
+		return withStore(ctx, getenv("DATABASE_URL"), func(st *store.Store) error {
+			return bindGoogleIdentity(ctx, st, google, req, stdout, time.Now)
+		})
+	case "revoke-sessions":
+		userID, err := parseUserArgs("revoke-sessions", args)
+		if err != nil {
+			return err
+		}
+		return withStore(ctx, getenv("DATABASE_URL"), func(st *store.Store) error {
+			return revokeSessions(ctx, st, userID, stdout)
+		})
+	}
 	cfg, err := loadConfig(getenv)
 	if err != nil {
 		return err
@@ -139,29 +165,6 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout 
 		}
 		return withDeps(ctx, cfg, logger, func(d deps) error {
 			return connectGoogle(ctx, d, userID, stdout)
-		})
-	case "bind-google-identity":
-		req, err := parseBindArgs(args)
-		if err != nil {
-			return err
-		}
-		if !cfg.google.enabled() {
-			return errors.New("bind-google-identity needs GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET (the Desktop app client)")
-		}
-		google, err := auth.NewGoogle(auth.GoogleOptions{ClientID: cfg.google.clientID, ClientSecret: cfg.google.clientSecret})
-		if err != nil {
-			return err
-		}
-		return withDeps(ctx, cfg, logger, func(d deps) error {
-			return bindGoogleIdentity(ctx, d.store, google, req, stdout, time.Now)
-		})
-	case "revoke-sessions":
-		userID, err := parseUserArgs("revoke-sessions", args)
-		if err != nil {
-			return err
-		}
-		return withDeps(ctx, cfg, logger, func(d deps) error {
-			return revokeSessions(ctx, d.store, userID, stdout)
 		})
 	default:
 		return fmt.Errorf("%w: unknown command %q", errUsage, cmd)
@@ -502,10 +505,42 @@ type deps struct {
 // withDeps migrates the database, connects, and wires the providers, the
 // credential vault and the Syncer.
 func withDeps(ctx context.Context, cfg config, logger *slog.Logger, fn func(deps) error) error {
-	if err := store.MigrateUp(cfg.databaseURL); err != nil {
+	return withStore(ctx, cfg.databaseURL, func(st *store.Store) error {
+		d := deps{store: st}
+		var err error
+		syncCfg := sync.DefaultConfig()
+		syncCfg.Logger = logger
+		if cfg.keyring != nil {
+			d.vault = credentials.NewVault(d.store, cfg.keyring)
+			syncCfg.Credentials = d.vault
+		}
+
+		var providers []domain.HealthProvider
+		if cfg.enableMock {
+			providers = append(providers, mock.New(mock.Options{Seed: 1}))
+		}
+		if cfg.google.enabled() {
+			d.google, err = googlehealth.New(googlehealth.Options{ClientID: cfg.google.clientID, ClientSecret: cfg.google.clientSecret})
+			if err != nil {
+				return err
+			}
+			providers = append(providers, d.google)
+		}
+		if d.syncer, err = sync.New(d.store, providers, syncCfg); err != nil {
+			return err
+		}
+		return fn(d)
+	})
+}
+
+func withStore(ctx context.Context, databaseURL string, fn func(*store.Store) error) error {
+	if databaseURL == "" {
+		return errors.New("DATABASE_URL is required")
+	}
+	if err := store.MigrateUp(databaseURL); err != nil {
 		return err
 	}
-	pool, err := pgxpool.New(ctx, cfg.databaseURL)
+	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		return errors.New("connecting to database: invalid DATABASE_URL") // pgx errors can echo the URL
 	}
@@ -514,29 +549,7 @@ func withDeps(ctx context.Context, cfg config, logger *slog.Logger, fn func(deps
 		return fmt.Errorf("connecting to database: %w", err)
 	}
 
-	d := deps{store: store.New(pool)}
-	syncCfg := sync.DefaultConfig()
-	syncCfg.Logger = logger
-	if cfg.keyring != nil {
-		d.vault = credentials.NewVault(d.store, cfg.keyring)
-		syncCfg.Credentials = d.vault
-	}
-
-	var providers []domain.HealthProvider
-	if cfg.enableMock {
-		providers = append(providers, mock.New(mock.Options{Seed: 1}))
-	}
-	if cfg.google.enabled() {
-		d.google, err = googlehealth.New(googlehealth.Options{ClientID: cfg.google.clientID, ClientSecret: cfg.google.clientSecret})
-		if err != nil {
-			return err
-		}
-		providers = append(providers, d.google)
-	}
-	if d.syncer, err = sync.New(d.store, providers, syncCfg); err != nil {
-		return err
-	}
-	return fn(d)
+	return fn(store.New(pool))
 }
 
 // poll runs due syncs immediately and then every interval until ctx ends.

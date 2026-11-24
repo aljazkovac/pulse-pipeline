@@ -99,16 +99,6 @@ func (m *memStore) CreateUserWithIdentity(_ context.Context, ident domain.Identi
 	return u, nil
 }
 
-func (m *memStore) CreateSession(_ context.Context, userID uuid.UUID, hash []byte, createdAt, expiresAt time.Time) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(hash) != 32 {
-		return errors.New("bad hash length")
-	}
-	m.sessions[string(hash)] = domain.Session{UserID: userID, CreatedAt: createdAt, LastSeenAt: createdAt, ExpiresAt: expiresAt}
-	return nil
-}
-
 func (m *memStore) GetSessionByTokenHash(_ context.Context, hash []byte) (domain.Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -528,4 +518,27 @@ func (s staleLookup) GetUserIDByIdentity(_ context.Context, issuer, subject stri
 		return id, nil
 	}
 	return uuid.Nil, store.ErrNotFound
+}
+
+type replaceBeforeSession struct {
+	*memStore
+}
+
+func (s replaceBeforeSession) SignInIdentity(ctx context.Context, userID uuid.UUID, ident domain.Identity, hash []byte, at, expiresAt time.Time) error {
+	delete(s.identities, [2]string{ident.Issuer, ident.Subject})
+	return s.memStore.SignInIdentity(ctx, userID, ident, hash, at, expiresAt)
+}
+
+func TestFirstSignInChecksBindingBeforeIssuingSession(t *testing.T) {
+	for _, concurrentEnrollment := range []bool{false, true} {
+		st := newMemStore()
+		if concurrentEnrollment {
+			st.raceWinner = uuid.New()
+		}
+		svc := auth.NewService(replaceBeforeSession{st}, allow(t, "fake-user@gmail.com"), func() time.Time { return now })
+		_, err := svc.SignIn(ctxT(t), gmailClaims())
+		if !errors.Is(err, store.ErrNotFound) || len(st.sessions) != 0 {
+			t.Fatalf("concurrent enrollment %t: err = %v, sessions = %d", concurrentEnrollment, err, len(st.sessions))
+		}
+	}
 }
