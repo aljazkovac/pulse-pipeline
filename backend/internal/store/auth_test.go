@@ -233,6 +233,9 @@ func TestSessions_LifecycleAndTenantIsolation(t *testing.T) {
 	if err := testStore.TouchSession(ctx, alice.ID, h, t0.Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
+	if err := testStore.TouchSession(ctx, alice.ID, h, t0.Add(2*time.Hour+time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	if err := testStore.TouchSession(ctx, alice.ID, h, t0.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +283,7 @@ func TestDeleteExpiredSessions_RemovesOnlyExpiredAcrossUsers(t *testing.T) {
 		"fresh":            {alice.ID, now.Add(-time.Hour), now.Add(-time.Hour), now.Add(time.Hour), true},
 		"absolute expired": {alice.ID, now.Add(-2 * time.Hour), now.Add(-time.Hour), now, false},
 		"idle expired":     {bob.ID, now.Add(-idle - time.Hour), now.Add(-idle), now.Add(time.Hour), false},
-		"idle almost":      {bob.ID, now.Add(-idle), now.Add(-idle + time.Second), now.Add(time.Hour), true},
+		"idle almost":      {bob.ID, now.Add(-idle - time.Hour), now.Add(-idle + time.Second), now.Add(time.Hour), true},
 	}
 	hashes := map[string][]byte{}
 	for name, s := range sessions {

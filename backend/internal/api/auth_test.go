@@ -577,3 +577,15 @@ func TestDevelopmentCookiesOnFailureAndSignOut(t *testing.T) {
 		t.Errorf("sign-outs = %v", a.sessions.signOuts)
 	}
 }
+
+func TestSignInPreservesCookieWhenRevocationFails(t *testing.T) {
+	a := newAuthHarness(t, false)
+	a.sessions.signOutEr = errors.New("database unavailable")
+	cookies := loginFlow(false)
+	cookies[cookieNames[false][0]] = bobToken
+	rec := a.do(t, http.MethodGet, callback(fakeCode, fakeState), cookies)
+	decodeProblem(t, rec, probUnavailable)
+	if setCookies(rec)[cookieNames[false][0]] != nil || !slices.Equal(a.sessions.signOuts, []string{bobToken, newTokenValue}) {
+		t.Fatal("failed rotation must preserve the browser cookie and discard the unissued session")
+	}
+}
