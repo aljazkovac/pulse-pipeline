@@ -68,7 +68,7 @@ WHERE token_hash = @token_hash;
 -- name: TouchSession :execrows
 UPDATE sessions
 SET last_seen_at = @last_seen_at
-WHERE token_hash = @token_hash AND user_id = @user_id AND last_seen_at <= @last_seen_at::timestamptz - interval '1 hour';
+WHERE token_hash = @token_hash AND user_id = @user_id AND last_seen_at + interval '1 hour' <= @last_seen_at;
 
 -- name: DeleteSession :execrows
 DELETE FROM sessions

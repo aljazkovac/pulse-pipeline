@@ -333,7 +333,7 @@ func (q *Queries) RecordIdentityLogin(ctx context.Context, arg RecordIdentityLog
 const touchSession = `-- name: TouchSession :execrows
 UPDATE sessions
 SET last_seen_at = $1
-WHERE token_hash = $2 AND user_id = $3 AND last_seen_at <= $1::timestamptz - interval '1 hour'
+WHERE token_hash = $2 AND user_id = $3 AND last_seen_at + interval '1 hour' <= $1
 `
 
 type TouchSessionParams struct {
