@@ -1,7 +1,7 @@
 # Pulse Pipeline — Backend & Sync Worker (`backend/`)
 
 Go service containing:
-- `cmd/api`: HTTP/REST API serving the Web/PWA frontend under `/api/v1` (see [API](#api); the Google OAuth web callback arrives with Phase 2 auth, until then accounts are linked with `pulse-worker connect-google`).
+- `cmd/api`: HTTP/REST API serving the Web/PWA frontend under `/api/v1`, with Google sign-in and server-side sessions (see [API](#api)). Google Health is still linked with `pulse-worker connect-google` until web linking ships with the Connections view.
 - `cmd/worker`: Nightly health data ingestion service pulling from the Google Health API (`HealthProvider` adapter).
 - `internal/`: Domain models, provider adapters, `sqlc` database repositories, and OpenTelemetry / OpenFeature integration.
 - `migrations/`: PostgreSQL schema migrations (`golang-migrate`).
@@ -97,7 +97,7 @@ go run ./cmd/worker sync -user <ID> -provider mock -from 2026-01-01 -to 2026-01-
 | `PULSE_SYNC_POLL_INTERVAL` | `1m` | How often `run` checks for due connections. |
 | `PULSE_ENABLE_MOCK_PROVIDER` | `false` | Register the synthetic `mock` provider. |
 | `ENV` | — | `seed-dev` refuses to run unless it is `development`. |
-| `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` | — | Desktop-app OAuth client; when both are set the `google_health` provider is registered and `connect-google` works. |
+| `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` | — | Desktop-app OAuth client; when both are set the `google_health` provider is registered and `connect-google` and `bind-google-identity` work. |
 | `TOKEN_ENCRYPTION_KEY` | — | Base64 of 32 random bytes; encrypts OAuth tokens at rest. Required with the Google provider. |
 | `TOKEN_ENCRYPTION_KEY_VERSION` | `1` | Version stored with each ciphertext; raise it when rotating. |
 | `TOKEN_ENCRYPTION_PREVIOUS_KEYS` | — | `version:base64key,…` of retired keys still needed to read older rows. |
@@ -130,11 +130,17 @@ Conventions every endpoint gets from `internal/api`:
   such as `Set-Cookie`) and is logged with its stack. If the reply had already started, the
   connection is aborted instead, so a truncated body cannot pass as complete.
 - Non-canonical paths (`//`, `..`) under `/api` are `not-found`, not redirected.
+- State-changing requests (`POST`, `PUT`, `PATCH`, `DELETE`) from another origin are rejected
+  with a `cross-origin-request` problem by `http.CrossOriginProtection`, which wraps the mux.
 
-| Endpoint | Purpose |
-| :--- | :--- |
-| `GET /healthz` | Liveness probe; does not touch the database. |
-| `GET /api/v1/health` | Readiness: pings the database, `503` `unavailable` problem when it is down. |
+| Endpoint | Session | Purpose |
+| :--- | :--- | :--- |
+| `GET /healthz` | — | Liveness probe; does not touch the database. |
+| `GET /api/v1/health` | — | Readiness: pings the database, `503` `unavailable` problem when it is down. |
+| `GET /api/v1/auth/google/login` | — | Starts Google sign-in: redirects to Google and sets the ten-minute OAuth flow cookie. |
+| `GET /api/v1/auth/google/callback` | — | Google redirects here; on success sets the session cookie and redirects to `/`. |
+| `POST /api/v1/auth/logout` | — | Ends the session, if any, and expires its cookie (`204`). |
+| `GET /api/v1/me` | required | The signed-in user's email and timezone. |
 
 ```bash
 export DATABASE_URL=postgres://pulse:pulse_dev_password@localhost:5432/pulse_pipeline?sslmode=disable
@@ -147,6 +153,10 @@ curl -i localhost:8080/api/v1/health
 | :--- | :--- | :--- |
 | `DATABASE_URL` | — (required) | PostgreSQL URL. |
 | `API_PORT` | `8080` | Listen port. The web dev server proxies `/api` here. |
+| `ENV` | — | `development` selects the unprefixed, non-`Secure` cookies for plain HTTP. |
+| `GOOGLE_WEB_OAUTH_CLIENT_ID` / `GOOGLE_WEB_OAUTH_CLIENT_SECRET` | — | Web-application OAuth client for sign-in. Without the ID the API runs, but the sign-in routes answer `503` and nobody can sign in. |
+| `PULSE_PUBLIC_URL` | — | Origin browsers use (development: `http://localhost:5173`); redirect URIs are derived from it. Required with sign-in; must be HTTPS unless `ENV=development`. |
+| `PULSE_ALLOWED_EMAILS` | — | Comma-separated addresses allowed to sign in, compared case-insensitively. An empty list denies all Google sign-ins. |
 
 The API does not apply migrations, so its database role needs no DDL rights: `pulse-worker`
 migrates on startup, or run `make migrate-up`. `/api/v1/health` checks database connectivity only,
@@ -154,6 +164,68 @@ not the schema version.
 
 On `SIGINT`/`SIGTERM` the API stops accepting connections and drains in-flight requests for up to
 15 seconds before exiting (a second signal exits at once).
+
+### Authentication
+
+Sign-in follows [ADR-0005](../docs/adr/0005-api-auth-and-read-model.md) §2–3 (`internal/auth`):
+
+- **Google sign-in** uses OpenID Connect with PKCE and only the `openid email` scopes; it never
+  asks for health data. The ID token comes straight from Google's token endpoint over TLS, so its
+  claims (`iss`, `aud`, `exp`, `email_verified`) are checked without verifying the signature.
+- **Who may sign in:** the email must be in `PULSE_ALLOWED_EMAILS`, checked on every sign-in. A
+  returning Google identity, found by its `(issuer, subject)` in `user_identities`, signs in to its
+  user. A new identity creates a user only when Google is authoritative for its email (Gmail or a
+  Google Workspace account) and neither a user nor another user's Google identity has that email
+  yet. Every other case is refused with `403 sign-in-denied` and changes nothing. ID tokens must
+  name exactly this client as their audience.
+- **Sessions** live in the `sessions` table. The cookie holds 32 random bytes; the table stores only
+  their SHA-256. Sessions end after 30 days idle or 90 days after sign-in, `last_seen_at` is
+  written at most hourly. At startup and hourly the API deletes expired sessions and the
+  sessions of users whose sign-in identities are all off `PULSE_ALLOWED_EMAILS`, so removing an
+  address and restarting the API signs that person out (a failed sweep retries after a minute).
+  An empty allowlist therefore signs out everyone who signed in with Google; the API warns at
+  startup. Each sign-in issues a new token and ends
+  the browser's previous session.
+- **Cookies** are `HttpOnly` and `SameSite=Lax`. In production they are `__Host-pulse_session`
+  and `__Host-pulse_oauth` with `Secure`, so `PULSE_PUBLIC_URL` must be HTTPS. With
+  `ENV=development` they are `pulse_session` and `pulse_oauth` without `Secure`, for plain
+  `http://localhost`.
+- **Scoping:** every operation needs a session unless the contract opts it out with
+  `security: []`; the middleware enforces the contract's `security` (generated into
+  `gen.SessionScopes`), and handlers read the user ID only from the request context. No operation
+  accepts a user ID. `GetSessionByTokenHash` and `GetUserIDByIdentity` are the only queries that
+  run before the user is known (the authentication boundary in `AGENTS.md` §1.1).
+
+**Setting up Google sign-in.** In the Google Cloud project that already holds the Desktop client,
+create a second OAuth client of type **Web application** and register the redirect URI
+`<PULSE_PUBLIC_URL>/api/v1/auth/google/callback`, for local development
+`http://localhost:5173/api/v1/auth/google/callback` (the Vite dev server proxies `/api` to the
+API). Put its ID and secret, `PULSE_PUBLIC_URL` and `PULSE_ALLOWED_EMAILS` in your local `.env`.
+pulse-api logs the redirect URI it uses at startup.
+
+**Keeping a Phase 1 user's history.** If your email already belongs to a user (for example one
+created before sign-in existed), signing in is refused, because a new Google identity never
+takes over an existing account. Bind your Google account to that user once, with the Desktop
+client configured as for `connect-google`:
+
+```bash
+go run ./cmd/worker bind-google-identity -user PULSE_USER_ID
+```
+
+The account owner signs in to Google in a browser on the same machine (loopback redirect, as with
+`connect-google`). The operator must know that person owns the Pulse user. For an address that is
+not Gmail or Google Workspace, first confirm that the owner controls the mailbox (for example with
+a one-time code sent to it) and add `-mailbox-verified`. Binding a different Google account later
+needs `-replace`, which also signs the user out of every session; a sign-in racing the replacement
+cannot keep a session either.
+
+**Signing someone out.** `go run ./cmd/worker revoke-sessions -user PULSE_USER_ID` ends every
+session of one user, for example after a lost phone. They can sign in again unless you also remove
+their address from `PULSE_ALLOWED_EMAILS`, which by itself signs them out at the next API restart.
+
+**Enrolling a non-Google address.** A Google account whose address is not Gmail or Workspace cannot
+create its own user. After the mailbox check, the operator enrolls it with
+`bind-google-identity -new-user -mailbox-verified`, then adds the address to `PULSE_ALLOWED_EMAILS`.
 
 ## Database Workflow
 
@@ -166,5 +238,9 @@ The schema and its rationale are in [ADR-0002](../docs/adr/0002-health-data-sche
 | Start local infrastructure, wait for PostgreSQL, and apply migrations | `make up && make migrate-up` |
 | Run integration tests | `make test` (each package with DB tests starts a throwaway PostgreSQL 17 via Testcontainers, see `internal/testdb`; requires Docker) |
 
-Every health-data query must filter by `user_id`. The only cross-user query is
-`ListConnectionsDueForSync`, reserved for the nightly scheduler (`AGENTS.md` §1.1).
+Every query must filter by `user_id`, with the exceptions `AGENTS.md` §1.1 allows, none of which
+returns health data or tokens: `ListConnectionsDueForSync` (the nightly scheduler) and
+`DeleteExpiredSessions` and `DeleteSessionsOutsideAllowlist` (the API's session sweeps) are system
+context, and `GetSessionByTokenHash`,
+`GetUserIDByIdentity` and the enrollment check `CreateUserUnlessEmailBound` are the authentication
+boundary that turns a credential into a user ID.

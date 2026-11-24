@@ -84,7 +84,11 @@ func resetHeaders(w http.ResponseWriter) {
 // The line holds method, route pattern, status and duration only (ADR-0005
 // §1): never the URL (OAuth callbacks carry code and state in the query),
 // cookies, headers or bodies.
-func observe(logger *slog.Logger, mux *http.ServeMux) http.Handler {
+//
+// h must be, or wrap without cloning the request, the *http.ServeMux that
+// serves the contract: unmatched /api requests are recognized by the empty
+// pattern the mux leaves on them.
+func observe(logger *slog.Logger, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w}
@@ -136,7 +140,7 @@ func observe(logger *slog.Logger, mux *http.ServeMux) http.Handler {
 			}
 		}()
 
-		dispatch(mux, sw, r)
+		dispatch(h, sw, r)
 	})
 }
 
@@ -148,7 +152,7 @@ func routeLabel(pattern string) string {
 }
 
 // dispatch preserves ServeMux path values and translates its unmatched API replies.
-func dispatch(mux *http.ServeMux, w *statusWriter, r *http.Request) {
+func dispatch(mux http.Handler, w *statusWriter, r *http.Request) {
 	if !isAPIPath(r.URL.Path) {
 		mux.ServeHTTP(w, r)
 		return

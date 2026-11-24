@@ -5,11 +5,16 @@
 //	    [-from YYYY-MM-DD -to YYYY-MM-DD]    ...or backfill a date range
 //	pulse-worker seed-dev [-email E] [-tz Z] create a local user with a mock connection
 //	pulse-worker connect-google -user ID     link a Google Health account (ADR-0004 §3)
+//	pulse-worker bind-google-identity (-user ID [-replace] | -new-user) [-mailbox-verified]
+//	                                         bind a Google sign-in identity to a user,
+//	                                         or enroll a new one (ADR-0005 §2)
+//	pulse-worker revoke-sessions -user ID    sign a user out of every session (ADR-0005 §2)
 //
 // Environment: DATABASE_URL (required), PULSE_SYNC_POLL_INTERVAL (default 1m),
 // PULSE_ENABLE_MOCK_PROVIDER (default false), ENV (seed-dev needs "development"),
-// GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET (register the Google
-// Health provider), TOKEN_ENCRYPTION_KEY, TOKEN_ENCRYPTION_KEY_VERSION and
+// GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET (the Desktop app
+// client: registers the Google Health provider and serves the loopback
+// commands), TOKEN_ENCRYPTION_KEY, TOKEN_ENCRYPTION_KEY_VERSION and
 // TOKEN_ENCRYPTION_PREVIOUS_KEYS (encrypted token storage, required with Google).
 // Every command applies pending migrations first.
 package main
@@ -24,12 +29,14 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/auth"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/credentials"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/domain"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/provider/googlehealth"
@@ -63,12 +70,40 @@ const usage = `usage:
   pulse-worker [run]
   pulse-worker sync -user ID -provider PROVIDER [-from YYYY-MM-DD -to YYYY-MM-DD]
   pulse-worker seed-dev [-email EMAIL] [-tz IANA_ZONE]
-  pulse-worker connect-google -user ID`
+  pulse-worker connect-google -user ID
+  pulse-worker bind-google-identity (-user ID [-replace] | -new-user) [-mailbox-verified]
+  pulse-worker revoke-sessions -user ID`
 
 func run(ctx context.Context, args []string, getenv func(string) string, stdout io.Writer, logger *slog.Logger) error {
 	cmd := "run"
 	if len(args) > 0 {
 		cmd, args = args[0], args[1:]
+	}
+	switch cmd {
+	case "bind-google-identity":
+		req, err := parseBindArgs(args)
+		if err != nil {
+			return err
+		}
+		clientID, secret := getenv("GOOGLE_OAUTH_CLIENT_ID"), getenv("GOOGLE_OAUTH_CLIENT_SECRET")
+		if clientID == "" || secret == "" {
+			return errors.New("bind-google-identity needs GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET (the Desktop app client)")
+		}
+		google, err := auth.NewGoogle(auth.GoogleOptions{ClientID: clientID, ClientSecret: secret})
+		if err != nil {
+			return err
+		}
+		return withStore(ctx, getenv("DATABASE_URL"), func(st *store.Store) error {
+			return bindGoogleIdentity(ctx, st, google, req, stdout, time.Now)
+		})
+	case "revoke-sessions":
+		userID, err := parseUserArgs("revoke-sessions", args)
+		if err != nil {
+			return err
+		}
+		return withStore(ctx, getenv("DATABASE_URL"), func(st *store.Store) error {
+			return revokeSessions(ctx, st, userID, stdout)
+		})
 	}
 	cfg, err := loadConfig(getenv)
 	if err != nil {
@@ -156,6 +191,165 @@ func connectGoogle(ctx context.Context, d deps, userID uuid.UUID, stdout io.Writ
 	}
 	_, err = fmt.Fprintf(stdout, "Linked Google Health for user %s (connection %s). The worker syncs it on its next poll.\n", u.ID, connectionID)
 	return err
+}
+
+// sessionRevoker is the subset of *store.Store revoke-sessions needs.
+type sessionRevoker interface {
+	GetUser(ctx context.Context, id uuid.UUID) (domain.User, error)
+	DeleteUserSessions(ctx context.Context, userID uuid.UUID) (int64, error)
+}
+
+// revokeSessions signs a user out of every browser, for example after a
+// lost phone (ADR-0005 §2). The user can sign in again unless their address
+// is also removed from PULSE_ALLOWED_EMAILS.
+func revokeSessions(ctx context.Context, st sessionRevoker, userID uuid.UUID, stdout io.Writer) error {
+	u, err := st.GetUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	n, err := st.DeleteUserSessions(ctx, u.ID)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(stdout, "Signed user %s (%s) out of %d sessions.\n", u.ID, u.Email, n)
+	return err
+}
+
+// identityBinder is the subset of *store.Store bind-google-identity needs.
+type identityBinder interface {
+	GetUser(ctx context.Context, id uuid.UUID) (domain.User, error)
+	BindIdentity(ctx context.Context, userID uuid.UUID, ident domain.Identity, replace bool, at time.Time) (store.BindResult, error)
+	CreateUserWithIdentity(ctx context.Context, ident domain.Identity, timezone string, at time.Time) (domain.User, error)
+}
+
+// loopbackSignIn is the subset of *auth.Google bind-google-identity needs.
+type loopbackSignIn interface {
+	SignInLoopback(ctx context.Context, show func(authURL string) error) (auth.Claims, error)
+}
+
+// bindRequest is a parsed bind-google-identity invocation: either userID or
+// newUser is set.
+type bindRequest struct {
+	userID          uuid.UUID
+	newUser         bool
+	replace         bool
+	mailboxVerified bool
+}
+
+// bindGoogleIdentity is the operator path of ADR-0005 §2. The account owner
+// proves control of a Google account by signing in through a loopback
+// redirect, and the identity is then either bound to an existing user, so
+// the owner keeps that user's history, or (-new-user) enrolled as a new user.
+// The operator is responsible for knowing the owner is the right person. For
+// an address Google is not authoritative for, the operator must also have
+// checked the mailbox and pass -mailbox-verified.
+func bindGoogleIdentity(ctx context.Context, st identityBinder, google loopbackSignIn, req bindRequest, stdout io.Writer, now func() time.Time) error {
+	target := "a new user"
+	var u domain.User
+	if !req.newUser {
+		var err error
+		if u, err = st.GetUser(ctx, req.userID); err != nil {
+			return err
+		}
+		target = fmt.Sprintf("user %s (%s)", u.ID, u.Email)
+	}
+	claims, err := google.SignInLoopback(ctx, func(authURL string) error {
+		_, err := fmt.Fprintf(stdout, "Binding a Google sign-in identity to %s.\n"+
+			"Have the account owner open this URL in a browser on this machine and choose their Google account:\n\n  %s\n\n"+
+			"Waiting for Google to redirect back...\n", target, authURL)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	switch {
+	case !claims.EmailVerified:
+		return fmt.Errorf("the Google account's address %s is not verified; it cannot be bound", claims.Email)
+	case !claims.GoogleAuthoritative() && !req.mailboxVerified:
+		return fmt.Errorf("the address %s is not a Gmail or Google Workspace address, so Google cannot vouch for it: confirm that the account owner controls this mailbox "+
+			"(for example with a one-time code sent to it), then run again with -mailbox-verified", claims.Email)
+	}
+	// Taken after the interactive wait, which can last minutes.
+	at := now()
+
+	if req.newUser {
+		created, err := st.CreateUserWithIdentity(ctx, claims.Identity, auth.NewUserTimezone, at)
+		switch {
+		case errors.Is(err, store.ErrEmailTaken):
+			return fmt.Errorf("%s already belongs to a Pulse user; bind the identity to that user with -user instead: %w", claims.Email, err)
+		case errors.Is(err, store.ErrIdentityTaken):
+			return fmt.Errorf("this Google account (%s) is already bound to a Pulse user: %w", claims.Email, err)
+		case err != nil:
+			return err
+		}
+		_, err = fmt.Fprintf(stdout, "Enrolled user %s for the Google account %s (subject %s).\n", created.ID, claims.Email, claims.Subject)
+		if err != nil {
+			return err
+		}
+		return allowlistReminder(stdout, claims.Email)
+	}
+
+	res, err := st.BindIdentity(ctx, u.ID, claims.Identity, req.replace, at)
+	switch {
+	case errors.Is(err, store.ErrIdentityBound):
+		return fmt.Errorf("user %s already has a different Google identity; run again with -replace to replace it and sign out all the user's sessions: %w", u.ID, err)
+	case errors.Is(err, store.ErrIdentityTaken):
+		return fmt.Errorf("this Google account (%s) is already bound to another Pulse user: %w", claims.Email, err)
+	case err != nil:
+		return err
+	}
+
+	switch {
+	case !res.Changed:
+		_, err = fmt.Fprintf(stdout, "The Google account %s was already bound to user %s; nothing changed.\n", claims.Email, u.ID)
+	case req.replace:
+		_, err = fmt.Fprintf(stdout, "Replaced the Google identity of user %s with %s (subject %s) and signed out %d sessions.\n",
+			u.ID, claims.Email, claims.Subject, res.RevokedSessions)
+	default:
+		_, err = fmt.Fprintf(stdout, "Bound the Google account %s (subject %s) to user %s.\n", claims.Email, claims.Subject, u.ID)
+	}
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(claims.Email, u.Email) {
+		if _, err := fmt.Fprintf(stdout, "Note: the Google account's address differs from the user's address %s.\n", u.Email); err != nil {
+			return err
+		}
+	}
+	return allowlistReminder(stdout, claims.Email)
+}
+
+func allowlistReminder(stdout io.Writer, email string) error {
+	_, err := fmt.Fprintf(stdout, "Sign-in also requires %s in the API's PULSE_ALLOWED_EMAILS.\n", email)
+	return err
+}
+
+func parseBindArgs(args []string) (bindRequest, error) {
+	fs := flag.NewFlagSet("bind-google-identity", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	user := fs.String("user", "", "ID of the existing user to bind to")
+	var req bindRequest
+	fs.BoolVar(&req.newUser, "new-user", false, "enroll a new user for the Google account instead")
+	fs.BoolVar(&req.replace, "replace", false, "replace the user's current Google identity and sign out all their sessions")
+	fs.BoolVar(&req.mailboxVerified, "mailbox-verified", false, "the operator checked mailbox ownership of a non-Google address")
+	if err := fs.Parse(args); err != nil {
+		return bindRequest{}, fmt.Errorf("%w: bind-google-identity: %v", errUsage, err)
+	}
+	if fs.NArg() > 0 {
+		return bindRequest{}, fmt.Errorf("%w: bind-google-identity: unexpected argument %q", errUsage, fs.Arg(0))
+	}
+	if req.newUser {
+		if *user != "" || req.replace {
+			return bindRequest{}, fmt.Errorf("%w: bind-google-identity: -new-user takes neither -user nor -replace", errUsage)
+		}
+		return req, nil
+	}
+	id, err := uuid.Parse(*user)
+	if err != nil {
+		return bindRequest{}, fmt.Errorf("%w: bind-google-identity: -user must be a UUID (or use -new-user)", errUsage)
+	}
+	req.userID = id
+	return req, nil
 }
 
 type config struct {
@@ -280,19 +474,22 @@ func parseSeedArgs(args []string) (email, tz string, err error) {
 	return email, tz, nil
 }
 
-func parseConnectArgs(args []string) (uuid.UUID, error) {
-	fs := flag.NewFlagSet("connect-google", flag.ContinueOnError)
+func parseConnectArgs(args []string) (uuid.UUID, error) { return parseUserArgs("connect-google", args) }
+
+// parseUserArgs parses the arguments of a command that takes only -user ID.
+func parseUserArgs(cmd string, args []string) (uuid.UUID, error) {
+	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	user := fs.String("user", "", "user ID")
 	if err := fs.Parse(args); err != nil {
-		return uuid.Nil, fmt.Errorf("%w: connect-google: %v", errUsage, err)
+		return uuid.Nil, fmt.Errorf("%w: %s: %v", errUsage, cmd, err)
 	}
 	if fs.NArg() > 0 {
-		return uuid.Nil, fmt.Errorf("%w: connect-google: unexpected argument %q", errUsage, fs.Arg(0))
+		return uuid.Nil, fmt.Errorf("%w: %s: unexpected argument %q", errUsage, cmd, fs.Arg(0))
 	}
 	id, err := uuid.Parse(*user)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("%w: connect-google: -user must be a UUID", errUsage)
+		return uuid.Nil, fmt.Errorf("%w: %s: -user must be a UUID", errUsage, cmd)
 	}
 	return id, nil
 }
@@ -308,10 +505,42 @@ type deps struct {
 // withDeps migrates the database, connects, and wires the providers, the
 // credential vault and the Syncer.
 func withDeps(ctx context.Context, cfg config, logger *slog.Logger, fn func(deps) error) error {
-	if err := store.MigrateUp(cfg.databaseURL); err != nil {
+	return withStore(ctx, cfg.databaseURL, func(st *store.Store) error {
+		d := deps{store: st}
+		var err error
+		syncCfg := sync.DefaultConfig()
+		syncCfg.Logger = logger
+		if cfg.keyring != nil {
+			d.vault = credentials.NewVault(d.store, cfg.keyring)
+			syncCfg.Credentials = d.vault
+		}
+
+		var providers []domain.HealthProvider
+		if cfg.enableMock {
+			providers = append(providers, mock.New(mock.Options{Seed: 1}))
+		}
+		if cfg.google.enabled() {
+			d.google, err = googlehealth.New(googlehealth.Options{ClientID: cfg.google.clientID, ClientSecret: cfg.google.clientSecret})
+			if err != nil {
+				return err
+			}
+			providers = append(providers, d.google)
+		}
+		if d.syncer, err = sync.New(d.store, providers, syncCfg); err != nil {
+			return err
+		}
+		return fn(d)
+	})
+}
+
+func withStore(ctx context.Context, databaseURL string, fn func(*store.Store) error) error {
+	if databaseURL == "" {
+		return errors.New("DATABASE_URL is required")
+	}
+	if err := store.MigrateUp(databaseURL); err != nil {
 		return err
 	}
-	pool, err := pgxpool.New(ctx, cfg.databaseURL)
+	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		return errors.New("connecting to database: invalid DATABASE_URL") // pgx errors can echo the URL
 	}
@@ -320,29 +549,7 @@ func withDeps(ctx context.Context, cfg config, logger *slog.Logger, fn func(deps
 		return fmt.Errorf("connecting to database: %w", err)
 	}
 
-	d := deps{store: store.New(pool)}
-	syncCfg := sync.DefaultConfig()
-	syncCfg.Logger = logger
-	if cfg.keyring != nil {
-		d.vault = credentials.NewVault(d.store, cfg.keyring)
-		syncCfg.Credentials = d.vault
-	}
-
-	var providers []domain.HealthProvider
-	if cfg.enableMock {
-		providers = append(providers, mock.New(mock.Options{Seed: 1}))
-	}
-	if cfg.google.enabled() {
-		d.google, err = googlehealth.New(googlehealth.Options{ClientID: cfg.google.clientID, ClientSecret: cfg.google.clientSecret})
-		if err != nil {
-			return err
-		}
-		providers = append(providers, d.google)
-	}
-	if d.syncer, err = sync.New(d.store, providers, syncCfg); err != nil {
-		return err
-	}
-	return fn(d)
+	return fn(store.New(pool))
 }
 
 // poll runs due syncs immediately and then every interval until ctx ends.

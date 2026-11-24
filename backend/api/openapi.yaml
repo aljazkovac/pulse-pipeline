@@ -15,8 +15,17 @@ info:
     - Every response carries `Cache-Control: no-store`.
     - Errors are RFC 9457 `application/problem+json` with a stable `type` per error;
       the types are listed in `docs/api/problems.md`.
+
+    Authentication (ADR-0005 §2–3): every operation needs the session cookie unless it
+    declares `security: []`. The signed-in user is always the session's user: no operation
+    accepts a user ID. State-changing requests from another origin are rejected with a
+    `cross-origin-request` problem.
 servers:
   - url: /api/v1
+
+# Every operation requires a session unless it opts out with `security: []`.
+security:
+  - session: []
 
 paths:
   /health:
@@ -28,6 +37,7 @@ paths:
         Needs no session. Container liveness probes use `/healthz` outside `/api` instead,
         which does not touch the database.
       tags: [system]
+      security: []
       responses:
         '200':
           description: The API and its database are reachable.
@@ -40,8 +50,140 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
+  /auth/google/login:
+    get:
+      operationId: startGoogleSignIn
+      summary: Start Google sign-in
+      description: |
+        Redirects the browser to Google's account chooser to sign in with OpenID Connect
+        (authorization code, PKCE `S256`, scopes `openid email` only). Sets the ten-minute
+        OAuth flow cookie (`__Host-pulse_oauth`; `pulse_oauth` with `ENV=development`)
+        holding the state and PKCE verifier. Signing in never asks for health data;
+        linking a wearable is a separate consent.
+      tags: [auth]
+      security: []
+      responses:
+        '302':
+          description: Redirect to Google. Sets the OAuth flow cookie.
+          headers:
+            Location:
+              description: Google's consent URL.
+              schema:
+                type: string
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /auth/google/callback:
+    get:
+      operationId: finishGoogleSignIn
+      summary: Finish Google sign-in
+      description: |
+        Google redirects the browser here. The API checks the flow cookie and `state`,
+        exchanges the code, checks the ID token and the `PULSE_ALLOWED_EMAILS` allowlist,
+        then signs the user in: a returning Google identity signs in to its user, and a new
+        one creates a user only when Google is authoritative for the email (Gmail or
+        Google Workspace) and no user has it yet. On success it sets a new session cookie
+        (`__Host-pulse_session`; `pulse_session` with `ENV=development`) and redirects to
+        the web app. Every response expires the flow cookie, so a callback cannot be replayed.
+      tags: [auth]
+      security: []
+      parameters:
+        - name: code
+          in: query
+          required: false
+          description: Google's authorization code.
+          schema:
+            type: string
+        - name: state
+          in: query
+          required: false
+          description: The state sent with the authorization request.
+          schema:
+            type: string
+        - name: error
+          in: query
+          required: false
+          description: Google's OAuth error code, such as `access_denied` when the user cancelled.
+          schema:
+            type: string
+      responses:
+        '303':
+          description: Signed in. Sets the session cookie and redirects to the web app.
+          headers:
+            Location:
+              description: The web app's root, `/`.
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/SignInFailed'
+        '403':
+          $ref: '#/components/responses/SignInDenied'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /auth/logout:
+    post:
+      operationId: signOut
+      summary: Sign out
+      description: |
+        Deletes the current session, if any, and expires the session cookie. Succeeds without
+        a valid session, so signing out is idempotent. Rejected when sent from another origin.
+      tags: [auth]
+      security: []
+      responses:
+        '204':
+          description: Signed out. Expires the session cookie.
+        '403':
+          $ref: '#/components/responses/CrossOriginRequest'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /me:
+    get:
+      operationId: getMe
+      summary: The signed-in user's profile
+      tags: [profile]
+      responses:
+        '200':
+          description: The profile of the session's user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        default:
+          $ref: '#/components/responses/Problem'
+
 components:
+  securitySchemes:
+    session:
+      type: apiKey
+      in: cookie
+      name: __Host-pulse_session
+      description: |
+        The `HttpOnly`, `Secure`, `SameSite=Lax` session cookie set by Google sign-in: 32 random
+        bytes, base64url-encoded; the server stores only their SHA-256. Sessions end after 30 days
+        idle or 90 days after sign-in. With `ENV=development` the cookie is `pulse_session`
+        without `Secure`, so plain `http://localhost` works.
+
   schemas:
+    Me:
+      type: object
+      additionalProperties: false
+      required: [email, timezone]
+      properties:
+        email:
+          type: string
+          description: The account's email address.
+        timezone:
+          type: string
+          description: IANA timezone for local days, e.g. `Europe/Stockholm`. `UTC` until the user chooses one.
+
     Health:
       type: object
       additionalProperties: false
@@ -76,6 +218,30 @@ components:
           description: URI reference identifying this occurrence.
 
   responses:
+    Unauthenticated:
+      description: No valid session; sign in again.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    SignInFailed:
+      description: The sign-in could not be completed (expired or foreign flow, cancelled consent, or a code Google rejected); start again.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    SignInDenied:
+      description: The Google account may not sign in (unlisted or unverified email, or an account that needs operator enrollment).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    CrossOriginRequest:
+      description: A state-changing request came from another origin.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
     Problem:
       description: Any other error, as RFC 9457 problem details.
       content:
@@ -83,7 +249,7 @@ components:
           schema:
             $ref: '#/components/schemas/Problem'
     Unavailable:
-      description: A dependency such as the database is unreachable; retry later.
+      description: A dependency such as the database or Google is unreachable, or Google sign-in is not configured.
       content:
         application/problem+json:
           schema:
@@ -92,3 +258,7 @@ components:
 tags:
   - name: system
     description: Operational endpoints.
+  - name: auth
+    description: Google sign-in and sign-out (ADR-0005 §2–3).
+  - name: profile
+    description: The signed-in user's profile and settings.

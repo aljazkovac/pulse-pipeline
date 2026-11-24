@@ -10,3 +10,8 @@ generate:
   strict-server: true
 output-options:
   skip-prune: false
+compatibility:
+  # Puts each operation's security requirement on the request context
+  # (gen.SessionScopes), so the auth middleware enforces the contract's
+  # `security` instead of a hand-kept list of protected routes.
+  enable-auth-scopes-on-context: true

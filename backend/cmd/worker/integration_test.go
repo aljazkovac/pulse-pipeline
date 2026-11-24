@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -273,5 +274,84 @@ func TestWorker_DatabaseErrorsDoNotLeakThePassword(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), password) {
 		t.Fatalf("error leaks the database password: %v", err)
+	}
+}
+
+// A Phase 1 user keeps their history: the operator binds the owner's Google
+// identity to the existing user, and the sign-in lookup then resolves it.
+func TestWorker_BindGoogleIdentityToAnExistingUser(t *testing.T) {
+	ctx := ctxT(t)
+	userID := seedDev(t, ctx)
+	st := store.New(testPool)
+	u, err := st.GetUser(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := googleClaims(u.Email, "", true) // seed-dev's example.com address
+	claims.Subject = "fake-sub-" + uuid.NewString()
+	req := bindRequest{userID: userID}
+
+	// example.com is not a Google-authoritative address.
+	if err := bindGoogleIdentity(ctx, st, fakeLoopback{claims: claims}, req, io.Discard, time.Now); err == nil {
+		t.Fatal("bound a third-party address without -mailbox-verified")
+	}
+	req.mailboxVerified = true
+	var out bytes.Buffer
+	if err := bindGoogleIdentity(ctx, st, fakeLoopback{claims: claims}, req, &out, time.Now); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetUserIDByIdentity(ctx, claims.Issuer, claims.Subject)
+	if err != nil || got != userID {
+		t.Fatalf("identity resolves to %s, %v; want %s", got, err, userID)
+	}
+
+	// Replacing it requires -replace and signs the user out everywhere.
+	if err := st.CreateSession(ctx, userID, bytes.Repeat([]byte{9}, 32), time.Now(), time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	other := claims
+	other.Subject = "fake-sub-" + uuid.NewString()
+	if err := bindGoogleIdentity(ctx, st, fakeLoopback{claims: other}, req, io.Discard, time.Now); !errors.Is(err, store.ErrIdentityBound) {
+		t.Fatalf("replacing without -replace = %v, want ErrIdentityBound", err)
+	}
+	req.replace = true
+	out.Reset()
+	if err := bindGoogleIdentity(ctx, st, fakeLoopback{claims: other}, req, &out, time.Now); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "signed out 1 sessions") {
+		t.Errorf("output = %q", out.String())
+	}
+	if n := count(t, ctx, `SELECT count(*) FROM sessions WHERE user_id = $1`, userID); n != 0 {
+		t.Errorf("%d sessions survived the replacement", n)
+	}
+}
+
+func TestWorker_RevokeSessionsSignsOneUserOutEverywhere(t *testing.T) {
+	ctx := ctxT(t)
+	target, other := seedDev(t, ctx), seedDev(t, ctx)
+	st := store.New(testPool)
+	for _, id := range []uuid.UUID{target, target, other} {
+		hash := sha256.Sum256([]byte(uuid.NewString()))
+		if err := st.CreateSession(ctx, id, hash[:], time.Now(), time.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var out bytes.Buffer
+	if err := run(ctx, []string{"revoke-sessions", "-user", target.String()}, devEnv(nil), &out, quietLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "out of 2 sessions") {
+		t.Errorf("output = %q", out.String())
+	}
+	if n := count(t, ctx, `SELECT count(*) FROM sessions WHERE user_id = $1`, target); n != 0 {
+		t.Errorf("%d sessions survived", n)
+	}
+	if n := count(t, ctx, `SELECT count(*) FROM sessions WHERE user_id = $1`, other); n != 1 {
+		t.Errorf("another user's sessions = %d, want 1 untouched", n)
+	}
+	if err := run(ctx, []string{"revoke-sessions", "-user", uuid.NewString()}, devEnv(nil), io.Discard, quietLogger()); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("unknown user = %v, want ErrNotFound", err)
 	}
 }

@@ -12,7 +12,9 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/auth"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/domain"
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/store"
 )
 
 func env(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
@@ -148,10 +150,181 @@ func TestRunRejectsBadInvocationsBeforeTouchingTheDatabase(t *testing.T) {
 		"connect bad user":  {[]string{"connect-google", "-user", "me"}, true, "-user must be a UUID"},
 		"connect extra arg": {[]string{"connect-google", "-user", "00000000-0000-4000-8000-000000000001", "now"}, true, "unexpected argument"},
 		"connect no google": {[]string{"connect-google", "-user", "00000000-0000-4000-8000-000000000001"}, false, "GOOGLE_OAUTH_CLIENT_ID"},
+		"bind bad user":     {[]string{"bind-google-identity", "-user", "me"}, true, "-user must be a UUID"},
+		"bind unknown flag": {[]string{"bind-google-identity", "-user", "00000000-0000-4000-8000-000000000001", "-force"}, true, "-force"},
+		"bind no google":    {[]string{"bind-google-identity", "-user", "00000000-0000-4000-8000-000000000001"}, false, "GOOGLE_OAUTH_CLIENT_ID"},
+		"revoke bad user":   {[]string{"revoke-sessions", "-user", "me"}, true, "revoke-sessions: -user must be a UUID"},
+		"revoke extra arg":  {[]string{"revoke-sessions", "-user", "00000000-0000-4000-8000-000000000001", "all"}, true, "unexpected argument"},
 	} {
 		err := run(context.Background(), tc.args, e, io.Discard, logger)
 		if err == nil || errors.Is(err, errUsage) != tc.usage || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: err = %v", name, err)
 		}
+	}
+}
+
+func TestParseBindArgs(t *testing.T) {
+	const id = "00000000-0000-4000-8000-000000000001"
+	got, err := parseBindArgs([]string{"-user", id})
+	if err != nil || got != (bindRequest{userID: uuid.MustParse(id)}) {
+		t.Errorf("defaults = %+v, %v", got, err)
+	}
+	got, err = parseBindArgs([]string{"-user", id, "-replace", "-mailbox-verified"})
+	if err != nil || !got.replace || !got.mailboxVerified {
+		t.Errorf("flags = %+v, %v", got, err)
+	}
+	got, err = parseBindArgs([]string{"-new-user", "-mailbox-verified"})
+	if err != nil || !got.newUser || !got.mailboxVerified || got.userID != uuid.Nil {
+		t.Errorf("new user = %+v, %v", got, err)
+	}
+	for _, args := range [][]string{{}, {"-user", id, "extra"}, {"-replace"}, {"-new-user", "-user", id}, {"-new-user", "-replace"}} {
+		if _, err := parseBindArgs(args); !errors.Is(err, errUsage) {
+			t.Errorf("parseBindArgs(%q) = %v, want a usage error", args, err)
+		}
+	}
+}
+
+// fakeBinder records BindIdentity and enrollment calls for one fictional user.
+type fakeBinder struct {
+	user     domain.User
+	err      error
+	res      store.BindResult
+	calls    []domain.Identity
+	at       []time.Time
+	enrolled []domain.Identity
+}
+
+func (f *fakeBinder) CreateUserWithIdentity(_ context.Context, ident domain.Identity, timezone string, at time.Time) (domain.User, error) {
+	f.enrolled = append(f.enrolled, ident)
+	f.at = append(f.at, at)
+	if f.err != nil {
+		return domain.User{}, f.err
+	}
+	return domain.User{ID: uuid.MustParse("00000000-0000-4000-8000-0000000000bb"), Email: ident.Email, Timezone: timezone}, nil
+}
+
+func (f *fakeBinder) GetUser(_ context.Context, id uuid.UUID) (domain.User, error) {
+	if id != f.user.ID {
+		return domain.User{}, store.ErrNotFound
+	}
+	return f.user, nil
+}
+
+func (f *fakeBinder) BindIdentity(_ context.Context, _ uuid.UUID, ident domain.Identity, _ bool, at time.Time) (store.BindResult, error) {
+	f.calls = append(f.calls, ident)
+	f.at = append(f.at, at)
+	return f.res, f.err
+}
+
+// fakeLoopback "signs in" with fixed claims after showing the URL and sets
+// *done, when given, once the sign-in has finished.
+type fakeLoopback struct {
+	claims auth.Claims
+	err    error
+	done   *bool
+}
+
+func (f fakeLoopback) SignInLoopback(_ context.Context, show func(string) error) (auth.Claims, error) {
+	if err := show("https://accounts.example.com/auth?fake=1"); err != nil {
+		return auth.Claims{}, err
+	}
+	if f.done != nil {
+		*f.done = true
+	}
+	return f.claims, f.err
+}
+
+var t0 = time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+
+func googleClaims(email, hd string, verified bool) auth.Claims {
+	c := auth.Claims{EmailVerified: verified, HostedDomain: hd}
+	c.Issuer, c.Subject, c.Email = auth.GoogleIssuer, "fake-sub-42", email
+	return c
+}
+
+func TestBindGoogleIdentity(t *testing.T) {
+	user := domain.User{ID: uuid.MustParse("00000000-0000-4000-8000-0000000000aa"), Email: "fake-owner@gmail.com"}
+	tests := []struct {
+		name       string
+		claims     auth.Claims
+		req        bindRequest
+		bindErr    error
+		res        store.BindResult
+		wantErr    string
+		wantBind   bool
+		wantEnroll bool
+		wantPrint  []string
+	}{
+		{name: "gmail", claims: googleClaims("fake-owner@gmail.com", "", true), res: store.BindResult{Changed: true},
+			wantBind: true, wantPrint: []string{"accounts.example.com", "Bound the Google account fake-owner@gmail.com (subject fake-sub-42)", "PULSE_ALLOWED_EMAILS"}},
+		{name: "already bound", claims: googleClaims("fake-owner@gmail.com", "", true),
+			wantBind: true, wantPrint: []string{"nothing changed"}},
+		{name: "replace", claims: googleClaims("fake-owner@gmail.com", "", true), req: bindRequest{replace: true},
+			res: store.BindResult{Changed: true, RevokedSessions: 3}, wantBind: true, wantPrint: []string{"signed out 3 sessions"}},
+		{name: "different address", claims: googleClaims("fake-other@example.com", "example.com", true), res: store.BindResult{Changed: true},
+			wantBind: true, wantPrint: []string{"differs from the user's address fake-owner@gmail.com"}},
+		{name: "unverified", claims: googleClaims("fake-owner@gmail.com", "", false), wantErr: "not verified"},
+		{name: "third-party address", claims: googleClaims("fake-owner@example.org", "", true), wantErr: "-mailbox-verified"},
+		{name: "third-party address, mailbox checked", claims: googleClaims("fake-owner@example.org", "", true),
+			req: bindRequest{mailboxVerified: true}, res: store.BindResult{Changed: true}, wantBind: true},
+		{name: "needs replace", claims: googleClaims("fake-owner@gmail.com", "", true), bindErr: store.ErrIdentityBound,
+			wantBind: true, wantErr: "run again with -replace"},
+		{name: "taken", claims: googleClaims("fake-owner@gmail.com", "", true), bindErr: store.ErrIdentityTaken,
+			wantBind: true, wantErr: "already bound to another Pulse user"},
+		{name: "new user, third-party address", claims: googleClaims("fake-new@example.org", "", true), req: bindRequest{newUser: true, mailboxVerified: true},
+			wantEnroll: true, wantPrint: []string{"to a new user", "Enrolled user 00000000-0000-4000-8000-0000000000bb", "PULSE_ALLOWED_EMAILS"}},
+		{name: "new user needs the mailbox check", claims: googleClaims("fake-new@example.org", "", true), req: bindRequest{newUser: true},
+			wantErr: "-mailbox-verified"},
+		{name: "new user, email of an existing user", claims: googleClaims("fake-new@example.org", "", true), req: bindRequest{newUser: true, mailboxVerified: true},
+			bindErr: store.ErrEmailTaken, wantEnroll: true, wantErr: "bind the identity to that user with -user"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &fakeBinder{user: user, err: tt.bindErr, res: tt.res}
+			if !tt.req.newUser {
+				tt.req.userID = user.ID
+			}
+			var out strings.Builder
+
+			signedIn := false
+			now := func() time.Time {
+				if !signedIn {
+					t.Error("the bind time was taken before the owner signed in")
+				}
+				return t0
+			}
+			err := bindGoogleIdentity(context.Background(), b, fakeLoopback{claims: tt.claims, done: &signedIn}, tt.req, &out, now)
+
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want it to mention %q", err, tt.wantErr)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if bound := len(b.calls) > 0; bound != tt.wantBind {
+				t.Errorf("BindIdentity called = %t, want %t", bound, tt.wantBind)
+			}
+			if tt.wantEnroll != (len(b.enrolled) > 0) {
+				t.Errorf("enrolled = %v, want enrollment %t", b.enrolled, tt.wantEnroll)
+			}
+			for _, at := range b.at {
+				if !at.Equal(t0) {
+					t.Errorf("recorded at %s, want the time after sign-in", at)
+				}
+			}
+			for _, want := range tt.wantPrint {
+				if !strings.Contains(out.String(), want) {
+					t.Errorf("output %q lacks %q", out.String(), want)
+				}
+			}
+		})
+	}
+
+	// An unknown user fails before any sign-in.
+	err := bindGoogleIdentity(context.Background(), &fakeBinder{user: user}, fakeLoopback{err: errors.New("must not run")},
+		bindRequest{userID: uuid.New()}, io.Discard, time.Now)
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("unknown user = %v, want ErrNotFound", err)
 	}
 }

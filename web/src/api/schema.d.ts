@@ -26,10 +26,104 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/auth/google/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Start Google sign-in
+         * @description Redirects the browser to Google's account chooser to sign in with OpenID Connect
+         *     (authorization code, PKCE `S256`, scopes `openid email` only). Sets the ten-minute
+         *     OAuth flow cookie (`__Host-pulse_oauth`; `pulse_oauth` with `ENV=development`)
+         *     holding the state and PKCE verifier. Signing in never asks for health data;
+         *     linking a wearable is a separate consent.
+         */
+        get: operations["startGoogleSignIn"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/google/callback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Finish Google sign-in
+         * @description Google redirects the browser here. The API checks the flow cookie and `state`,
+         *     exchanges the code, checks the ID token and the `PULSE_ALLOWED_EMAILS` allowlist,
+         *     then signs the user in: a returning Google identity signs in to its user, and a new
+         *     one creates a user only when Google is authoritative for the email (Gmail or
+         *     Google Workspace) and no user has it yet. On success it sets a new session cookie
+         *     (`__Host-pulse_session`; `pulse_session` with `ENV=development`) and redirects to
+         *     the web app. Every response expires the flow cookie, so a callback cannot be replayed.
+         */
+        get: operations["finishGoogleSignIn"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Sign out
+         * @description Deletes the current session, if any, and expires the session cookie. Succeeds without
+         *     a valid session, so signing out is idempotent. Rejected when sent from another origin.
+         */
+        post: operations["signOut"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The signed-in user's profile */
+        get: operations["getMe"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        Me: {
+            /** @description The account's email address. */
+            email: string;
+            /** @description IANA timezone for local days, e.g. `Europe/Stockholm`. `UTC` until the user chooses one. */
+            timezone: string;
+        };
         Health: {
             /** @enum {string} */
             status: "ok";
@@ -52,6 +146,42 @@ export interface components {
         };
     };
     responses: {
+        /** @description No valid session; sign in again. */
+        Unauthenticated: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["Problem"];
+            };
+        };
+        /** @description The sign-in could not be completed (expired or foreign flow, cancelled consent, or a code Google rejected); start again. */
+        SignInFailed: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["Problem"];
+            };
+        };
+        /** @description The Google account may not sign in (unlisted or unverified email, or an account that needs operator enrollment). */
+        SignInDenied: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["Problem"];
+            };
+        };
+        /** @description A state-changing request came from another origin. */
+        CrossOriginRequest: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["Problem"];
+            };
+        };
         /** @description Any other error, as RFC 9457 problem details. */
         Problem: {
             headers: {
@@ -61,7 +191,7 @@ export interface components {
                 "application/problem+json": components["schemas"]["Problem"];
             };
         };
-        /** @description A dependency such as the database is unreachable; retry later. */
+        /** @description A dependency such as the database or Google is unreachable, or Google sign-in is not configured. */
         Unavailable: {
             headers: {
                 [name: string]: unknown;
@@ -97,6 +227,101 @@ export interface operations {
                 };
             };
             503: components["responses"]["Unavailable"];
+            default: components["responses"]["Problem"];
+        };
+    };
+    startGoogleSignIn: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Redirect to Google. Sets the OAuth flow cookie. */
+            302: {
+                headers: {
+                    /** @description Google's consent URL. */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Problem"];
+        };
+    };
+    finishGoogleSignIn: {
+        parameters: {
+            query?: {
+                /** @description Google's authorization code. */
+                code?: string;
+                /** @description The state sent with the authorization request. */
+                state?: string;
+                /** @description Google's OAuth error code, such as `access_denied` when the user cancelled. */
+                error?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Signed in. Sets the session cookie and redirects to the web app. */
+            303: {
+                headers: {
+                    /** @description The web app's root, `/`. */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["SignInFailed"];
+            403: components["responses"]["SignInDenied"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Problem"];
+        };
+    };
+    signOut: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Signed out. Expires the session cookie. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["CrossOriginRequest"];
+            default: components["responses"]["Problem"];
+        };
+    };
+    getMe: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The profile of the session's user. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Me"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
             default: components["responses"]["Problem"];
         };
     };

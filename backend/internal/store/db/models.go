@@ -51,6 +51,14 @@ type ProviderConnection struct {
 	ProviderAccountID      pgtype.Text
 }
 
+type Session struct {
+	TokenHash  []byte
+	UserID     uuid.UUID
+	CreatedAt  time.Time
+	LastSeenAt time.Time
+	ExpiresAt  time.Time
+}
+
 type SleepSession struct {
 	ID                uuid.UUID
 	UserID            uuid.UUID
@@ -94,4 +102,13 @@ type User struct {
 	Timezone  string
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+type UserIdentity struct {
+	Issuer      string
+	Subject     string
+	UserID      uuid.UUID
+	Email       string
+	CreatedAt   time.Time
+	LastLoginAt *time.Time
 }

@@ -9,9 +9,12 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/auth"
 )
 
 func env(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
@@ -52,13 +55,186 @@ func TestLoadConfig(t *testing.T) {
 	}
 }
 
-func TestConfigStringRedactsDatabaseURL(t *testing.T) {
-	cfg := config{databaseURL: "postgres://pulse:hunter2@db/pulse", port: 8080}
-	for _, s := range []string{fmt.Sprint(cfg), fmt.Sprintf("%v", cfg), fmt.Sprintf("%+v", cfg), fmt.Sprintf("%#v", cfg)} {
-		if strings.Contains(s, "hunter2") || strings.Contains(s, "postgres://") {
-			t.Errorf("formatted config leaks the database URL: %s", s)
+func TestConfigStringRedactsSecrets(t *testing.T) {
+	cfg, err := loadConfig(env(map[string]string{
+		"DATABASE_URL": "postgres://pulse:hunter2@db/pulse", "PULSE_PUBLIC_URL": "https://pulse.example.com",
+		"GOOGLE_WEB_OAUTH_CLIENT_ID": "fake-client.apps.example.com", "GOOGLE_WEB_OAUTH_CLIENT_SECRET": "fake-client-secret",
+		"PULSE_ALLOWED_EMAILS": "fake-owner@example.com",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []any{cfg, cfg.google} {
+		for _, s := range []string{fmt.Sprint(v), fmt.Sprintf("%v", v), fmt.Sprintf("%+v", v), fmt.Sprintf("%#v", v)} {
+			for _, secret := range []string{"hunter2", "postgres://", "fake-client-secret", "fake-owner@example.com"} {
+				if strings.Contains(s, secret) {
+					t.Errorf("formatted config leaks %q: %s", secret, s)
+				}
+			}
 		}
 	}
+}
+
+func TestLoadConfigSignIn(t *testing.T) {
+	const db = "postgres://db/pulse"
+	signIn := func(extra map[string]string) map[string]string {
+		m := map[string]string{
+			"DATABASE_URL": db, "PULSE_PUBLIC_URL": "https://pulse.example.com/",
+			"GOOGLE_WEB_OAUTH_CLIENT_ID": "fake-client.apps.example.com", "GOOGLE_WEB_OAUTH_CLIENT_SECRET": "fake-client-secret",
+			"PULSE_ALLOWED_EMAILS": "fake-owner@example.com, fake-partner@example.com",
+		}
+		for k, v := range extra {
+			if v == "" {
+				delete(m, k)
+			} else {
+				m[k] = v
+			}
+		}
+		return m
+	}
+	tests := []struct {
+		name       string
+		env        map[string]string
+		wantErr    string
+		wantSignIn bool
+		wantDev    bool
+		wantPublic string
+	}{
+		{"disabled by default", map[string]string{"DATABASE_URL": db}, "", false, false, ""},
+		{"enabled", signIn(nil), "", true, false, "https://pulse.example.com"},
+		{"development over http", signIn(map[string]string{"ENV": "development", "PULSE_PUBLIC_URL": "http://localhost:5173"}), "", true, true, "http://localhost:5173"},
+		{"http outside development", signIn(map[string]string{"PULSE_PUBLIC_URL": "http://pulse.example.com"}), "must use https", false, false, ""},
+		{"ENV other than development is production", signIn(map[string]string{"ENV": "dev", "PULSE_PUBLIC_URL": "http://localhost:5173"}), "must use https", false, false, ""},
+		{"public URL with a path", signIn(map[string]string{"PULSE_PUBLIC_URL": "https://pulse.example.com/app"}), "without a path", false, false, ""},
+		{"public URL with a query", signIn(map[string]string{"PULSE_PUBLIC_URL": "https://pulse.example.com/?x=1"}), "without a path", false, false, ""},
+		{"public URL with credentials", signIn(map[string]string{"PULSE_PUBLIC_URL": "https://fake:pw@pulse.example.com"}), "without a path", false, false, ""},
+		{"relative public URL", signIn(map[string]string{"PULSE_PUBLIC_URL": "pulse.example.com"}), "absolute http(s) URL", false, false, ""},
+		{"no secret", signIn(map[string]string{"GOOGLE_WEB_OAUTH_CLIENT_SECRET": ""}), "without GOOGLE_WEB_OAUTH_CLIENT_SECRET", false, false, ""},
+		{"secret without ID", map[string]string{"DATABASE_URL": db, "GOOGLE_WEB_OAUTH_CLIENT_SECRET": "fake-client-secret"}, "without GOOGLE_WEB_OAUTH_CLIENT_ID", false, false, ""},
+		{"no public URL", signIn(map[string]string{"PULSE_PUBLIC_URL": ""}), "PULSE_PUBLIC_URL", false, false, ""},
+		{"empty allowlist", signIn(map[string]string{"PULSE_ALLOWED_EMAILS": " , "}), "", true, false, "https://pulse.example.com"},
+		{"malformed allowlist", signIn(map[string]string{"PULSE_ALLOWED_EMAILS": "fake-owner"}), "PULSE_ALLOWED_EMAILS", false, false, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := loadConfig(env(tt.env))
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want it to mention %q", err, tt.wantErr)
+				}
+				if strings.Contains(err.Error(), "fake-client-secret") {
+					t.Errorf("error leaks the client secret: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig: %v", err)
+			}
+			if cfg.google.enabled() != tt.wantSignIn || cfg.dev != tt.wantDev || cfg.publicURL != tt.wantPublic {
+				t.Errorf("cfg = %v, want sign-in %t, dev %t, public URL %q", cfg, tt.wantSignIn, tt.wantDev, tt.wantPublic)
+			}
+			if tt.name == "empty allowlist" {
+				if cfg.allowlist.Len() != 0 {
+					t.Fatal("expected an empty allowlist")
+				}
+			} else if tt.wantSignIn && (!cfg.allowlist.Allows("FAKE-PARTNER@example.com") || cfg.allowlist.Len() != 2) {
+				t.Errorf("allowlist = %v", cfg.allowlist)
+			}
+		})
+	}
+}
+
+func TestSweepSessionsRunsAtOnceThenEveryIntervalUntilCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var logs strings.Builder
+	var mu sync.Mutex
+	logger := slog.New(slog.NewTextHandler(&lockedWriter{w: &logs, mu: &mu}, nil))
+
+	calls := make(chan struct{}, 10)
+	n := 0
+	sweep := func(sctx context.Context) (auth.SweepResult, error) {
+		if _, ok := sctx.Deadline(); !ok {
+			t.Error("a sweep runs without a deadline")
+		}
+		n++
+		calls <- struct{}{}
+		if n == 2 {
+			// Half of the sweep failed: its counts are still logged.
+			return auth.SweepResult{Disallowed: 1}, errors.New("fake: connection refused")
+		}
+		return auth.SweepResult{Expired: 3}, nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sweepSessions(ctx, sweep, 10*time.Millisecond, 10*time.Millisecond, logger)
+	}()
+	for range 3 {
+		select {
+		case <-calls:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the sweeper stopped sweeping")
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the sweeper ignored cancellation")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, want := range []string{"expired sessions deleted", "no longer in PULSE_ALLOWED_EMAILS deleted", "session sweep failed"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("logs = %s; want %q", logs.String(), want)
+		}
+	}
+}
+
+// A failed sweep runs again after the short retry, not the full interval;
+// a successful one waits the full interval.
+func TestSweepSessionsRetriesAFailureSooner(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := make(chan error, 10)
+	results := []error{errors.New("fake: database starting up"), nil}
+	sweep := func(context.Context) (auth.SweepResult, error) {
+		err := results[0]
+		if len(results) > 1 {
+			results = results[1:]
+		}
+		calls <- err
+		return auth.SweepResult{}, err
+	}
+	go sweepSessions(ctx, sweep, time.Hour, 10*time.Millisecond, quietLogger())
+
+	for i, want := range []bool{true, false} {
+		select {
+		case err := <-calls:
+			if failed := err != nil; failed != want {
+				t.Fatalf("sweep %d failed = %t, want %t", i, failed, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("sweep %d did not run: a failure must be retried soon", i)
+		}
+	}
+	select {
+	case err := <-calls:
+		t.Fatalf("a successful sweep was followed by another (err %v) before the interval", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+type lockedWriter struct {
+	w  io.Writer
+	mu *sync.Mutex
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 // startServe runs serve on a loopback listener and returns its base URL and
@@ -127,11 +303,15 @@ func TestServeDrainsInFlightRequestsOnShutdown(t *testing.T) {
 	for {
 		var dialer net.Dialer
 		conn, err := dialer.DialContext(context.Background(), "tcp", strings.TrimPrefix(base, "http://"))
-		if err == nil {
-			_ = conn.Close()
-		} else if errors.Is(err, syscall.ECONNREFUSED) {
+		if errors.Is(err, syscall.ECONNREFUSED) {
 			break
-		} else {
+		}
+		switch {
+		case err == nil:
+			_ = conn.Close()
+		case errors.Is(err, syscall.ECONNRESET):
+			// The dial raced the listener closing; the next one is refused.
+		default:
 			t.Fatalf("dial during shutdown: %v, want connection refused", err)
 		}
 		if time.Now().After(deadline) {

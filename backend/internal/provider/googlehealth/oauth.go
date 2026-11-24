@@ -2,21 +2,17 @@ package googlehealth
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"html"
-	"net"
 	"net/http"
 	"net/url"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/domain"
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/oauthflow"
 )
 
 // Grant holds the credentials and scopes from an authorization. AuthorizeLoopback
@@ -110,89 +106,15 @@ func (p *Provider) CheckIdentity(ctx context.Context, creds domain.Credentials) 
 // 127.0.0.1 at a random port, passes the consent URL to show (which prints or
 // opens it), waits for Google's redirect, checks state, exchanges the code
 // with the PKCE verifier, and confirms the account can read Google Health
-// data. It gives up after LoopbackTimeout.
+// data. It gives up waiting for the redirect after LoopbackTimeout.
 func (p *Provider) AuthorizeLoopback(ctx context.Context, show func(authURL string) error) (Grant, error) {
 	// The timeout bounds waiting for the user only; the code exchange below
 	// runs on ctx, bounded by the HTTP client's timeout.
-	waitCtx, cancel := context.WithTimeout(ctx, p.loopbackTimeout)
-	defer cancel()
-
-	var lc net.ListenConfig
-	ln, err := lc.Listen(waitCtx, "tcp", "127.0.0.1:0")
+	redirect, err := oauthflow.Loopback(ctx, p.loopbackTimeout, p.AuthCodeURL, show)
 	if err != nil {
-		return Grant{}, fmt.Errorf("googlehealth: opening loopback listener: %w", err)
+		return Grant{}, fmt.Errorf("googlehealth: %w", err)
 	}
-	defer ln.Close() //nolint:errcheck // also closed by Shutdown; covers early returns
-	redirectURI := "http://" + ln.Addr().String()
-	state, err := randomToken()
-	if err != nil {
-		return Grant{}, err
-	}
-	verifier, err := randomToken()
-	if err != nil {
-		return Grant{}, err
-	}
-
-	type callback struct {
-		code string
-		err  error
-	}
-	done := make(chan callback, 1)
-	deliver := func(c callback) {
-		select {
-		case done <- c:
-		default: // already delivered; later requests are ignored
-		}
-	}
-	srv := &http.Server{
-		ReadHeaderTimeout: 10 * time.Second,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/" {
-				http.NotFound(w, r)
-				return
-			}
-			q := r.URL.Query()
-			// A request without the right state is not Google's redirect for
-			// this flow: refuse it and keep waiting.
-			if subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(state)) != 1 {
-				http.Error(w, "invalid state", http.StatusBadRequest)
-				return
-			}
-			if e := q.Get("error"); e != "" {
-				writePage(w, "Linking was cancelled. You can close this tab.")
-				deliver(callback{err: fmt.Errorf("googlehealth: authorization denied: %s", capText(sanitizeCode(e)))})
-				return
-			}
-			code := q.Get("code")
-			if code == "" {
-				http.Error(w, "missing code", http.StatusBadRequest)
-				return
-			}
-			writePage(w, "Authorization received. Return to the terminal to see whether linking finished.")
-			deliver(callback{code: code})
-		}),
-	}
-	go func() { _ = srv.Serve(ln) }() // returns ErrServerClosed on Shutdown
-	defer func() {
-		sctx, scancel := context.WithTimeout(context.WithoutCancel(waitCtx), 5*time.Second)
-		defer scancel()
-		_ = srv.Shutdown(sctx) // best effort: the listener is local and short-lived
-	}()
-
-	if err := show(p.AuthCodeURL(redirectURI, state, verifier)); err != nil {
-		return Grant{}, fmt.Errorf("googlehealth: showing consent URL: %w", err)
-	}
-
-	var cb callback
-	select {
-	case cb = <-done:
-	case <-waitCtx.Done():
-		return Grant{}, fmt.Errorf("googlehealth: waiting for Google's redirect: %w", waitCtx.Err())
-	}
-	if cb.err != nil {
-		return Grant{}, cb.err
-	}
-	g, err := p.Exchange(ctx, cb.code, verifier, redirectURI)
+	g, err := p.Exchange(ctx, redirect.Code, redirect.Verifier, redirect.RedirectURI)
 	if err != nil {
 		return Grant{}, err
 	}
@@ -201,30 +123,4 @@ func (p *Provider) AuthorizeLoopback(ctx context.Context, show func(authURL stri
 		return Grant{}, err
 	}
 	return g, nil
-}
-
-// randomToken returns 32 random bytes, base64url-encoded (43 characters),
-// suitable for both state and a PKCE verifier.
-func randomToken() (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", fmt.Errorf("googlehealth: generating random value: %w", err)
-	}
-	return base64.RawURLEncoding.EncodeToString(b), nil
-}
-
-// sanitizeCode keeps an OAuth error code (e.g. access_denied) printable.
-func sanitizeCode(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r == '_' || r == '-' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
-			return r
-		}
-		return -1
-	}, s)
-}
-
-func writePage(w http.ResponseWriter, msg string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	_, _ = fmt.Fprintf(w, "<!doctype html><title>Pulse Pipeline</title><p>%s</p>", html.EscapeString(msg))
 }
