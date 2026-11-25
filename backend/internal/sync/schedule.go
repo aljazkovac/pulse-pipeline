@@ -113,14 +113,18 @@ func localSpan(r domain.DateRange, loc *time.Location) domain.TimeRange {
 	}
 }
 
-// nextNightly returns the next occurrence of hour:00 local time after now.
-func nextNightly(now time.Time, loc *time.Location, hour int) time.Time {
+// NextNightly returns the next occurrence of hour:00 local time after now, in UTC.
+func NextNightly(now time.Time, loc *time.Location, hour int) time.Time {
 	l := now.In(loc)
 	next := time.Date(l.Year(), l.Month(), l.Day(), hour, 0, 0, 0, loc)
 	if !next.After(now) {
 		next = time.Date(l.Year(), l.Month(), l.Day()+1, hour, 0, 0, 0, loc)
 	}
 	return next.UTC()
+}
+
+func nextNightly(now time.Time, loc *time.Location, hour int) time.Time {
+	return NextNightly(now, loc, hour)
 }
 
 func rangeString(r domain.DateRange) string {

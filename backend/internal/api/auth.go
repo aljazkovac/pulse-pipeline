@@ -22,6 +22,7 @@ import (
 // implements it.
 type Sessions interface {
 	SignIn(ctx context.Context, c auth.Claims) (auth.SignedIn, error)
+	SignInDev(ctx context.Context, email string) (auth.SignedIn, error)
 	Authenticate(ctx context.Context, token string) (uuid.UUID, error)
 	SignOut(ctx context.Context, token string) error
 }

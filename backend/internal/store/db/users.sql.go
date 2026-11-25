@@ -42,6 +42,50 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (CreateU
 	return i, err
 }
 
+const createUserWithID = `-- name: CreateUserWithID :one
+INSERT INTO users (id, email, timezone)
+VALUES ($1, $2, $3)
+RETURNING id, email, timezone, created_at
+`
+
+type CreateUserWithIDParams struct {
+	ID       uuid.UUID
+	Email    string
+	Timezone string
+}
+
+type CreateUserWithIDRow struct {
+	ID        uuid.UUID
+	Email     string
+	Timezone  string
+	CreatedAt time.Time
+}
+
+func (q *Queries) CreateUserWithID(ctx context.Context, arg CreateUserWithIDParams) (CreateUserWithIDRow, error) {
+	row := q.db.QueryRow(ctx, createUserWithID, arg.ID, arg.Email, arg.Timezone)
+	var i CreateUserWithIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.Timezone,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const deleteUser = `-- name: DeleteUser :execrows
+DELETE FROM users
+WHERE id = $1
+`
+
+func (q *Queries) DeleteUser(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteUser, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getUser = `-- name: GetUser :one
 SELECT id, email, timezone, created_at
 FROM users

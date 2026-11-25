@@ -2,10 +2,13 @@
 // /api/v1 contract in backend/api/openapi.yaml and the /healthz liveness probe.
 //
 // Environment: DATABASE_URL (required), API_PORT (default 8080), ENV
-// ("development" selects plain-HTTP cookies), and for Google sign-in
+// ("development" selects plain-HTTP cookies and allows PULSE_DEV_NOW and
+// PULSE_ENABLE_DEV_LOGIN), PULSE_DEV_NOW (RFC 3339 fixed clock, honored only
+// with ENV=development), PULSE_ENABLE_DEV_LOGIN ("true" registers
+// POST /api/v1/dev/login only when ENV=development), and for Google sign-in
 // GOOGLE_WEB_OAUTH_CLIENT_ID, GOOGLE_WEB_OAUTH_CLIENT_SECRET, PULSE_PUBLIC_URL
 // and PULSE_ALLOWED_EMAILS. Without a client ID the API serves, but the
-// sign-in routes answer 503 and nobody can sign in.
+// sign-in routes answer 503 and nobody can sign in with Google.
 //
 // A background ticker deletes expired sessions, and the sessions of users no
 // longer in PULSE_ALLOWED_EMAILS, at startup and hourly (ADR-0005 §2–3).
@@ -34,6 +37,7 @@ import (
 
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/api"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/auth"
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/devclock"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/store"
 )
 
@@ -66,12 +70,15 @@ func main() {
 }
 
 type config struct {
-	databaseURL string
-	port        int
-	dev         bool   // ENV=development
-	publicURL   string // PULSE_PUBLIC_URL as an origin; "" when unset
-	allowlist   auth.Allowlist
-	google      googleWebClient
+	databaseURL     string
+	port            int
+	dev             bool            // ENV=development
+	devLogin        bool            // ENV=development && PULSE_ENABLE_DEV_LOGIN=true
+	devLoginIgnored bool            // PULSE_ENABLE_DEV_LOGIN=true outside ENV=development
+	clock           devclock.Result // PULSE_DEV_NOW when ENV=development; time.Now otherwise
+	publicURL       string          // PULSE_PUBLIC_URL as an origin; "" when unset
+	allowlist       auth.Allowlist
+	google          googleWebClient
 	// googleAuthURL and googleTokenURL replace Google's endpoints in tests.
 	// No environment variable sets them.
 	googleAuthURL, googleTokenURL string
@@ -95,15 +102,16 @@ func (g googleWebClient) GoString() string { return g.String() }
 // String omits the database URL, which may hold a password, the client
 // secret and the allowed addresses.
 func (c config) String() string {
-	return fmt.Sprintf("config{port: %d, dev: %t, public_url: %q, google_sign_in: %t, allowed_emails: %d}",
-		c.port, c.dev, c.publicURL, c.google.enabled(), c.allowlist.Len())
+	return fmt.Sprintf("config{port: %d, dev: %t, dev_login: %t, dev_now: %t, public_url: %q, google_sign_in: %t, allowed_emails: %d}",
+		c.port, c.dev, c.devLogin, !c.clock.Pinned.IsZero(), c.publicURL, c.google.enabled(), c.allowlist.Len())
 }
 
 // GoString redacts for %#v as well.
 func (c config) GoString() string { return c.String() }
 
 func loadConfig(getenv func(string) string) (config, error) {
-	cfg := config{databaseURL: getenv("DATABASE_URL"), port: 8080, dev: getenv("ENV") == "development"}
+	rawEnv := getenv("ENV")
+	cfg := config{databaseURL: getenv("DATABASE_URL"), port: 8080, dev: rawEnv == "development"}
 	if cfg.databaseURL == "" {
 		return config{}, errors.New("DATABASE_URL is required")
 	}
@@ -113,6 +121,22 @@ func loadConfig(getenv func(string) string) (config, error) {
 			return config{}, fmt.Errorf("API_PORT %q: want a port number between 1 and 65535", v)
 		}
 		cfg.port = p
+	}
+	clk, err := devclock.FromEnv(rawEnv, getenv("PULSE_DEV_NOW"))
+	if err != nil {
+		return config{}, err
+	}
+	cfg.clock = clk
+	if v := getenv("PULSE_ENABLE_DEV_LOGIN"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return config{}, fmt.Errorf("PULSE_ENABLE_DEV_LOGIN %q: want true or false", v)
+		}
+		if b && cfg.dev {
+			cfg.devLogin = true
+		} else if b {
+			cfg.devLoginIgnored = true
+		}
 	}
 	if v := getenv("PULSE_PUBLIC_URL"); v != "" {
 		origin, err := publicOrigin(v, cfg.dev)
@@ -173,8 +197,18 @@ func runWithConfig(ctx context.Context, cfg config, logger *slog.Logger, listen 
 	defer pool.Close()
 
 	st := store.New(pool)
-	sessions := auth.NewService(st, cfg.allowlist, time.Now)
-	opts := api.Options{DB: pool, Logger: logger, Sessions: sessions, Users: st, Dev: cfg.dev}
+	sessions := auth.NewService(st, cfg.allowlist, cfg.clock.Now)
+	opts := api.Options{DB: pool, Logger: logger, Sessions: sessions, Users: st, Dev: cfg.dev, DevLogin: cfg.devLogin}
+	if !cfg.clock.Pinned.IsZero() {
+		logger.Info("development clock pinned", "now", cfg.clock.Pinned)
+	} else if cfg.clock.Ignored {
+		logger.Warn("PULSE_DEV_NOW ignored outside ENV=development")
+	}
+	if cfg.devLogin {
+		logger.Warn("development login enabled on POST /api/v1/dev/login; never enable in production")
+	} else if cfg.devLoginIgnored {
+		logger.Warn("PULSE_ENABLE_DEV_LOGIN ignored outside ENV=development")
+	}
 	if cfg.google.enabled() {
 		google, err := auth.NewGoogle(auth.GoogleOptions{
 			ClientID: cfg.google.clientID, ClientSecret: cfg.google.clientSecret,

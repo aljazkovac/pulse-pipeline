@@ -533,3 +533,16 @@ func TestDeleteSessionsOutsideAllowlist(t *testing.T) {
 		t.Errorf("a user without identities lost their session: %v", err)
 	}
 }
+
+func TestGetUserIDByEmail(t *testing.T) {
+	ctx := ctxT(t)
+	u := newUser(t)
+
+	got, err := testStore.GetUserIDByEmail(ctx, strings.ToUpper(u.Email))
+	if err != nil || got != u.ID {
+		t.Fatalf("GetUserIDByEmail = %s, %v; want %s", got, err, u.ID)
+	}
+	if _, err := testStore.GetUserIDByEmail(ctx, uniqueEmail("nobody")); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("unknown email = %v, want ErrNotFound", err)
+	}
+}

@@ -214,6 +214,23 @@ func (q *Queries) GetSessionByTokenHash(ctx context.Context, tokenHash []byte) (
 	return i, err
 }
 
+const getUserIDByEmail = `-- name: GetUserIDByEmail :one
+SELECT id
+FROM users
+WHERE lower(email) = lower($1)
+`
+
+// AUTHENTICATION BOUNDARY (AGENTS.md §1.1, ADR-0005 §8): runs before a
+// user_id is known. Keyed by lower(email); returns the user ID only.
+// Called only by the development-only login (ENV=development +
+// PULSE_ENABLE_DEV_LOGIN=true).
+func (q *Queries) GetUserIDByEmail(ctx context.Context, email string) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, getUserIDByEmail, email)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const getUserIDByIdentity = `-- name: GetUserIDByIdentity :one
 
 SELECT user_id

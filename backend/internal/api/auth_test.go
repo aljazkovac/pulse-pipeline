@@ -53,6 +53,7 @@ type fakeSessions struct {
 	signOuts  []string
 	signOutEr error
 	claims    []auth.Claims
+	devEmails []string
 }
 
 func newFakeSessions() *fakeSessions {
@@ -68,6 +69,25 @@ func (f *fakeSessions) SignIn(_ context.Context, c auth.Claims) (auth.SignedIn, 
 	}
 	f.tokens[newTokenValue] = aliceID
 	return auth.SignedIn{UserID: aliceID, Token: newTokenValue}, nil
+}
+
+func (f *fakeSessions) SignInDev(_ context.Context, email string) (auth.SignedIn, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.devEmails = append(f.devEmails, email)
+	if f.signInErr != nil {
+		return auth.SignedIn{}, f.signInErr
+	}
+	switch strings.ToLower(email) {
+	case "fake.alice@example.com":
+		f.tokens[newTokenValue] = aliceID
+		return auth.SignedIn{UserID: aliceID, Token: newTokenValue}, nil
+	case "fake.bob@example.com":
+		f.tokens[newTokenValue] = bobID
+		return auth.SignedIn{UserID: bobID, Token: newTokenValue}, nil
+	default:
+		return auth.SignedIn{}, fmt.Errorf("dev login: %w", store.ErrNotFound)
+	}
 }
 
 func (f *fakeSessions) Authenticate(_ context.Context, token string) (uuid.UUID, error) {
@@ -160,7 +180,21 @@ func newAuthHarness(t *testing.T, dev bool, mutate ...func(*Options)) *authHarne
 
 func (a *authHarness) do(t *testing.T, method, target string, cookies map[string]string, headers ...string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequestWithContext(context.Background(), method, target, nil)
+	return a.doBody(t, method, target, "", cookies, headers...)
+}
+
+func (a *authHarness) doBody(t *testing.T, method, target, body string, cookies map[string]string, headers ...string) *httptest.ResponseRecorder {
+	t.Helper()
+	var r *strings.Reader
+	if body != "" {
+		r = strings.NewReader(body)
+	} else {
+		r = strings.NewReader("")
+	}
+	req := httptest.NewRequestWithContext(context.Background(), method, target, r)
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	for name, value := range cookies {
 		req.AddCookie(&http.Cookie{Name: name, Value: value})
 	}
@@ -588,4 +622,92 @@ func TestSignInPreservesCookieWhenRevocationFails(t *testing.T) {
 	if setCookies(rec)[cookieNames[false][0]] != nil || !slices.Equal(a.sessions.signOuts, []string{bobToken, newTokenValue}) {
 		t.Fatal("failed rotation must preserve the browser cookie and discard the unissued session")
 	}
+}
+
+func TestDevLogin(t *testing.T) {
+	// ADR-0005 §8: unregistered (404) under production configuration — even if
+	// DevLogin is passed — and in development when DevLogin is false.
+	for name, tc := range map[string]struct{ dev, devLogin bool }{
+		"production":                          {false, false},
+		"production with DevLogin forced":     {false, true},
+		"development without DevLogin":        {true, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a := newAuthHarness(t, tc.dev, func(o *Options) { o.DevLogin = tc.devLogin })
+			for _, m := range []string{http.MethodPost, http.MethodGet} {
+				rec := a.doBody(t, m, "/api/v1/dev/login", `{"email":"fake.alice@example.com"}`, nil)
+				decodeProblem(t, rec, probNotFound)
+				assertAPIHeaders(t, rec)
+			}
+			if len(a.sessions.devEmails) != 0 {
+				t.Errorf("disabled dev login reached SignInDev: %v", a.sessions.devEmails)
+			}
+		})
+	}
+
+	t.Run("enabled in development", func(t *testing.T) {
+		a := newAuthHarness(t, true, func(o *Options) { o.DevLogin = true; o.SignIn = nil })
+
+		rec := a.doBody(t, http.MethodPost, "/api/v1/dev/login", `{"email":"  FAKE.ALICE@example.com "}`,
+			map[string]string{"pulse_session": bobToken})
+		if rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
+			t.Fatalf("dev login = %d %q, want 204", rec.Code, rec.Body)
+		}
+		assertAPIHeaders(t, rec)
+		sess := setCookies(rec)["pulse_session"]
+		checkCookie(t, sess, "pulse_session", false, int(auth.AbsoluteLifetime/time.Second))
+		if sess.Value != newTokenValue {
+			t.Errorf("cookie = %q, want %q", sess.Value, newTokenValue)
+		}
+		if !slices.Equal(a.sessions.signOuts, []string{bobToken}) {
+			t.Errorf("sign-outs = %v, want previous session ended", a.sessions.signOuts)
+		}
+		if me := a.do(t, http.MethodGet, "/api/v1/me", map[string]string{"pulse_session": sess.Value}); me.Code != http.StatusOK {
+			t.Errorf("/me with dev session = %d, want 200", me.Code)
+		}
+		if strings.Contains(a.logs.String(), newTokenValue) || strings.Contains(a.logs.String(), "FAKE.ALICE") {
+			t.Errorf("request log leaked body or token: %s", a.logs)
+		}
+	})
+
+	t.Run("validation, unknown user, cross-origin and store errors", func(t *testing.T) {
+		a := newAuthHarness(t, true, func(o *Options) { o.DevLogin = true })
+
+		for name, body := range map[string]string{
+			"empty body":     "",
+			"malformed json": `{"email":`,
+			"unknown field":  `{"email":"fake.alice@example.com","admin":true}`,
+			"trailing json":  `{"email":"fake.alice@example.com"}{}`,
+			"missing email":  `{}`,
+			"blank email":    `{"email":"   "}`,
+		} {
+			rec := a.doBody(t, http.MethodPost, "/api/v1/dev/login", body, nil)
+			decodeProblem(t, rec, probInvalidRequest)
+			if len(rec.Result().Cookies()) != 0 {
+				t.Errorf("%s set a cookie", name)
+			}
+		}
+
+		unknown := a.doBody(t, http.MethodPost, "/api/v1/dev/login", `{"email":"nobody@example.com"}`, nil)
+		decodeProblem(t, unknown, probNotFound)
+
+		cross := a.doBody(t, http.MethodPost, "/api/v1/dev/login", `{"email":"fake.alice@example.com"}`, nil, "Sec-Fetch-Site", "cross-site")
+		decodeProblem(t, cross, probCrossOrigin)
+
+		a.sessions.signOutEr = errors.New("database unavailable")
+		failedRot := a.doBody(t, http.MethodPost, "/api/v1/dev/login", `{"email":"fake.alice@example.com"}`,
+			map[string]string{"pulse_session": bobToken})
+		decodeProblem(t, failedRot, probUnavailable)
+		if setCookies(failedRot)["pulse_session"] != nil {
+			t.Error("failed rotation set a session cookie")
+		}
+
+		a.sessions.signOutEr = nil
+		a.sessions.signInErr = errors.New("pq: connection reset")
+		failedStore := a.doBody(t, http.MethodPost, "/api/v1/dev/login", `{"email":"fake.alice@example.com"}`, nil)
+		decodeProblem(t, failedStore, probInternal)
+		if strings.Contains(failedStore.Body.String(), "pq:") {
+			t.Errorf("internal error leaked: %s", failedStore.Body)
+		}
+	})
 }

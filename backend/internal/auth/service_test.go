@@ -63,6 +63,29 @@ func (m *memStore) GetUserIDByIdentity(_ context.Context, issuer, subject string
 	return id, nil
 }
 
+func (m *memStore) GetUserIDByEmail(_ context.Context, email string) (uuid.UUID, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failWith != nil {
+		return uuid.Nil, m.failWith
+	}
+	id, ok := m.emails[strings.ToLower(email)]
+	if !ok {
+		return uuid.Nil, fmt.Errorf("looking up email: %w", store.ErrNotFound)
+	}
+	return id, nil
+}
+
+func (m *memStore) CreateSession(_ context.Context, userID uuid.UUID, hash []byte, createdAt, expiresAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failWith != nil {
+		return m.failWith
+	}
+	m.sessions[string(hash)] = domain.Session{UserID: userID, CreatedAt: createdAt, LastSeenAt: createdAt, ExpiresAt: expiresAt}
+	return nil
+}
+
 // SignInIdentity mirrors the store: the login is recorded and the session
 // created only while the identity is bound to the user.
 func (m *memStore) SignInIdentity(_ context.Context, userID uuid.UUID, ident domain.Identity, hash []byte, at, expiresAt time.Time) error {
@@ -540,5 +563,35 @@ func TestFirstSignInChecksBindingBeforeIssuingSession(t *testing.T) {
 		if !errors.Is(err, store.ErrNotFound) || len(st.sessions) != 0 {
 			t.Fatalf("concurrent enrollment %t: err = %v, sessions = %d", concurrentEnrollment, err, len(st.sessions))
 		}
+	}
+}
+
+func TestSignInDev(t *testing.T) {
+	svc, st, clk := newService(t, "") // empty allowlist: dev fixtures have no identities
+	fixtureID := uuid.MustParse("00000000-0000-4000-8000-000000000101")
+	st.emails["e2e-desktop-synced@example.com"] = fixtureID
+
+	signed, err := svc.SignInDev(ctxT(t), "  E2E-DESKTOP-SYNCED@example.com ")
+	if err != nil || signed.UserID != fixtureID {
+		t.Fatalf("SignInDev = %+v, %v; want user %s", signed, err, fixtureID)
+	}
+	got, err := svc.Authenticate(ctxT(t), signed.Token)
+	if err != nil || got != fixtureID {
+		t.Fatalf("Authenticate = %s, %v; want %s", got, err, fixtureID)
+	}
+	sess := st.sessions[string(hashOf(t, signed.Token))]
+	if !sess.CreatedAt.Equal(clk.Now()) || !sess.ExpiresAt.Equal(clk.Now().Add(auth.AbsoluteLifetime)) {
+		t.Errorf("session timestamps = %+v, want created at %s", sess, clk.Now())
+	}
+
+	for _, missing := range []string{"", "   ", "unknown-fixture@example.com"} {
+		if _, err := svc.SignInDev(ctxT(t), missing); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("SignInDev(%q) = %v, want ErrNotFound", missing, err)
+		}
+	}
+
+	st.failWith = errors.New("fake: database offline")
+	if _, err := svc.SignInDev(ctxT(t), "e2e-desktop-synced@example.com"); err == nil || errors.Is(err, store.ErrNotFound) {
+		t.Errorf("store failure = %v, want non-not-found error", err)
 	}
 }

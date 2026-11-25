@@ -21,7 +21,7 @@ The dev server (and `npm run preview`) proxies `/api` to the Go API, so the brow
 | `src/api/` | Typed API client (`createApiClient`, `openapi-fetch`) and `schema.d.ts`, generated from [`backend/api/openapi.yaml`](../backend/api/openapi.yaml) — never edit it by hand; run `npm run generate:api` or `make generate`. |
 | `src/**/*.test.{ts,tsx}` | Vitest + Testing Library component tests (jsdom). |
 | `config/` | Node-side helpers for the Vite config, with their Vitest specs. |
-| `e2e/` | Playwright specs; each runs in the `desktop` (`1280x800`) and `mobile` (`390x844`, touch) projects. |
+| `e2e/` | Playwright specs (`*.spec.ts`), shared fixtures (`fixtures.ts`, `fixtureUsers.ts`), and the deterministic E2E stack launcher (`stack.ts`); each spec runs in the `desktop` (`1280x800`) and `mobile` (`390x844`, touch) projects with isolated fixture users per project and state. |
 
 TypeScript is split into `tsconfig.app.json` (browser code), `tsconfig.node.json` (configs) and `tsconfig.e2e.json` (Playwright specs), all `strict` with `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`.
 
@@ -35,7 +35,8 @@ Because `web/package.json` exists, the root `make build`, `make test`, `make lin
 | `typecheck` | `tsc -b` across the three projects (no emit, `"strict": true`). |
 | `lint` | ESLint (`typescript-eslint` strict type-checked, React Hooks), `@typescript-eslint/no-explicit-any` as an error, zero warnings. |
 | `test` | Vitest unit/component tests. |
-| `test:e2e` | Playwright specs across the desktop (`1280x800`) and mobile (`390x844`) projects; starts the Vite dev server itself. Install the browser once with `npx playwright install chromium`. |
+| `test:e2e` | Playwright specs across the desktop (`1280x800`) and mobile (`390x844`) projects against the full deterministic stack (`e2e:stack`). Install the browser once with `npx playwright install chromium`. |
+| `e2e:stack` | Starts compose PostgreSQL, compiles `pulse-worker` and `pulse-api`, seeds per-project fixture users at `E2E_DEV_NOW`, and runs polling `pulse-worker` (`1s`) + `pulse-api` (`ENV=development`, `PULSE_ENABLE_DEV_LOGIN=true`) + Vite (`:5173`). |
 
 `generate:api` regenerates `src/api/schema.d.ts` from the OpenAPI contract; `make generate-check` fails CI when it is stale. `openapi-typescript` declares a TypeScript 5 peer; `package.json` `overrides` points it at the project's TypeScript 6, which it only uses to print declarations.
 

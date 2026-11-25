@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './fixtures.ts';
 
 // Runs in both the desktop (1280x800) and mobile (390x844) projects.
 test.describe('app shell', () => {

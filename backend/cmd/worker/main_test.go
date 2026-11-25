@@ -21,13 +21,20 @@ func env(m map[string]string) func(string) string { return func(k string) string
 
 func TestLoadConfig(t *testing.T) {
 	cfg, err := loadConfig(env(map[string]string{
-		"DATABASE_URL": "postgres://localhost/x", "PULSE_SYNC_POLL_INTERVAL": "30s", "PULSE_ENABLE_MOCK_PROVIDER": "true", "ENV": "development",
+		"DATABASE_URL": "postgres://localhost/x", "PULSE_SYNC_POLL_INTERVAL": "30s", "PULSE_ENABLE_MOCK_PROVIDER": "true",
+		"ENV": "development", "PULSE_DEV_NOW": "2026-11-15T14:30:00Z",
 	}))
-	if err != nil || cfg.pollInterval != 30*time.Second || !cfg.enableMock || cfg.env != "development" {
+	if err != nil || cfg.pollInterval != 30*time.Second || !cfg.enableMock || cfg.env != "development" || cfg.clock.Pinned.IsZero() {
 		t.Fatalf("loadConfig = %+v, %v", cfg, err)
 	}
+	prodIgnored, err := loadConfig(env(map[string]string{
+		"DATABASE_URL": "postgres://localhost/x", "ENV": "production", "PULSE_DEV_NOW": "2026-11-15T14:30:00Z",
+	}))
+	if err != nil || !prodIgnored.clock.Pinned.IsZero() || !prodIgnored.clock.Ignored {
+		t.Fatalf("prodIgnored = %+v, %v", prodIgnored, err)
+	}
 	defaults, err := loadConfig(env(map[string]string{"DATABASE_URL": "postgres://localhost/x"}))
-	if err != nil || defaults.pollInterval != time.Minute || defaults.enableMock {
+	if err != nil || defaults.pollInterval != time.Minute || defaults.enableMock || !defaults.clock.Pinned.IsZero() {
 		t.Fatalf("defaults = %+v, %v", defaults, err)
 	}
 	for name, e := range map[string]map[string]string{
@@ -35,6 +42,7 @@ func TestLoadConfig(t *testing.T) {
 		"bad interval":  {"DATABASE_URL": "x", "PULSE_SYNC_POLL_INTERVAL": "soon"},
 		"zero interval": {"DATABASE_URL": "x", "PULSE_SYNC_POLL_INTERVAL": "0s"},
 		"bad bool":      {"DATABASE_URL": "x", "PULSE_ENABLE_MOCK_PROVIDER": "maybe"},
+		"bad dev clock": {"DATABASE_URL": "x", "ENV": "development", "PULSE_DEV_NOW": "tomorrow"},
 	} {
 		if _, err := loadConfig(env(e)); err == nil {
 			t.Errorf("%s: want error", name)
@@ -125,12 +133,27 @@ func TestParseSyncArgs(t *testing.T) {
 }
 
 func TestParseSeedArgs(t *testing.T) {
-	email, tz, err := parseSeedArgs(nil)
-	if err != nil || email != "dev@example.com" || tz != "Europe/Stockholm" {
-		t.Fatalf("defaults = %q %q %v", email, tz, err)
+	got, err := parseSeedArgs(nil)
+	if err != nil || got != (seedRequest{email: "dev@example.com", tz: "Europe/Stockholm", connection: seedSynced}) {
+		t.Fatalf("defaults = %+v, %v", got, err)
 	}
-	if _, _, err := parseSeedArgs([]string{"-tz", "UTC", "extra"}); !errors.Is(err, errUsage) {
-		t.Errorf("extra operand: want usage error, got %v", err)
+	id := uuid.MustParse("00000000-0000-4000-8000-000000000101")
+	for _, conn := range []seedConnection{seedSynced, seedEmpty, seedRevoked, seedNone} {
+		got, err := parseSeedArgs([]string{"-user-id", id.String(), "-email", "e2e@example.com", "-tz", "UTC", "-connection", string(conn)})
+		if err != nil || got != (seedRequest{userID: id, email: "e2e@example.com", tz: "UTC", connection: conn}) {
+			t.Fatalf("conn %s = %+v, %v", conn, got, err)
+		}
+	}
+	for name, args := range map[string][]string{
+		"extra operand": {"-tz", "UTC", "extra"},
+		"bad user-id":   {"-user-id", "not-a-uuid"},
+		"nil user-id":   {"-user-id", uuid.Nil.String()},
+		"bad state":     {"-connection", "broken"},
+		"unknown flag":  {"-force"},
+	} {
+		if _, err := parseSeedArgs(args); !errors.Is(err, errUsage) {
+			t.Errorf("%s: want usage error, got %v", name, err)
+		}
 	}
 }
 
@@ -147,6 +170,8 @@ func TestRunRejectsBadInvocationsBeforeTouchingTheDatabase(t *testing.T) {
 		"run with operands": {[]string{"run", "now"}, true, "no arguments"},
 		"sync without user": {[]string{"sync", "-provider", "mock"}, true, "-user"},
 		"seed outside dev":  {[]string{"seed-dev"}, false, "ENV=development"},
+		"seed bad state":    {[]string{"seed-dev", "-connection", "paused"}, true, "-connection"},
+		"seed bad user-id":  {[]string{"seed-dev", "-user-id", "abc"}, true, "-user-id"},
 		"connect bad user":  {[]string{"connect-google", "-user", "me"}, true, "-user must be a UUID"},
 		"connect extra arg": {[]string{"connect-google", "-user", "00000000-0000-4000-8000-000000000001", "now"}, true, "unexpected argument"},
 		"connect no google": {[]string{"connect-google", "-user", "00000000-0000-4000-8000-000000000001"}, false, "GOOGLE_OAUTH_CLIENT_ID"},

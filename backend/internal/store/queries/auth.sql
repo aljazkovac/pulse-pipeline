@@ -10,6 +10,15 @@ SELECT user_id
 FROM user_identities
 WHERE issuer = @issuer AND subject = @subject;
 
+-- AUTHENTICATION BOUNDARY (AGENTS.md §1.1, ADR-0005 §8): runs before a
+-- user_id is known. Keyed by lower(email); returns the user ID only.
+-- Called only by the development-only login (ENV=development +
+-- PULSE_ENABLE_DEV_LOGIN=true).
+-- name: GetUserIDByEmail :one
+SELECT id
+FROM users
+WHERE lower(email) = lower(@email);
+
 -- name: RecordIdentityLogin :execrows
 UPDATE user_identities
 SET email = @email, last_login_at = @last_login_at

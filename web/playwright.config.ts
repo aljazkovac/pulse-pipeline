@@ -35,9 +35,12 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: 'npm run dev',
-    url: baseURL,
-    reuseExistingServer: !isCI,
-    timeout: 60_000,
+    // Starts compose PostgreSQL, seeds per-project fixture users at E2E_DEV_NOW,
+    // and runs polling pulse-worker + pulse-api (dev login + pinned clock) + Vite.
+    // Never reuse a standalone `npm run dev`, which lacks the E2E backend and fixtures.
+    command: 'npm run e2e:stack',
+    url: `${baseURL}/api/v1/health`,
+    reuseExistingServer: false,
+    timeout: 120_000,
   },
 });

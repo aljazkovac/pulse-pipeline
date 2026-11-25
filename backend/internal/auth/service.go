@@ -68,12 +68,15 @@ func Denied(err error) bool {
 
 // Store is the subset of *store.Store the service needs. Every method is
 // scoped by user ID except the authentication-boundary lookups
-// GetUserIDByIdentity and GetSessionByTokenHash and the system-context sweeps
-// DeleteExpiredSessions and DeleteSessionsOutsideAllowlist (AGENTS.md §1.1).
+// GetUserIDByIdentity, GetUserIDByEmail (development login only) and
+// GetSessionByTokenHash and the system-context sweeps DeleteExpiredSessions
+// and DeleteSessionsOutsideAllowlist (AGENTS.md §1.1).
 type Store interface {
 	GetUserIDByIdentity(ctx context.Context, issuer, subject string) (uuid.UUID, error)
+	GetUserIDByEmail(ctx context.Context, email string) (uuid.UUID, error)
 	SignInIdentity(ctx context.Context, userID uuid.UUID, ident domain.Identity, tokenHash []byte, at, expiresAt time.Time) error
 	CreateUserWithIdentity(ctx context.Context, ident domain.Identity, timezone string, at time.Time) (domain.User, error)
+	CreateSession(ctx context.Context, userID uuid.UUID, tokenHash []byte, createdAt, expiresAt time.Time) error
 	GetSessionByTokenHash(ctx context.Context, tokenHash []byte) (domain.Session, error)
 	TouchSession(ctx context.Context, userID uuid.UUID, tokenHash []byte, at time.Time) error
 	DeleteSession(ctx context.Context, userID uuid.UUID, tokenHash []byte) error
@@ -148,6 +151,31 @@ func (s *Service) SignIn(ctx context.Context, c Claims) (SignedIn, error) {
 	// identity, so a replaced identity never keeps a session.
 	if err := s.st.SignInIdentity(ctx, userID, c.Identity, hash, now, expires); err != nil {
 		return SignedIn{}, fmt.Errorf("auth: signing in: %w", err)
+	}
+	return SignedIn{UserID: userID, Token: token}, nil
+}
+
+// SignInDev issues a session for an existing user identified by email
+// (case-insensitive), for the development-only POST /api/v1/dev/login route
+// (ADR-0005 §8). It never creates a user and returns an error wrapping
+// store.ErrNotFound when the email is blank or unknown. Callers must gate the
+// route on ENV=development and PULSE_ENABLE_DEV_LOGIN=true.
+func (s *Service) SignInDev(ctx context.Context, email string) (SignedIn, error) {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return SignedIn{}, fmt.Errorf("auth: development sign-in requires an email: %w", store.ErrNotFound)
+	}
+	userID, err := s.st.GetUserIDByEmail(ctx, email)
+	if err != nil {
+		return SignedIn{}, fmt.Errorf("auth: development sign-in: %w", err)
+	}
+	now := s.now().UTC()
+	token, hash, err := newSessionToken()
+	if err != nil {
+		return SignedIn{}, err
+	}
+	if err := s.st.CreateSession(ctx, userID, hash, now, now.Add(AbsoluteLifetime)); err != nil {
+		return SignedIn{}, fmt.Errorf("auth: development sign-in: %w", err)
 	}
 	return SignedIn{UserID: userID, Token: token}, nil
 }

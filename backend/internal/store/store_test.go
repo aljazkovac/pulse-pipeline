@@ -139,6 +139,65 @@ func TestGetUser_NotFound(t *testing.T) {
 	}
 }
 
+func TestResetDevUser(t *testing.T) {
+	ctx := ctxT(t)
+	fixtureID := uuid.New()
+	email := fmt.Sprintf("fixture-%s@example.com", fixtureID)
+	bystander := newUser(t)
+	day := mustDate(t, "2026-11-15")
+	if _, err := testStore.UpsertDailySummaries(ctx, bystander.ID, []domain.DailySummary{{Provider: mock, Date: day, Steps: ptr[int32](5000)}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := testStore.ResetDevUser(ctx, uuid.Nil, email, "UTC"); err == nil {
+		t.Fatal("accepted nil UUID")
+	}
+	if _, err := testStore.ResetDevUser(ctx, fixtureID, email, "Mars/Olympus"); err == nil {
+		t.Fatal("accepted invalid timezone")
+	}
+
+	u, err := testStore.ResetDevUser(ctx, fixtureID, email, "UTC")
+	if err != nil || u.ID != fixtureID || u.Email != email || u.Timezone != "UTC" {
+		t.Fatalf("first ResetDevUser = %+v, %v", u, err)
+	}
+	if _, err := testStore.CreateConnection(ctx, fixtureID, mock, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testStore.UpsertDailySummaries(ctx, fixtureID, []domain.DailySummary{{Provider: mock, Date: day, Steps: ptr[int32](9000)}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-seeding the same fixture ID wipes its old connections and summaries
+	// and updates its timezone, while leaving other users untouched.
+	reset, err := testStore.ResetDevUser(ctx, fixtureID, email, "Europe/Stockholm")
+	if err != nil || reset.ID != fixtureID || reset.Timezone != "Europe/Stockholm" {
+		t.Fatalf("second ResetDevUser = %+v, %v", reset, err)
+	}
+	if n := countRows(t, "SELECT count(*) FROM daily_summaries WHERE user_id = $1", fixtureID); n != 0 {
+		t.Errorf("fixture summaries survived reset: %d", n)
+	}
+	if n := countRows(t, "SELECT count(*) FROM provider_connections WHERE user_id = $1", fixtureID); n != 0 {
+		t.Errorf("fixture connections survived reset: %d", n)
+	}
+	if n := countRows(t, "SELECT count(*) FROM daily_summaries WHERE user_id = $1", bystander.ID); n != 1 {
+		t.Errorf("bystander summaries = %d, want 1", n)
+	}
+
+	// Colliding with another user's email rolls back the delete as well.
+	if _, err := testStore.UpsertDailySummaries(ctx, fixtureID, []domain.DailySummary{{Provider: mock, Date: day, Steps: ptr[int32](7777)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testStore.ResetDevUser(ctx, fixtureID, strings.ToUpper(bystander.Email), "UTC"); !errors.Is(err, store.ErrEmailTaken) {
+		t.Fatalf("collision err = %v, want ErrEmailTaken", err)
+	}
+	if got, err := testStore.GetUser(ctx, fixtureID); err != nil || got.Email != email {
+		t.Errorf("fixture after rolled-back collision = %+v, %v", got, err)
+	}
+	if n := countRows(t, "SELECT count(*) FROM daily_summaries WHERE user_id = $1", fixtureID); n != 1 {
+		t.Errorf("rolled-back collision lost fixture summaries: %d", n)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // daily summaries
 // ---------------------------------------------------------------------------
