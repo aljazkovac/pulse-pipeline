@@ -24,6 +24,7 @@ import (
 
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/domain"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/store"
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/sync"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/testdb"
 )
 
@@ -294,9 +295,23 @@ func (h *cancelOnSync) WithAttrs(as []slog.Attr) slog.Handler {
 func TestWorker_RunPollsDueConnectionsUntilStopped(t *testing.T) {
 	ctx := ctxT(t)
 	userID := seedDev(t, ctx)
-	if _, err := testPool.Exec(ctx, "UPDATE provider_connections SET next_sync_at = now() WHERE user_id = $1", userID); err != nil {
+	emptyID, revokedID := uuid.New(), uuid.New()
+	// Reject an intermediate active, due insert for either fixture even if a
+	// poll does not happen to land between that insert and a corrective update.
+	constraint := fmt.Sprintf(`ALTER TABLE provider_connections ADD CONSTRAINT fixture_initial_state CHECK (
+		(user_id <> '%s' OR status = 'active' AND next_sync_at > created_at) AND
+		(user_id <> '%s' OR status = 'revoked')
+	) NOT VALID`, emptyID, revokedID)
+	if _, err := testPool.Exec(ctx, constraint); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := testPool.Exec(cleanupCtx, "ALTER TABLE provider_connections DROP CONSTRAINT fixture_initial_state"); err != nil {
+			t.Errorf("dropping fixture state constraint: %v", err)
+		}
+	})
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -304,8 +319,20 @@ func TestWorker_RunPollsDueConnectionsUntilStopped(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- run(runCtx, nil, devEnv(map[string]string{"PULSE_SYNC_POLL_INTERVAL": "1h"}), io.Discard, logger)
+		done <- run(runCtx, nil, devEnv(map[string]string{"PULSE_SYNC_POLL_INTERVAL": "10ms"}), io.Discard, logger)
 	}()
+	// Keep the nightly boundary outside the test even with a wall clock.
+	emptyTimezone := "UTC"
+	now := time.Now()
+	if sync.NextNightly(now, time.UTC, sync.DefaultConfig().SyncHour).Sub(now) < 5*time.Minute {
+		emptyTimezone = testTimezone
+	}
+	seedDev(t, ctx, "-user-id", emptyID.String(), "-tz", emptyTimezone)
+	seedDev(t, ctx, "-user-id", revokedID.String(), "-connection", "revoked")
+	// Queue an ordinary sync after seeding so the test observes a real poll.
+	if _, err := testPool.Exec(ctx, "UPDATE provider_connections SET next_sync_at = now() WHERE user_id = $1", userID); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case err := <-done:
 		if err != nil {
@@ -315,6 +342,12 @@ func TestWorker_RunPollsDueConnectionsUntilStopped(t *testing.T) {
 		t.Fatal("worker did not sync the seeded connection and stop")
 	}
 
+	if n := count(t, ctx, "SELECT count(*) FROM sync_runs WHERE user_id IN ($1, $2)", emptyID, revokedID); n != 0 {
+		t.Errorf("scheduled worker claimed %d empty or revoked fixture connections", n)
+	}
+	if n := count(t, ctx, "SELECT count(*) FROM daily_summaries WHERE user_id = $1", emptyID); n != 0 {
+		t.Errorf("empty fixture has %d daily summaries, want 0", n)
+	}
 	if n := count(t, ctx, "SELECT count(*) FROM sync_runs WHERE user_id = $1 AND trigger = 'scheduled' AND status = 'succeeded'", userID); n != 1 {
 		t.Errorf("scheduled runs = %d, want 1", n)
 	}

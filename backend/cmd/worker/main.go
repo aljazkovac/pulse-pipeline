@@ -595,36 +595,22 @@ func seedDevUser(ctx context.Context, d deps, cfg config, req seedRequest, stdou
 		_, err = fmt.Fprintf(stdout, "created user %s (%s, %s) with no connections\n", u.ID, u.Email, u.Timezone)
 		return err
 	case seedRevoked:
-		conn, err := d.store.CreateConnection(ctx, u.ID, domain.ProviderMock, nil)
-		if err != nil {
-			return err
-		}
-		if err := d.store.SetConnectionStatus(ctx, u.ID, conn.ID, domain.ConnectionRevoked); err != nil {
+		if err := d.store.CreateDevMockConnection(ctx, u.ID, domain.ConnectionRevoked, now); err != nil {
 			return err
 		}
 		_, err = fmt.Fprintf(stdout, "created user %s (%s, %s) with a revoked mock connection\n", u.ID, u.Email, u.Timezone)
 		return err
 	case seedEmpty:
-		conn, err := d.store.CreateConnection(ctx, u.ID, domain.ProviderMock, nil)
-		if err != nil {
-			return err
-		}
-		// Schedule for the next nightly slot after now so a live polling worker
-		// at PULSE_DEV_NOW leaves an empty fixture empty until a manual sync runs.
+		// Keep the fixture out of scheduled polls until its next nightly slot.
 		next := sync.NextNightly(now, u.Location(), sync.DefaultConfig().SyncHour)
-		if err := d.store.RescheduleConnection(ctx, u.ID, conn.ID, next); err != nil {
+		if err := d.store.CreateDevMockConnection(ctx, u.ID, domain.ConnectionActive, next); err != nil {
 			return err
 		}
 		_, err = fmt.Fprintf(stdout, "created user %s (%s, %s) with an empty mock connection\n", u.ID, u.Email, u.Timezone)
 		return err
 	default: // seedSynced
-		conn, err := d.store.CreateConnection(ctx, u.ID, domain.ProviderMock, nil)
-		if err != nil {
-			return err
-		}
-		// Align next_sync_at with now so ClaimSyncRun succeeds even when
-		// PULSE_DEV_NOW is earlier than PostgreSQL's wall-clock DEFAULT now().
-		if err := d.store.RescheduleConnection(ctx, u.ID, conn.ID, now); err != nil {
+		// Use the development clock so the initial scheduled sync is due.
+		if err := d.store.CreateDevMockConnection(ctx, u.ID, domain.ConnectionActive, now); err != nil {
 			return err
 		}
 		r, err := d.syncer.SyncConnection(ctx, sync.Request{

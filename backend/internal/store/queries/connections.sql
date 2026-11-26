@@ -7,6 +7,10 @@ INSERT INTO provider_connections (user_id, provider, scopes)
 VALUES (@user_id, @provider, @scopes)
 RETURNING id, user_id, provider, status, scopes, next_sync_at, last_synced_at, created_at;
 
+-- name: CreateDevMockConnection :exec
+INSERT INTO provider_connections (user_id, provider, status, next_sync_at)
+VALUES (@user_id, 'mock', @status, @next_sync_at);
+
 -- name: GetProviderConnection :one
 SELECT id, user_id, provider, status, scopes, next_sync_at, last_synced_at, created_at
 FROM provider_connections

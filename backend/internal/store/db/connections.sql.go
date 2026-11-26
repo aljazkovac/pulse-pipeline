@@ -13,6 +13,22 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const createDevMockConnection = `-- name: CreateDevMockConnection :exec
+INSERT INTO provider_connections (user_id, provider, status, next_sync_at)
+VALUES ($1, 'mock', $2, $3)
+`
+
+type CreateDevMockConnectionParams struct {
+	UserID     uuid.UUID
+	Status     string
+	NextSyncAt time.Time
+}
+
+func (q *Queries) CreateDevMockConnection(ctx context.Context, arg CreateDevMockConnectionParams) error {
+	_, err := q.db.Exec(ctx, createDevMockConnection, arg.UserID, arg.Status, arg.NextSyncAt)
+	return err
+}
+
 const createProviderConnection = `-- name: CreateProviderConnection :one
 
 INSERT INTO provider_connections (user_id, provider, scopes)
