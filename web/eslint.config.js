@@ -36,4 +36,10 @@ export default defineConfig([
     files: ['*.config.ts', 'config/**/*.ts', 'e2e/**/*.ts'],
     languageOptions: { globals: globals.node },
   },
+  {
+    // Playwright's fixture runner requires the first parameter to be `{}` when a
+    // fixture depends on `testInfo` only.
+    files: ['e2e/**/*.ts'],
+    rules: { 'no-empty-pattern': 'off' },
+  },
 ]);

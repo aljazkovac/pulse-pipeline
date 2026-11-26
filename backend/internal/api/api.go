@@ -46,6 +46,9 @@ type Options struct {
 	// Dev selects the development cookies (ENV=development): unprefixed
 	// names without Secure, for plain http://localhost (ADR-0005 §3).
 	Dev bool
+	// DevLogin registers POST /api/v1/dev/login when Dev is also true
+	// (ENV=development + PULSE_ENABLE_DEV_LOGIN=true, ADR-0005 §8).
+	DevLogin bool
 }
 
 // NewHandler returns the complete API handler: routing, sessions,
@@ -62,6 +65,9 @@ func NewHandler(opts Options) http.Handler {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", liveness)
+	if opts.Dev && opts.DevLogin {
+		mux.HandleFunc("POST "+BasePath+"/dev/login", s.devLogin)
+	}
 
 	strict := gen.NewStrictHandlerWithOptions(s, nil, gen.StrictHTTPServerOptions{
 		RequestErrorHandlerFunc:  s.requestError,

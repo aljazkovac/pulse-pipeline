@@ -51,6 +51,18 @@ func (s *Store) GetUserIDByIdentity(ctx context.Context, issuer, subject string)
 	return id, nil
 }
 
+// GetUserIDByEmail is an AUTHENTICATION BOUNDARY query (AGENTS.md §1.1,
+// ADR-0005 §8): it runs before a user is known, is keyed by lower(email) and
+// returns only the user's ID, or ErrNotFound. Only the development-only login
+// (ENV=development + PULSE_ENABLE_DEV_LOGIN=true) calls it.
+func (s *Store) GetUserIDByEmail(ctx context.Context, email string) (uuid.UUID, error) {
+	id, err := s.q.GetUserIDByEmail(ctx, email)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("looking up user by email: %w", notFound(err))
+	}
+	return id, nil
+}
+
 // RecordIdentityLogin stores the identity's current email and sign-in time.
 // It returns ErrNotFound unless the identity is bound to userID.
 func (s *Store) RecordIdentityLogin(ctx context.Context, userID uuid.UUID, ident domain.Identity, at time.Time) error {

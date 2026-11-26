@@ -488,3 +488,122 @@ func TestSignInAndSessionIsolationAgainstPostgres(t *testing.T) {
 		t.Fatalf("run = %v, want a clean shutdown", err)
 	}
 }
+
+func (c apiClient) postJSON(path, body string, cookies []*http.Cookie, headers ...string) *http.Response {
+	c.t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, c.base+path, strings.NewReader(body))
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for _, ck := range cookies {
+		req.AddCookie(&http.Cookie{Name: ck.Name, Value: ck.Value})
+	}
+	for i := 0; i+1 < len(headers); i += 2 {
+		req.Header.Set(headers[i], headers[i+1])
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		c.t.Fatalf("POST %s: %v", path, err)
+	}
+	c.t.Cleanup(func() { _ = resp.Body.Close() })
+	return resp
+}
+
+// TestDevLoginAndPinnedClockAgainstPostgres checks ADR-0005 §8 against a real
+// PostgreSQL 17: POST /api/v1/dev/login answers 404 under production
+// configuration (even with PULSE_ENABLE_DEV_LOGIN=true), and with
+// ENV=development + PULSE_ENABLE_DEV_LOGIN=true + PULSE_DEV_NOW it signs in an
+// existing fixture user at the pinned clock and survives the empty-allowlist sweep.
+func TestDevLoginAndPinnedClockAgainstPostgres(t *testing.T) {
+	testdb.Require(t, testPool)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	st := store.New(testPool)
+	fixtureID := uuid.New()
+	fixtureEmail := "e2e-fixture-" + fixtureID.String()[:8] + "@example.com"
+	if _, err := st.ResetDevUser(ctx, fixtureID, fixtureEmail, "Europe/Stockholm"); err != nil {
+		t.Fatal(err)
+	}
+
+	startAPI := func(t *testing.T, extra map[string]string) (apiClient, func()) {
+		t.Helper()
+		sctx, stop := context.WithCancel(ctx)
+		m := map[string]string{"DATABASE_URL": testURL}
+		for k, v := range extra {
+			m[k] = v
+		}
+		var lc net.ListenConfig
+		listening := make(chan net.Addr, 1)
+		listen := func(ctx context.Context, network, _ string) (net.Listener, error) {
+			ln, err := lc.Listen(ctx, network, "127.0.0.1:0")
+			if err != nil {
+				return nil, fmt.Errorf("binding test listener: %w", err)
+			}
+			listening <- ln.Addr()
+			return ln, nil
+		}
+		done := make(chan error, 1)
+		go func() { done <- run(sctx, env(m), quietLogger(), listen) }()
+		var base string
+		select {
+		case addr := <-listening:
+			base = "http://" + addr.String()
+		case err := <-done:
+			stop()
+			t.Fatalf("run exited before listening: %v", err)
+		}
+		return apiClient{t: t, base: base, hc: &http.Client{Timeout: 10 * time.Second}}, func() {
+			stop()
+			if err := <-done; err != nil {
+				t.Fatalf("shutdown: %v", err)
+			}
+		}
+	}
+
+	// Production configuration returns 404 even when PULSE_ENABLE_DEV_LOGIN=true.
+	for name, extra := range map[string]map[string]string{
+		"production":                 {"ENV": "production", "PULSE_ENABLE_DEV_LOGIN": "true"},
+		"unset ENV":                  {"PULSE_ENABLE_DEV_LOGIN": "true"},
+		"development without opt-in": {"ENV": "development"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, shutdown := startAPI(t, extra)
+			defer shutdown()
+			resp := c.postJSON("/api/v1/dev/login", fmt.Sprintf(`{"email":%q}`, fixtureEmail), nil)
+			if resp.StatusCode != http.StatusNotFound || problemType(t, resp) != "not-found" {
+				t.Fatalf("status = %d, want 404 not-found", resp.StatusCode)
+			}
+		})
+	}
+
+	const pinnedNow = "2026-11-15T14:30:00Z"
+	wantNow := time.Date(2026, 11, 15, 14, 30, 0, 0, time.UTC)
+	c, shutdown := startAPI(t, map[string]string{
+		"ENV": "development", "PULSE_ENABLE_DEV_LOGIN": "true", "PULSE_DEV_NOW": pinnedNow,
+	})
+	defer shutdown()
+
+	resp := c.postJSON("/api/v1/dev/login", fmt.Sprintf(`{"email":%q}`, fixtureEmail), nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("dev login = %d, want 204", resp.StatusCode)
+	}
+	sessCookie := cookieNamed(resp, "pulse_session")
+	if sessCookie == nil || !sessCookie.HttpOnly || sessCookie.Secure {
+		t.Fatalf("dev session cookie = %+v", sessCookie)
+	}
+	if code, email, tz := c.profile(sessCookie); code != http.StatusOK || email != fixtureEmail || tz != "Europe/Stockholm" {
+		t.Fatalf("/me = %d %q %q, want 200 %q Europe/Stockholm", code, email, tz, fixtureEmail)
+	}
+
+	raw, err := base64.RawURLEncoding.DecodeString(sessCookie.Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(raw)
+	stored, err := st.GetSessionByTokenHash(ctx, sum[:])
+	if err != nil || !stored.CreatedAt.Equal(wantNow) {
+		t.Fatalf("stored session = %+v, %v; want created_at %s", stored, err, wantNow)
+	}
+}

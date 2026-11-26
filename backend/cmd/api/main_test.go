@@ -144,6 +144,43 @@ func TestLoadConfigSignIn(t *testing.T) {
 	}
 }
 
+func TestLoadConfigDevControls(t *testing.T) {
+	const db = "postgres://db/pulse"
+	cfg, err := loadConfig(env(map[string]string{
+		"DATABASE_URL": db, "ENV": "development",
+		"PULSE_ENABLE_DEV_LOGIN": "true", "PULSE_DEV_NOW": "2026-11-15T14:30:00Z",
+	}))
+	if err != nil || !cfg.dev || !cfg.devLogin || cfg.devLoginIgnored || cfg.clock.Pinned.IsZero() {
+		t.Fatalf("dev controls = %+v, %v", cfg, err)
+	}
+
+	if got := cfg.listenAddress(); got != "127.0.0.1:8080" {
+		t.Errorf("dev login listen address = %q, want IPv4 loopback", got)
+	}
+
+	// Production ignores both controls rather than turning them on.
+	prod, err := loadConfig(env(map[string]string{
+		"DATABASE_URL": db, "ENV": "production",
+		"PULSE_ENABLE_DEV_LOGIN": "true", "PULSE_DEV_NOW": "2026-11-15T14:30:00Z",
+	}))
+	if err != nil || prod.dev || prod.devLogin || !prod.devLoginIgnored || !prod.clock.Pinned.IsZero() || !prod.clock.Ignored {
+		t.Fatalf("production controls = %+v, %v", prod, err)
+	}
+
+	if got := prod.listenAddress(); got != ":8080" {
+		t.Errorf("production listen address = %q, want wildcard", got)
+	}
+
+	for name, e := range map[string]map[string]string{
+		"bad dev login bool": {"DATABASE_URL": db, "ENV": "development", "PULSE_ENABLE_DEV_LOGIN": "yes-please"},
+		"bad dev clock":      {"DATABASE_URL": db, "ENV": "development", "PULSE_DEV_NOW": "yesterday"},
+	} {
+		if _, err := loadConfig(env(e)); err == nil {
+			t.Errorf("%s: want error", name)
+		}
+	}
+}
+
 func TestSweepSessionsRunsAtOnceThenEveryIntervalUntilCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

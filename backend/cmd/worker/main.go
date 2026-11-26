@@ -3,7 +3,8 @@
 //	pulse-worker [run]                       poll for due connections and sync them (default)
 //	pulse-worker sync -user ID -provider P   sync one connection now (manual)
 //	    [-from YYYY-MM-DD -to YYYY-MM-DD]    ...or backfill a date range
-//	pulse-worker seed-dev [-email E] [-tz Z] create a local user with a mock connection
+//	pulse-worker seed-dev [-email E] [-tz Z] [-user-id ID] [-connection synced|empty|revoked|none]
+//	                                         create or reset a local development fixture user (ADR-0005 §8)
 //	pulse-worker connect-google -user ID     link a Google Health account (ADR-0004 §3)
 //	pulse-worker bind-google-identity (-user ID [-replace] | -new-user) [-mailbox-verified]
 //	                                         bind a Google sign-in identity to a user,
@@ -11,16 +12,18 @@
 //	pulse-worker revoke-sessions -user ID    sign a user out of every session (ADR-0005 §2)
 //
 // Environment: DATABASE_URL (required), PULSE_SYNC_POLL_INTERVAL (default 1m),
-// PULSE_ENABLE_MOCK_PROVIDER (default false), ENV (seed-dev needs "development"),
-// GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET (the Desktop app
-// client: registers the Google Health provider and serves the loopback
-// commands), TOKEN_ENCRYPTION_KEY, TOKEN_ENCRYPTION_KEY_VERSION and
+// PULSE_ENABLE_MOCK_PROVIDER (default false), ENV (seed-dev and PULSE_DEV_NOW
+// need "development"), PULSE_DEV_NOW (RFC 3339 fixed clock, honored only with
+// ENV=development), GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET (the
+// Desktop app client: registers the Google Health provider and serves the
+// loopback commands), TOKEN_ENCRYPTION_KEY, TOKEN_ENCRYPTION_KEY_VERSION and
 // TOKEN_ENCRYPTION_PREVIOUS_KEYS (encrypted token storage, required with Google).
 // Every command applies pending migrations first.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -38,6 +41,7 @@ import (
 
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/auth"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/credentials"
+	"github.com/aljazkovac/pulse-pipeline/backend/internal/devclock"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/domain"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/provider/googlehealth"
 	"github.com/aljazkovac/pulse-pipeline/backend/internal/provider/mock"
@@ -69,7 +73,8 @@ func main() {
 const usage = `usage:
   pulse-worker [run]
   pulse-worker sync -user ID -provider PROVIDER [-from YYYY-MM-DD -to YYYY-MM-DD]
-  pulse-worker seed-dev [-email EMAIL] [-tz IANA_ZONE]
+  pulse-worker seed-dev [-email EMAIL] [-tz IANA_ZONE] [-user-id UUID] [-connection synced|empty|revoked|none]
+  pulse-worker seed-dev -fixtures FILE
   pulse-worker connect-google -user ID
   pulse-worker bind-google-identity (-user ID [-replace] | -new-user) [-mailbox-verified]
   pulse-worker revoke-sessions -user ID`
@@ -85,6 +90,10 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout 
 		if err != nil {
 			return err
 		}
+		clk, err := devclock.FromEnv(getenv("ENV"), getenv("PULSE_DEV_NOW"))
+		if err != nil {
+			return err
+		}
 		clientID, secret := getenv("GOOGLE_OAUTH_CLIENT_ID"), getenv("GOOGLE_OAUTH_CLIENT_SECRET")
 		if clientID == "" || secret == "" {
 			return errors.New("bind-google-identity needs GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET (the Desktop app client)")
@@ -94,7 +103,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout 
 			return err
 		}
 		return withStore(ctx, getenv("DATABASE_URL"), func(st *store.Store) error {
-			return bindGoogleIdentity(ctx, st, google, req, stdout, time.Now)
+			return bindGoogleIdentity(ctx, st, google, req, stdout, clk.Now)
 		})
 	case "revoke-sessions":
 		userID, err := parseUserArgs("revoke-sessions", args)
@@ -136,24 +145,23 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout 
 			return err
 		})
 	case "seed-dev":
-		email, tz, err := parseSeedArgs(args)
+		requests, err := seedRequests(args)
 		if err != nil {
 			return err
 		}
 		if cfg.env != "development" {
 			return errors.New("seed-dev only runs with ENV=development")
 		}
+		for _, req := range requests {
+			cfg.enableMock = cfg.enableMock || req.connection == seedSynced
+		}
 		return withDeps(ctx, cfg, logger, func(d deps) error {
-			u, err := d.store.CreateUser(ctx, email, tz)
-			if err != nil {
-				return err
+			for _, req := range requests {
+				if err := seedDevUser(ctx, d, cfg, req, stdout); err != nil {
+					return fmt.Errorf("seeding %s: %w", req.email, err)
+				}
 			}
-			if _, err := d.store.CreateConnection(ctx, u.ID, domain.ProviderMock, nil); err != nil {
-				return err
-			}
-			_, err = fmt.Fprintf(stdout, "created user %s (%s, %s) with a mock connection; "+
-				"run the worker with PULSE_ENABLE_MOCK_PROVIDER=true to sync it\n", u.ID, email, tz)
-			return err
+			return nil
 		})
 	case "connect-google":
 		userID, err := parseConnectArgs(args)
@@ -357,8 +365,16 @@ type config struct {
 	pollInterval time.Duration
 	enableMock   bool
 	env          string
+	clock        devclock.Result
 	keyring      *tokencrypt.Keyring // nil without TOKEN_ENCRYPTION_KEY
 	google       googleConfig
+}
+
+func (c config) now() time.Time {
+	if c.clock.Now != nil {
+		return c.clock.Now()
+	}
+	return time.Now()
 }
 
 // googleConfig holds the OAuth client. Its String method keeps the secret
@@ -372,8 +388,8 @@ func (g googleConfig) enabled() bool { return g.clientID != "" }
 // String omits the database URL (it may hold a password), the client secret
 // and the keys, so printing a config cannot leak them.
 func (c config) String() string {
-	return fmt.Sprintf("config{poll_interval: %s, mock: %t, env: %q, google: %t, token_key: %t}",
-		c.pollInterval, c.enableMock, c.env, c.google.enabled(), c.keyring != nil)
+	return fmt.Sprintf("config{poll_interval: %s, mock: %t, env: %q, dev_now: %t, google: %t, token_key: %t}",
+		c.pollInterval, c.enableMock, c.env, !c.clock.Pinned.IsZero(), c.google.enabled(), c.keyring != nil)
 }
 
 // GoString redacts for %#v as well.
@@ -403,6 +419,11 @@ func loadConfig(getenv func(string) string) (config, error) {
 		}
 		cfg.enableMock = b
 	}
+	clk, err := devclock.FromEnv(cfg.env, getenv("PULSE_DEV_NOW"))
+	if err != nil {
+		return config{}, err
+	}
+	cfg.clock = clk
 
 	if v := getenv("TOKEN_ENCRYPTION_KEY"); v != "" {
 		kr, err := tokencrypt.FromEnv(v, getenv("TOKEN_ENCRYPTION_KEY_VERSION"), getenv("TOKEN_ENCRYPTION_PREVIOUS_KEYS"))
@@ -460,18 +481,165 @@ func parseSyncArgs(args []string) (sync.Request, error) {
 	return req, nil
 }
 
-func parseSeedArgs(args []string) (email, tz string, err error) {
+// seedConnection names one of the ADR-0005 §8 fixture connection states.
+type seedConnection string
+
+const (
+	seedSynced  seedConnection = "synced"
+	seedEmpty   seedConnection = "empty"
+	seedRevoked seedConnection = "revoked"
+	seedNone    seedConnection = "none"
+)
+
+type seedRequest struct {
+	userID     uuid.UUID // uuid.Nil: assign a random UUID
+	email      string
+	tz         string
+	connection seedConnection
+}
+
+// seedRequests accepts the regular CLI flags or a manifest of fixed-ID E2E users.
+func seedRequests(args []string) ([]seedRequest, error) {
+	if len(args) != 2 || args[0] != "-fixtures" {
+		req, err := parseSeedArgs(args)
+		if err != nil {
+			return nil, err
+		}
+		return []seedRequest{req}, nil
+	}
+	data, err := os.ReadFile(args[1])
+	if err != nil {
+		return nil, fmt.Errorf("reading seed fixture manifest: %w", err)
+	}
+	var fixtures []struct {
+		ID         string `json:"id"`
+		Email      string `json:"email"`
+		Timezone   string `json:"timezone"`
+		Connection string `json:"connection"`
+	}
+	if err := json.Unmarshal(data, &fixtures); err != nil {
+		return nil, fmt.Errorf("decoding seed fixture manifest: %w", err)
+	}
+	if len(fixtures) == 0 {
+		return nil, errors.New("seed fixture manifest is empty")
+	}
+	requests := make([]seedRequest, 0, len(fixtures))
+	ids, emails := make(map[uuid.UUID]bool), make(map[string]bool)
+	for i, f := range fixtures {
+		req, err := parseSeedArgs([]string{"-user-id", f.ID, "-email", f.Email, "-tz", f.Timezone, "-connection", f.Connection})
+		if err != nil {
+			return nil, fmt.Errorf("fixture %d: %w", i+1, err)
+		}
+		email := strings.ToLower(strings.TrimSpace(req.email))
+		if req.userID == uuid.Nil || email == "" || req.tz == "" || ids[req.userID] || emails[email] {
+			return nil, fmt.Errorf("fixture %d: expected distinct ID and email and a non-empty timezone", i+1)
+		}
+		if _, err := time.LoadLocation(req.tz); err != nil {
+			return nil, fmt.Errorf("fixture %d: invalid timezone: %w", i+1, err)
+		}
+		ids[req.userID], emails[email] = true, true
+		requests = append(requests, req)
+	}
+	return requests, nil
+}
+
+func parseSeedArgs(args []string) (seedRequest, error) {
 	fs := flag.NewFlagSet("seed-dev", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	fs.StringVar(&email, "email", "dev@example.com", "email of the local user")
-	fs.StringVar(&tz, "tz", "Europe/Stockholm", "IANA timezone of the local user")
+	var req seedRequest
+	userID := fs.String("user-id", "", "fixed UUID of the fixture user")
+	conn := fs.String("connection", string(seedSynced), "connection state: synced, empty, revoked or none")
+	fs.StringVar(&req.email, "email", "dev@example.com", "email of the local user")
+	fs.StringVar(&req.tz, "tz", "Europe/Stockholm", "IANA timezone of the local user")
 	if err := fs.Parse(args); err != nil {
-		return "", "", fmt.Errorf("%w: seed-dev: %v", errUsage, err)
+		return seedRequest{}, fmt.Errorf("%w: seed-dev: %v", errUsage, err)
 	}
 	if fs.NArg() > 0 {
-		return "", "", fmt.Errorf("%w: seed-dev: unexpected argument %q", errUsage, fs.Arg(0))
+		return seedRequest{}, fmt.Errorf("%w: seed-dev: unexpected argument %q", errUsage, fs.Arg(0))
 	}
-	return email, tz, nil
+	if *userID != "" {
+		id, err := uuid.Parse(*userID)
+		if err != nil || id == uuid.Nil {
+			return seedRequest{}, fmt.Errorf("%w: seed-dev: -user-id must be a non-nil UUID", errUsage)
+		}
+		req.userID = id
+	}
+	switch seedConnection(*conn) {
+	case seedSynced, seedEmpty, seedRevoked, seedNone:
+		req.connection = seedConnection(*conn)
+	default:
+		return seedRequest{}, fmt.Errorf("%w: seed-dev: -connection %q must be synced, empty, revoked or none", errUsage, *conn)
+	}
+	return req, nil
+}
+
+// seedDevUser creates (or resets, when -user-id is given) a development user
+// and configures its mock connection according to req.connection (ADR-0005 §8).
+func seedDevUser(ctx context.Context, d deps, cfg config, req seedRequest, stdout io.Writer) error {
+	var (
+		u   domain.User
+		err error
+	)
+	if req.userID == uuid.Nil {
+		u, err = d.store.CreateUser(ctx, req.email, req.tz)
+	} else {
+		u, err = d.store.ResetDevUser(ctx, req.userID, req.email, req.tz)
+	}
+	if err != nil {
+		return err
+	}
+
+	now := cfg.now()
+	switch req.connection {
+	case seedNone:
+		_, err = fmt.Fprintf(stdout, "created user %s (%s, %s) with no connections\n", u.ID, u.Email, u.Timezone)
+		return err
+	case seedRevoked:
+		conn, err := d.store.CreateConnection(ctx, u.ID, domain.ProviderMock, nil)
+		if err != nil {
+			return err
+		}
+		if err := d.store.SetConnectionStatus(ctx, u.ID, conn.ID, domain.ConnectionRevoked); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(stdout, "created user %s (%s, %s) with a revoked mock connection\n", u.ID, u.Email, u.Timezone)
+		return err
+	case seedEmpty:
+		conn, err := d.store.CreateConnection(ctx, u.ID, domain.ProviderMock, nil)
+		if err != nil {
+			return err
+		}
+		// Schedule for the next nightly slot after now so a live polling worker
+		// at PULSE_DEV_NOW leaves an empty fixture empty until a manual sync runs.
+		next := sync.NextNightly(now, u.Location(), sync.DefaultConfig().SyncHour)
+		if err := d.store.RescheduleConnection(ctx, u.ID, conn.ID, next); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(stdout, "created user %s (%s, %s) with an empty mock connection\n", u.ID, u.Email, u.Timezone)
+		return err
+	default: // seedSynced
+		conn, err := d.store.CreateConnection(ctx, u.ID, domain.ProviderMock, nil)
+		if err != nil {
+			return err
+		}
+		// Align next_sync_at with now so ClaimSyncRun succeeds even when
+		// PULSE_DEV_NOW is earlier than PostgreSQL's wall-clock DEFAULT now().
+		if err := d.store.RescheduleConnection(ctx, u.ID, conn.ID, now); err != nil {
+			return err
+		}
+		r, err := d.syncer.SyncConnection(ctx, sync.Request{
+			UserID: u.ID, Provider: domain.ProviderMock, Trigger: domain.SyncTriggerScheduled,
+		})
+		if err != nil {
+			return err
+		}
+		if r.Status != domain.SyncSucceeded {
+			return fmt.Errorf("seeding user %s: initial mock sync finished %s%s", u.ID, r.Status, suffix(r.ErrorMessage))
+		}
+		_, err = fmt.Fprintf(stdout, "created user %s (%s, %s) with a synced mock connection (%d records)\n",
+			u.ID, u.Email, u.Timezone, r.RecordsIngested)
+		return err
+	}
 }
 
 func parseConnectArgs(args []string) (uuid.UUID, error) { return parseUserArgs("connect-google", args) }
@@ -498,18 +666,24 @@ func parseUserArgs(cmd string, args []string) (uuid.UUID, error) {
 type deps struct {
 	store  *store.Store
 	syncer *sync.Syncer
-	vault  *credentials.Vault      // nil without TOKEN_ENCRYPTION_KEY
+	vault  *credentials.Vault     // nil without TOKEN_ENCRYPTION_KEY
 	google *googlehealth.Provider // nil unless the Google OAuth client is configured
 }
 
 // withDeps migrates the database, connects, and wires the providers, the
 // credential vault and the Syncer.
 func withDeps(ctx context.Context, cfg config, logger *slog.Logger, fn func(deps) error) error {
+	if !cfg.clock.Pinned.IsZero() {
+		logger.Info("development clock pinned", "now", cfg.clock.Pinned)
+	} else if cfg.clock.Ignored {
+		logger.Warn("PULSE_DEV_NOW ignored outside ENV=development")
+	}
 	return withStore(ctx, cfg.databaseURL, func(st *store.Store) error {
 		d := deps{store: st}
 		var err error
 		syncCfg := sync.DefaultConfig()
 		syncCfg.Logger = logger
+		syncCfg.Now = cfg.now
 		if cfg.keyring != nil {
 			d.vault = credentials.NewVault(d.store, cfg.keyring)
 			syncCfg.Credentials = d.vault
@@ -517,7 +691,7 @@ func withDeps(ctx context.Context, cfg config, logger *slog.Logger, fn func(deps
 
 		var providers []domain.HealthProvider
 		if cfg.enableMock {
-			providers = append(providers, mock.New(mock.Options{Seed: 1}))
+			providers = append(providers, mock.New(mock.Options{Seed: 1, Now: cfg.now}))
 		}
 		if cfg.google.enabled() {
 			d.google, err = googlehealth.New(googlehealth.Options{ClientID: cfg.google.clientID, ClientSecret: cfg.google.clientSecret})

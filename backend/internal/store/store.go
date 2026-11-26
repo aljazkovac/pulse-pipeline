@@ -5,9 +5,10 @@
 // with the exceptions AGENTS.md §1.1 allows, none of which returns health
 // data or tokens: ListConnectionsDueForSync, DeleteExpiredSessions and
 // DeleteSessionsOutsideAllowlist are system context for background jobs,
-// and GetUserIDByIdentity, GetSessionByTokenHash and the enrollment check in
-// CreateUserWithIdentity are the authentication boundary that turns a
-// validated credential into a user ID (ADR-0005 §2–3).
+// and GetUserIDByIdentity, GetUserIDByEmail (development login only),
+// GetSessionByTokenHash and the enrollment check in CreateUserWithIdentity
+// are the authentication boundary that turns a validated credential into a
+// user ID (ADR-0005 §2–3, §8).
 package store
 
 import (
@@ -81,6 +82,39 @@ func (s *Store) CreateUser(ctx context.Context, email, timezone string) (domain.
 		return domain.User{}, fmt.Errorf("creating user: %w", err)
 	}
 	return domain.User{ID: row.ID, Email: row.Email, Timezone: row.Timezone, CreatedAt: row.CreatedAt.UTC()}, nil
+}
+
+// ResetDevUser creates or cleanly recreates a development fixture user with a
+// fixed ID (ADR-0005 §8). Deleting by id inside a transaction cascades that
+// fixture user's previous connections, sessions and health rows; if email
+// belongs to a different user, users_email_lower_key aborts the transaction
+// with ErrEmailTaken so no other user is modified.
+func (s *Store) ResetDevUser(ctx context.Context, id uuid.UUID, email, timezone string) (domain.User, error) {
+	if id == uuid.Nil {
+		return domain.User{}, errors.New("resetting dev user: user ID is required")
+	}
+	if _, err := time.LoadLocation(timezone); err != nil {
+		return domain.User{}, fmt.Errorf("resetting dev user %s: invalid timezone %q: %w", id, timezone, err)
+	}
+	var u domain.User
+	err := s.inTx(ctx, func(tx *Store) error {
+		if _, err := tx.q.DeleteUser(ctx, id); err != nil {
+			return fmt.Errorf("deleting previous fixture state: %w", err)
+		}
+		row, err := tx.q.CreateUserWithID(ctx, db.CreateUserWithIDParams{ID: id, Email: email, Timezone: timezone})
+		if uniqueViolation(err, usersEmailKey) {
+			return ErrEmailTaken
+		}
+		if err != nil {
+			return fmt.Errorf("creating user: %w", err)
+		}
+		u = domain.User{ID: row.ID, Email: row.Email, Timezone: row.Timezone, CreatedAt: row.CreatedAt.UTC()}
+		return nil
+	})
+	if err != nil {
+		return domain.User{}, fmt.Errorf("resetting dev user %s: %w", id, err)
+	}
+	return u, nil
 }
 
 // GetUser returns the user with id, or ErrNotFound.

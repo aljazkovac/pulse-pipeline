@@ -1,4 +1,5 @@
 import { defineConfig, devices } from '@playwright/test';
+import { E2E_RETRIES } from './e2e/fixtureUsers.ts';
 
 const isCI = Boolean(process.env.CI);
 const baseURL = 'http://localhost:5173';
@@ -11,7 +12,7 @@ export default defineConfig({
   testDir: './e2e',
   fullyParallel: true,
   forbidOnly: isCI,
-  retries: isCI ? 2 : 0,
+  retries: isCI ? E2E_RETRIES : 0,
   ...(isCI ? { workers: 1 } : {}),
   reporter: isCI ? [['github'], ['html', { open: 'never' }]] : 'list',
   use: {
@@ -35,9 +36,13 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: 'npm run dev',
-    url: baseURL,
-    reuseExistingServer: !isCI,
-    timeout: 60_000,
+    // Starts disposable PostgreSQL, seeds per-project fixture users at E2E_DEV_NOW,
+    // and runs polling pulse-worker + pulse-api (dev login + pinned clock) + Vite.
+    // Never reuse a standalone `npm run dev`, which lacks the E2E backend and fixtures.
+    command: 'npm run e2e:stack',
+    url: `${baseURL}/api/v1/health`,
+    reuseExistingServer: false,
+    timeout: 120_000,
+    gracefulShutdown: { signal: 'SIGTERM', timeout: 20_000 },
   },
 });

@@ -50,8 +50,8 @@ rollups; and sleep sessions with deep/REM/light/awake stages. The API has no sle
    cd backend
    ```
 
-4. Use an existing Pulse user ID or create a user with `go run ./cmd/worker seed-dev` in
-   development. Replace `PULSE_USER_ID` below with that ID. Open the consent URL printed by
+4. Use an existing Pulse user ID or create a user with `go run ./cmd/worker seed-dev -connection none`
+   in development. Replace `PULSE_USER_ID` below with that ID. Open the consent URL printed by
    `connect-google` in a browser **on the same machine** and allow every permission. Google
    redirects to a temporary listener on `127.0.0.1`, and the worker stores the tokens encrypted.
 
@@ -85,7 +85,8 @@ To get mock data into a local database (`make up` first):
 ```bash
 export DATABASE_URL=postgres://pulse:pulse_dev_password@localhost:5432/pulse_pipeline?sslmode=disable
 export ENV=development PULSE_ENABLE_MOCK_PROVIDER=true
-go run ./cmd/worker seed-dev                       # prints the new user's ID
+go run ./cmd/worker seed-dev                       # creates a user and syncs 30 days of mock data
+go run ./cmd/worker seed-dev -user-id <UUID> -connection empty   # active mock connection without records (synced|empty|revoked|none)
 go run ./cmd/worker                                # polls and syncs due connections (Ctrl-C to stop)
 go run ./cmd/worker sync -user <ID> -provider mock # one manual sync
 go run ./cmd/worker sync -user <ID> -provider mock -from 2026-01-01 -to 2026-01-31  # backfill
@@ -97,6 +98,7 @@ go run ./cmd/worker sync -user <ID> -provider mock -from 2026-01-01 -to 2026-01-
 | `PULSE_SYNC_POLL_INTERVAL` | `1m` | How often `run` checks for due connections. |
 | `PULSE_ENABLE_MOCK_PROVIDER` | `false` | Register the synthetic `mock` provider. |
 | `ENV` | — | `seed-dev` refuses to run unless it is `development`. |
+| `PULSE_DEV_NOW` | — | RFC 3339 instant that pins the worker and mock clock when `ENV=development` (ignored otherwise). |
 | `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` | — | Desktop-app OAuth client; when both are set the `google_health` provider is registered and `connect-google` and `bind-google-identity` work. |
 | `TOKEN_ENCRYPTION_KEY` | — | Base64 of 32 random bytes; encrypts OAuth tokens at rest. Required with the Google provider. |
 | `TOKEN_ENCRYPTION_KEY_VERSION` | `1` | Version stored with each ciphertext; raise it when rotating. |
@@ -140,6 +142,7 @@ Conventions every endpoint gets from `internal/api`:
 | `GET /api/v1/auth/google/login` | — | Starts Google sign-in: redirects to Google and sets the ten-minute OAuth flow cookie. |
 | `GET /api/v1/auth/google/callback` | — | Google redirects here; on success sets the session cookie and redirects to `/`. |
 | `POST /api/v1/auth/logout` | — | Ends the session, if any, and expires its cookie (`204`). |
+| `POST /api/v1/dev/login` | — | Development/E2E only (`ENV=development` + `PULSE_ENABLE_DEV_LOGIN=true`): issues a session for an existing user by `{"email": "…"}`; `404` otherwise. |
 | `GET /api/v1/me` | required | The signed-in user's email and timezone. |
 
 ```bash
@@ -153,7 +156,9 @@ curl -i localhost:8080/api/v1/health
 | :--- | :--- | :--- |
 | `DATABASE_URL` | — (required) | PostgreSQL URL. |
 | `API_PORT` | `8080` | Listen port. The web dev server proxies `/api` here. |
-| `ENV` | — | `development` selects the unprefixed, non-`Secure` cookies for plain HTTP. |
+| `ENV` | — | `development` selects the unprefixed, non-`Secure` cookies for plain HTTP and enables `PULSE_DEV_NOW` / `PULSE_ENABLE_DEV_LOGIN`. |
+| `PULSE_ENABLE_DEV_LOGIN` | `false` | Registers `POST /api/v1/dev/login` only when `ENV=development` and binds the API to IPv4 loopback (ignored otherwise). |
+| `PULSE_DEV_NOW` | — | RFC 3339 instant that pins the API session clock when `ENV=development` (ignored otherwise). |
 | `GOOGLE_WEB_OAUTH_CLIENT_ID` / `GOOGLE_WEB_OAUTH_CLIENT_SECRET` | — | Web-application OAuth client for sign-in. Without the ID the API runs, but the sign-in routes answer `503` and nobody can sign in. |
 | `PULSE_PUBLIC_URL` | — | Origin browsers use (development: `http://localhost:5173`); redirect URIs are derived from it. Required with sign-in; must be HTTPS unless `ENV=development`. |
 | `PULSE_ALLOWED_EMAILS` | — | Comma-separated addresses allowed to sign in, compared case-insensitively. An empty list denies all Google sign-ins. |
@@ -193,8 +198,9 @@ Sign-in follows [ADR-0005](../docs/adr/0005-api-auth-and-read-model.md) §2–3 
 - **Scoping:** every operation needs a session unless the contract opts it out with
   `security: []`; the middleware enforces the contract's `security` (generated into
   `gen.SessionScopes`), and handlers read the user ID only from the request context. No operation
-  accepts a user ID. `GetSessionByTokenHash` and `GetUserIDByIdentity` are the only queries that
-  run before the user is known (the authentication boundary in `AGENTS.md` §1.1).
+  accepts a user ID. `GetSessionByTokenHash`, `GetUserIDByIdentity` and `GetUserIDByEmail`
+  (development login only) are the only queries that run before the user is known (the
+  authentication boundary in `AGENTS.md` §1.1).
 
 **Setting up Google sign-in.** In the Google Cloud project that already holds the Desktop client,
 create a second OAuth client of type **Web application** and register the redirect URI
@@ -241,6 +247,6 @@ The schema and its rationale are in [ADR-0002](../docs/adr/0002-health-data-sche
 Every query must filter by `user_id`, with the exceptions `AGENTS.md` §1.1 allows, none of which
 returns health data or tokens: `ListConnectionsDueForSync` (the nightly scheduler) and
 `DeleteExpiredSessions` and `DeleteSessionsOutsideAllowlist` (the API's session sweeps) are system
-context, and `GetSessionByTokenHash`,
-`GetUserIDByIdentity` and the enrollment check `CreateUserUnlessEmailBound` are the authentication
-boundary that turns a credential into a user ID.
+context, and `GetSessionByTokenHash`, `GetUserIDByIdentity`, `GetUserIDByEmail` (development login
+only) and the enrollment check `CreateUserUnlessEmailBound` are the authentication boundary that
+turns a credential into a user ID.

@@ -59,12 +59,14 @@ func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard
 
 var createdUser = regexp.MustCompile(`created user ([0-9a-f-]{36}) `)
 
-// seedDev runs `seed-dev` for a fresh, obviously fictional user and returns its ID.
-func seedDev(t *testing.T, ctx context.Context) uuid.UUID {
+// seedDev runs `seed-dev -connection empty` for a fresh, obviously fictional
+// user and returns its ID.
+func seedDev(t *testing.T, ctx context.Context, extraFlags ...string) uuid.UUID {
 	t.Helper()
 	var out bytes.Buffer
 	email := fmt.Sprintf("worker-test-%s@example.com", uuid.NewString())
-	if err := run(ctx, []string{"seed-dev", "-email", email, "-tz", testTimezone}, devEnv(nil), &out, quietLogger()); err != nil {
+	args := append([]string{"seed-dev", "-email", email, "-tz", testTimezone, "-connection", "empty"}, extraFlags...)
+	if err := run(ctx, args, devEnv(nil), &out, quietLogger()); err != nil {
 		t.Fatalf("seed-dev: %v", err)
 	}
 	m := createdUser.FindStringSubmatch(out.String())
@@ -148,6 +150,93 @@ func TestWorker_SeedDevThenManualSyncIngestsIdempotently(t *testing.T) {
 	}
 }
 
+func TestWorker_SeedDevConnectionStatesAndPinnedClock(t *testing.T) {
+	ctx := ctxT(t)
+	const pinnedNow = "2026-11-15T14:30:00Z"
+	wantNow := time.Date(2026, 11, 15, 14, 30, 0, 0, time.UTC)
+	pinnedEnv := devEnv(map[string]string{"PULSE_DEV_NOW": pinnedNow, "PULSE_ENABLE_MOCK_PROVIDER": "false"})
+
+	syncedID := uuid.MustParse("00000000-0000-4000-8000-000000000901")
+	emptyID := uuid.MustParse("00000000-0000-4000-8000-000000000902")
+	revokedID := uuid.MustParse("00000000-0000-4000-8000-000000000903")
+	noneID := uuid.MustParse("00000000-0000-4000-8000-000000000904")
+
+	// Default -connection is synced; PULSE_DEV_NOW + -user-id pins every row.
+	var out bytes.Buffer
+	if err := run(ctx, []string{"seed-dev", "-user-id", syncedID.String(), "-email", "seed-synced@example.com", "-tz", testTimezone}, pinnedEnv, &out, quietLogger()); err != nil {
+		t.Fatalf("seed-dev synced: %v", err)
+	}
+	if !strings.Contains(out.String(), syncedID.String()) || !strings.Contains(out.String(), "synced mock connection") {
+		t.Fatalf("synced output = %q", out.String())
+	}
+	firstFP := fingerprint(t, ctx, syncedID, wantNow.Add(24*time.Hour))
+	if strings.HasPrefix(firstFP, "0:") {
+		t.Fatalf("synced fixture has no intraday rows: %s", firstFP)
+	}
+	if future := count(t, ctx, "SELECT count(*) FROM intraday_metrics WHERE user_id = $1 AND recorded_at >= $2", syncedID, wantNow); future != 0 {
+		t.Errorf("intraday rows at or after PULSE_DEV_NOW = %d, want 0", future)
+	}
+	if n := count(t, ctx, `SELECT count(*) FROM provider_connections WHERE user_id = $1
+		AND status = 'active' AND last_synced_at = $2 AND next_sync_at > $2`, syncedID, wantNow); n != 1 {
+		t.Errorf("synced connection not scheduled after PULSE_DEV_NOW")
+	}
+
+	// Re-seeding the same -user-id resets mutations and reproduces the exact fingerprint.
+	if _, err := testPool.Exec(ctx, "UPDATE users SET timezone = 'UTC' WHERE id = $1", syncedID); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(ctx, []string{"seed-dev", "-user-id", syncedID.String(), "-email", "seed-synced@example.com", "-tz", testTimezone}, pinnedEnv, io.Discard, quietLogger()); err != nil {
+		t.Fatalf("re-seed synced: %v", err)
+	}
+	if secondFP := fingerprint(t, ctx, syncedID, wantNow.Add(24*time.Hour)); secondFP != firstFP {
+		t.Fatalf("re-seed changed pinned data:\n first  %s\n second %s", firstFP, secondFP)
+	}
+	if n := count(t, ctx, "SELECT count(*) FROM sync_runs WHERE user_id = $1", syncedID); n != 1 {
+		t.Errorf("sync_runs after re-seed = %d, want 1", n)
+	}
+
+	// Seed the remaining three states: empty, revoked, none.
+	for _, tc := range []struct {
+		id    uuid.UUID
+		email string
+		state string
+	}{
+		{emptyID, "seed-empty@example.com", "empty"},
+		{revokedID, "seed-revoked@example.com", "revoked"},
+		{noneID, "seed-none@example.com", "none"},
+	} {
+		if err := run(ctx, []string{"seed-dev", "-user-id", tc.id.String(), "-email", tc.email, "-tz", testTimezone, "-connection", tc.state}, pinnedEnv, io.Discard, quietLogger()); err != nil {
+			t.Fatalf("seed-dev %s: %v", tc.state, err)
+		}
+	}
+	if n := count(t, ctx, `SELECT count(*) FROM provider_connections WHERE user_id = $1
+		AND status = 'active' AND last_synced_at IS NULL AND next_sync_at > $2`, emptyID, wantNow); n != 1 {
+		t.Errorf("empty connection state mismatch")
+	}
+	if n := count(t, ctx, "SELECT count(*) FROM daily_summaries WHERE user_id = $1", emptyID); n != 0 {
+		t.Errorf("empty user has %d summaries, want 0", n)
+	}
+	if n := count(t, ctx, "SELECT count(*) FROM provider_connections WHERE user_id = $1 AND status = 'revoked'", revokedID); n != 1 {
+		t.Errorf("revoked connection state mismatch")
+	}
+	if n := count(t, ctx, "SELECT count(*) FROM provider_connections WHERE user_id = $1", noneID); n != 0 {
+		t.Errorf("none user has %d connections, want 0", n)
+	}
+
+	// None of the four fixtures is due at PULSE_DEV_NOW, so a polling worker leaves them alone.
+	due, err := store.New(testPool).ListConnectionsDueForSync(ctx, wantNow, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range due {
+		for _, id := range []uuid.UUID{syncedID, emptyID, revokedID, noneID} {
+			if c.UserID == id {
+				t.Errorf("fixture %s appeared in ListConnectionsDueForSync at PULSE_DEV_NOW", id)
+			}
+		}
+	}
+}
+
 func TestWorker_BackfillSyncsOnlyTheRequestedRange(t *testing.T) {
 	ctx := ctxT(t)
 	userID := seedDev(t, ctx)
@@ -172,14 +261,9 @@ func TestWorker_BackfillSyncsOnlyTheRequestedRange(t *testing.T) {
 	if outside != 0 {
 		t.Errorf("%d summaries outside the backfill range", outside)
 	}
-	// A backfill leaves the schedule alone: the connection is still due for
-	// its first scheduled sync.
+	// A backfill leaves the schedule alone: last_synced_at stays NULL.
 	if n := count(t, ctx, "SELECT count(*) FROM provider_connections WHERE user_id = $1 AND last_synced_at IS NULL", userID); n != 1 {
 		t.Errorf("backfill touched the connection's schedule")
-	}
-	// Park it so the polling test only finds the connection it seeds.
-	if _, err := testPool.Exec(ctx, "UPDATE provider_connections SET next_sync_at = now() + interval '1 year' WHERE user_id = $1", userID); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -210,6 +294,9 @@ func (h *cancelOnSync) WithAttrs(as []slog.Attr) slog.Handler {
 func TestWorker_RunPollsDueConnectionsUntilStopped(t *testing.T) {
 	ctx := ctxT(t)
 	userID := seedDev(t, ctx)
+	if _, err := testPool.Exec(ctx, "UPDATE provider_connections SET next_sync_at = now() WHERE user_id = $1", userID); err != nil {
+		t.Fatal(err)
+	}
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
