@@ -1,6 +1,7 @@
 import { test as base, expect } from '@playwright/test';
 import {
   E2E_DEV_NOW,
+  fixtureUser,
   FIXTURE_USERS,
   type FixtureState,
   type FixtureUser,
@@ -10,7 +11,6 @@ import {
 
 export interface PulseFixtures {
   readonly projectViewport: ViewportProject;
-  readonly users: Readonly<Record<FixtureState, FixtureUser>>;
   readonly signInAs: (state: FixtureState) => Promise<FixtureUser>;
 }
 
@@ -18,7 +18,7 @@ export interface PulseFixtures {
  * Extended Playwright `test` for Pulse Pipeline E2E scenarios (ADR-0005 §8):
  * - Pins the browser clock (`Date.now()`, `new Date()`) to `E2E_DEV_NOW`
  *   without freezing `setTimeout` / UI polling.
- * - Resolves the active viewport project's isolated fixture user set.
+ * - Uses separate fixture users across viewports and retries of mutating scenarios.
  * - Provides `signInAs(state)` backed by `POST /api/v1/dev/login`.
  */
 export const test = base.extend<PulseFixtures>({
@@ -35,13 +35,9 @@ export const test = base.extend<PulseFixtures>({
     await use(name);
   },
 
-  users: async ({ projectViewport }, use) => {
-    await use(FIXTURE_USERS[projectViewport]);
-  },
-
-  signInAs: async ({ page, users }, use) => {
+  signInAs: async ({ page, projectViewport }, use, testInfo) => {
     await use(async (state: FixtureState): Promise<FixtureUser> => {
-      const user = users[state];
+      const user = fixtureUser(projectViewport, state, testInfo.retry);
       const response = await page.request.post('/api/v1/dev/login', {
         data: { email: user.email },
       });

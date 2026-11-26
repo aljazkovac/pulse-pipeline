@@ -1,4 +1,4 @@
-import { allFixtureUsers } from './fixtureUsers.ts';
+import { allFixtureUsers, E2E_RETRIES, fixtureUser } from './fixtureUsers.ts';
 import { E2E_DEV_NOW, expect, type FixtureState, test } from './fixtures.ts';
 
 interface MeResponse {
@@ -24,12 +24,25 @@ const ALL_STATES: readonly FixtureState[] = [
 test.describe('deterministic E2E stack (ADR-0005 §8)', () => {
   test('fixture matrix isolates every state and viewport project', () => {
     const all = allFixtureUsers();
-    expect(all).toHaveLength(ALL_STATES.length * 2);
+    expect(allFixtureUsers(0)).toHaveLength(ALL_STATES.length * 2);
 
     const ids = new Set(all.map((u) => u.id));
     const emails = new Set(all.map((u) => u.email.toLowerCase()));
     expect(ids.size).toBe(all.length);
     expect(emails.size).toBe(all.length);
+  });
+
+  test('retries use distinct users for scenarios that mutate server state', ({}, testInfo) => {
+    const project = testInfo.project.name === 'mobile' ? 'mobile' : 'desktop';
+    const seededIds = new Set(allFixtureUsers().map((user) => user.id));
+    for (const state of ['syncNow', 'timezonePrompt', 'settings'] as const) {
+      const ids = Array.from({ length: E2E_RETRIES + 1 }, (_, retry) =>
+        fixtureUser(project, state, retry).id,
+      );
+      expect(new Set(ids).size).toBe(ids.length);
+      expect(ids.every((id) => seededIds.has(id))).toBe(true);
+    }
+    expect(fixtureUser(project, 'synced', 1)).toBe(fixtureUser(project, 'synced', 0));
   });
 
   test('matches target viewport dimensions and pins the browser clock to E2E_DEV_NOW', async ({

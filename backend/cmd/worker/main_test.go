@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -351,5 +353,36 @@ func TestBindGoogleIdentity(t *testing.T) {
 		bindRequest{userID: uuid.New()}, io.Discard, time.Now)
 	if !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("unknown user = %v, want ErrNotFound", err)
+	}
+}
+
+func TestSeedRequestsManifest(t *testing.T) {
+	const first = `{"id":"00000000-0000-4000-8000-000000000101","email":"one@example.com","timezone":"UTC","connection":"empty"}`
+	const second = `{"id":"00000000-0000-4000-8000-000000000102","email":"two@example.com","timezone":"UTC","connection":"synced"}`
+	file := filepath.Join(t.TempDir(), "fixtures.json")
+	for name, test := range map[string]struct {
+		data      string
+		wantError bool
+	}{
+		"two users":       {"[" + first + "," + second + "]", false},
+		"duplicate ID":    {"[" + first + "," + strings.Replace(second, "000102", "000101", 1) + "]", true},
+		"duplicate email": {"[" + first + "," + strings.Replace(second, "two@", "One@", 1) + "]", true},
+		"empty manifest":  {"[]", true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := os.WriteFile(file, []byte(test.data), 0600); err != nil {
+				t.Fatal(err)
+			}
+			got, err := seedRequests([]string{"-fixtures", file})
+			if test.wantError {
+				if err == nil {
+					t.Fatal("expected a manifest error")
+				}
+				return
+			}
+			if err != nil || len(got) != 2 || got[0].connection != seedEmpty || got[1].connection != seedSynced {
+				t.Fatalf("seedRequests = %+v, %v", got, err)
+			}
+		})
 	}
 }

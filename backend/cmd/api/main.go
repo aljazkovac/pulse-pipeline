@@ -226,7 +226,7 @@ func runWithConfig(ctx context.Context, cfg config, logger *slog.Logger, listen 
 		logger.Warn("PULSE_ALLOWED_EMAILS is empty: the session sweep signs out every user with a sign-in identity")
 	}
 
-	ln, err := listen(ctx, "tcp", ":"+strconv.Itoa(cfg.port))
+	ln, err := listen(ctx, "tcp", cfg.listenAddress())
 	if err != nil {
 		return fmt.Errorf("listening on port %d: %w", cfg.port, err)
 	}
@@ -244,6 +244,14 @@ func runWithConfig(ctx context.Context, cfg config, logger *slog.Logger, listen 
 	}()
 
 	return serve(ctx, ln, api.NewHandler(opts), logger, shutdownTimeout)
+}
+
+func (c config) listenAddress() string {
+	host := ""
+	if c.devLogin {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, strconv.Itoa(c.port))
 }
 
 // sweepSessions deletes expired sessions and those of users who are no

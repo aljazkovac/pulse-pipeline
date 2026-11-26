@@ -15,6 +15,7 @@
  * and the local day is partially recorded, while preceding days are complete.
  */
 export const E2E_DEV_NOW = '2026-11-15T14:30:00Z';
+export const E2E_RETRIES = 2;
 
 export type ViewportProject = 'desktop' | 'mobile';
 
@@ -23,7 +24,8 @@ export type SeedConnectionState = 'synced' | 'empty' | 'revoked' | 'none';
 /**
  * Acceptance states from `docs/design/phase-2-dashboards.md`. Scenarios that
  * mutate state (`syncNow`, `timezonePrompt`, `settings`) have dedicated users
- * per viewport project so parallel runs never share mutable state.
+ * per viewport project so parallel runs and CI retries of those scenarios do not share mutable state.
+ * Use each mutating state for a single test per viewport.
  */
 export type FixtureState =
   | 'synced'
@@ -166,9 +168,30 @@ export function isViewportProject(name: string): name is ViewportProject {
   return name === 'desktop' || name === 'mobile';
 }
 
-export function allFixtureUsers(): readonly FixtureUser[] {
+const MUTATING_STATES = new Set<FixtureState>(['syncNow', 'timezonePrompt', 'settings']);
+
+export function fixtureUser(project: ViewportProject, state: FixtureState, retry: number): FixtureUser {
+  const user = FIXTURE_USERS[project][state];
+  if (retry === 0 || !MUTATING_STATES.has(state)) {
+    return user;
+  }
+  if (!Number.isInteger(retry) || retry < 0 || retry > E2E_RETRIES) {
+    throw new Error(`No seeded fixture for retry ${String(retry)}`);
+  }
+  return {
+    ...user,
+    // The first digit in the last UUID group is reserved for the retry.
+    id: `${user.id.slice(0, -12)}${String(retry)}${user.id.slice(-11)}`,
+    email: user.email.replace('@', `-retry-${String(retry)}@`),
+  };
+}
+
+export function allFixtureUsers(retries = E2E_RETRIES): readonly FixtureUser[] {
+  const originals = [...Object.values(FIXTURE_USERS.desktop), ...Object.values(FIXTURE_USERS.mobile)];
   return [
-    ...Object.values(FIXTURE_USERS.desktop),
-    ...Object.values(FIXTURE_USERS.mobile),
+    ...originals,
+    ...originals.filter((user) => MUTATING_STATES.has(user.state)).flatMap((user) =>
+      Array.from({ length: retries }, (_, i) => fixtureUser(user.project, user.state, i + 1)),
+    ),
   ];
 }

@@ -154,6 +154,10 @@ func TestLoadConfigDevControls(t *testing.T) {
 		t.Fatalf("dev controls = %+v, %v", cfg, err)
 	}
 
+	if got := cfg.listenAddress(); got != "127.0.0.1:8080" {
+		t.Errorf("dev login listen address = %q, want IPv4 loopback", got)
+	}
+
 	// Production ignores both controls rather than turning them on.
 	prod, err := loadConfig(env(map[string]string{
 		"DATABASE_URL": db, "ENV": "production",
@@ -161,6 +165,10 @@ func TestLoadConfigDevControls(t *testing.T) {
 	}))
 	if err != nil || prod.dev || prod.devLogin || !prod.devLoginIgnored || !prod.clock.Pinned.IsZero() || !prod.clock.Ignored {
 		t.Fatalf("production controls = %+v, %v", prod, err)
+	}
+
+	if got := prod.listenAddress(); got != ":8080" {
+		t.Errorf("production listen address = %q, want wildcard", got)
 	}
 
 	for name, e := range map[string]map[string]string{

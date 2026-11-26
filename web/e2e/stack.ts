@@ -1,26 +1,15 @@
-/**
- * Deterministic E2E stack launcher (ADR-0005 §8).
- *
- * Invoked by Playwright's `webServer` (`npm run e2e:stack`):
- *   1. Starts compose PostgreSQL 17 (`docker compose up --wait postgres`) unless
- *      an explicit `DATABASE_URL` is provided.
- *   2. Compiles `pulse-worker` and `pulse-api`.
- *   3. Seeds every per-project fixture user (`seed-dev -user-id -connection`)
- *      with `PULSE_DEV_NOW` so mock metrics and cursors are deterministic.
- *   4. Starts `pulse-worker` in poll mode (`PULSE_SYNC_POLL_INTERVAL=1s`),
- *      `pulse-api` (`ENV=development`, `PULSE_ENABLE_DEV_LOGIN=true`,
- *      `PULSE_DEV_NOW`) on a free loopback port, and Vite on `:5173` proxying
- *      `/api` to `pulse-api`.
- */
+/** Playwright's isolated PostgreSQL, worker, API and Vite stack (ADR-0005 §8). */
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { createServer } from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { allFixtureUsers, E2E_DEV_NOW } from './fixtureUsers.ts';
+import { allFixtureUsers, E2E_DEV_NOW, E2E_RETRIES } from './fixtureUsers.ts';
 
-const DEFAULT_DATABASE_URL =
-  'postgres://pulse:pulse_dev_password@localhost:5432/pulse_pipeline?sslmode=disable';
+const postgresName = `pulse-e2e-${randomUUID()}`;
+const database = 'pulse_e2e';
 
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
 const repoRoot = path.resolve(webRoot, '..');
@@ -31,18 +20,37 @@ function log(message: string): void {
   process.stderr.write(`[e2e-stack] ${message}\n`);
 }
 
-function ensurePostgres(): string {
-  const explicit = process.env.DATABASE_URL?.trim();
-  if (explicit) {
-    log('using explicit DATABASE_URL from environment');
-    return explicit;
+async function startPostgres(): Promise<string> {
+  // Never use the developer's database or inherit DATABASE_URL.
+  log('starting disposable PostgreSQL 17...');
+  execFileSync('docker', [
+    'run', '--detach', '--rm', '--name', postgresName,
+    '--tmpfs', '/var/lib/postgresql/data',
+    '--publish', '127.0.0.1::5432',
+    '--env', `POSTGRES_DB=${database}`,
+    '--env', 'POSTGRES_PASSWORD=e2e',
+    'postgres:17',
+  ], { stdio: 'inherit' });
+  const binding = execFileSync('docker', ['port', postgresName, '5432/tcp'], {
+    encoding: 'utf8',
+    timeout: 5_000,
+  }).trim();
+  if (!/^127\.0\.0\.1:[0-9]+$/.test(binding)) {
+    throw new Error('PostgreSQL did not publish a loopback port');
   }
-  log('ensuring compose PostgreSQL is healthy...');
-  execFileSync('docker', ['compose', 'up', '--wait', 'postgres'], {
-    cwd: repoRoot,
-    stdio: 'inherit',
-  });
-  return DEFAULT_DATABASE_URL;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    try {
+      // The image's temporary initialization server does not listen on TCP.
+      execFileSync('docker', [
+        'exec', postgresName, 'pg_isready', '-h', '127.0.0.1', '-U', 'postgres', '-d', database,
+      ], { stdio: 'ignore', timeout: 5_000 });
+      return `postgres://postgres:e2e@${binding}/${database}?sslmode=disable`;
+    } catch {
+      await new Promise<void>((resolve) => { setTimeout(resolve, 250); });
+    }
+  }
+  throw new Error('Disposable PostgreSQL did not become ready');
 }
 
 function buildBackendBinaries(): { readonly workerBin: string; readonly apiBin: string } {
@@ -80,68 +88,22 @@ function sanitizedBackendEnv(databaseUrl: string, overrides: Readonly<Record<str
   };
 }
 
-function seedArgs(user: ReturnType<typeof allFixtureUsers>[number]): string[] {
-  return [
-    'seed-dev',
-    '-user-id',
-    user.id,
-    '-email',
-    user.email,
-    '-tz',
-    user.timezone,
-    '-connection',
-    user.connection,
-  ];
-}
-
-function runSeedOne(
-  workerBin: string,
-  args: readonly string[],
-  env: NodeJS.ProcessEnv,
-): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    const child = spawn(workerBin, args, { cwd: repoRoot, env, stdio: 'inherit' });
-    child.once('error', reject);
-    child.once('exit', (code, signal) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-      reject(
-        new Error(
-          `seed-dev ${args.join(' ')} exited with code=${String(code)} signal=${String(signal)}`,
-        ),
-      );
-    });
-  });
-}
-
-async function seedFixtures(workerBin: string, databaseUrl: string): Promise<void> {
-  const fixtures = allFixtureUsers();
-  const [first, ...rest] = fixtures;
-  if (!first) {
-    return;
-  }
+function seedFixtures(workerBin: string, databaseUrl: string): void {
+  const fixtures = allFixtureUsers(process.env.CI ? E2E_RETRIES : 0);
   log(`seeding ${String(fixtures.length)} fixture users at PULSE_DEV_NOW=${E2E_DEV_NOW}...`);
   const env = sanitizedBackendEnv(databaseUrl, { PULSE_ENABLE_MOCK_PROVIDER: 'true' });
-
-  // Run the first fixture alone so pending migrations apply once without lock contention.
-  execFileSync(workerBin, seedArgs(first), { cwd: repoRoot, env, stdio: 'inherit' });
-
-  // Each remaining fixture owns a distinct user_id and email, so bounded concurrency is contention-free.
-  const concurrency = 4;
-  let nextIndex = 0;
-  const runWorker = async (): Promise<void> => {
-    for (;;) {
-      const user = rest[nextIndex];
-      nextIndex += 1;
-      if (!user) {
-        return;
-      }
-      await runSeedOne(workerBin, seedArgs(user), env);
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(concurrency, rest.length) }, () => runWorker()));
+  const dir = mkdtempSync(path.join(tmpdir(), 'pulse-e2e-'));
+  try {
+    const manifest = path.join(dir, 'users.json');
+    writeFileSync(manifest, JSON.stringify(fixtures));
+    execFileSync(workerBin, ['seed-dev', '-fixtures', manifest], {
+      cwd: repoRoot,
+      env,
+      stdio: 'inherit',
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 async function findFreePort(): Promise<number> {
@@ -172,7 +134,7 @@ async function waitForHttpOk(url: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, { signal: AbortSignal.timeout(1_000) });
       if (response.ok) {
         return;
       }
@@ -219,21 +181,20 @@ async function terminateChildren(children: readonly ChildProcess[]): Promise<voi
 }
 
 async function main(): Promise<void> {
-  const databaseUrl = ensurePostgres();
-  const { workerBin, apiBin } = buildBackendBinaries();
-  await seedFixtures(workerBin, databaseUrl);
-
-  const apiPort = await findFreePort();
-  const apiOrigin = `http://localhost:${String(apiPort)}`;
   const children: ChildProcess[] = [];
-  let shuttingDown = false;
+  const stop = new AbortController();
 
   const shutdown = async (exitCode: number): Promise<void> => {
-    if (shuttingDown) {
+    if (stop.signal.aborted) {
       return;
     }
-    shuttingDown = true;
+    stop.abort();
     await terminateChildren(children);
+    try {
+      execFileSync('docker', ['rm', '--force', postgresName], { stdio: 'ignore', timeout: 5_000 });
+    } catch {
+      // It may already be gone (--rm), or creation may have failed.
+    }
     process.exit(exitCode);
   };
 
@@ -251,7 +212,7 @@ async function main(): Promise<void> {
       void shutdown(1);
     });
     child.once('exit', (code, signal) => {
-      if (!shuttingDown) {
+      if (!stop.signal.aborted) {
         log(`${name} exited unexpectedly (code=${String(code)}, signal=${String(signal)})`);
         void shutdown(1);
       }
@@ -259,49 +220,62 @@ async function main(): Promise<void> {
     return child;
   };
 
-  log('starting polling pulse-worker (PULSE_SYNC_POLL_INTERVAL=1s)...');
-  spawnManaged(
-    'pulse-worker',
-    workerBin,
-    ['run'],
-    repoRoot,
-    sanitizedBackendEnv(databaseUrl, {
-      PULSE_ENABLE_MOCK_PROVIDER: 'true',
-      PULSE_SYNC_POLL_INTERVAL: '1s',
-    }),
-  );
+  try {
+    const { workerBin, apiBin } = buildBackendBinaries();
+    const databaseUrl = await startPostgres();
+    stop.signal.throwIfAborted();
+    seedFixtures(workerBin, databaseUrl);
 
-  log(`starting pulse-api on ${apiOrigin}...`);
-  spawnManaged(
-    'pulse-api',
-    apiBin,
-    [],
-    repoRoot,
-    sanitizedBackendEnv(databaseUrl, {
-      API_PORT: String(apiPort),
-      PULSE_ENABLE_DEV_LOGIN: 'true',
-      PULSE_PUBLIC_URL: 'http://localhost:5173',
-    }),
-  );
+    const apiPort = await findFreePort();
+    stop.signal.throwIfAborted();
+    const apiOrigin = `http://127.0.0.1:${String(apiPort)}`;
+    log('starting polling pulse-worker (PULSE_SYNC_POLL_INTERVAL=1s)...');
+    spawnManaged(
+      'pulse-worker',
+      workerBin,
+      ['run'],
+      repoRoot,
+      sanitizedBackendEnv(databaseUrl, {
+        PULSE_ENABLE_MOCK_PROVIDER: 'true',
+        PULSE_SYNC_POLL_INTERVAL: '1s',
+      }),
+    );
 
-  await waitForHttpOk(`http://127.0.0.1:${String(apiPort)}/api/v1/health`, 15_000);
+    log(`starting pulse-api on ${apiOrigin}...`);
+    spawnManaged(
+      'pulse-api',
+      apiBin,
+      [],
+      repoRoot,
+      sanitizedBackendEnv(databaseUrl, {
+        API_PORT: String(apiPort),
+        PULSE_ENABLE_DEV_LOGIN: 'true',
+        PULSE_PUBLIC_URL: 'http://localhost:5173',
+      }),
+    );
 
-  log('starting Vite dev server on http://localhost:5173...');
-  const viteBin = path.join(webRoot, 'node_modules', 'vite', 'bin', 'vite.js');
-  spawnManaged(
-    'vite',
-    process.execPath,
-    [viteBin],
-    webRoot,
-    {
-      ...process.env,
-      PULSE_API_ORIGIN: apiOrigin,
-    },
-  );
+    await waitForHttpOk(`${apiOrigin}/api/v1/health`, 15_000);
+    stop.signal.throwIfAborted();
+
+    log('starting Vite dev server on http://localhost:5173...');
+    const viteBin = path.join(webRoot, 'node_modules', 'vite', 'bin', 'vite.js');
+    spawnManaged(
+      'vite',
+      process.execPath,
+      [viteBin, '--host', 'localhost'],
+      webRoot,
+      {
+        ...process.env,
+        PULSE_API_ORIGIN: apiOrigin,
+      },
+    );
+  } catch (err) {
+    if (stop.signal.aborted) {
+      return;
+    }
+    log(`fatal: ${err instanceof Error ? err.message : String(err)}`);
+    await shutdown(1);
+  }
 }
 
-void main().catch((err: unknown) => {
-  const message = err instanceof Error ? (err.stack ?? err.message) : String(err);
-  log(`fatal: ${message}`);
-  process.exit(1);
-});
+void main();

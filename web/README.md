@@ -36,7 +36,9 @@ Because `web/package.json` exists, the root `make build`, `make test`, `make lin
 | `lint` | ESLint (`typescript-eslint` strict type-checked, React Hooks), `@typescript-eslint/no-explicit-any` as an error, zero warnings. |
 | `test` | Vitest unit/component tests. |
 | `test:e2e` | Playwright specs across the desktop (`1280x800`) and mobile (`390x844`) projects against the full deterministic stack (`e2e:stack`). Install the browser once with `npx playwright install chromium`. |
-| `e2e:stack` | Starts compose PostgreSQL, compiles `pulse-worker` and `pulse-api`, seeds per-project fixture users at `E2E_DEV_NOW`, and runs polling `pulse-worker` (`1s`) + `pulse-api` (`ENV=development`, `PULSE_ENABLE_DEV_LOGIN=true`) + Vite (`:5173`). |
+| `e2e:stack` | Starts a disposable PostgreSQL 17 container, compiles `pulse-worker` and `pulse-api`, seeds per-project fixture users at `E2E_DEV_NOW`, and runs polling `pulse-worker` (`1s`) + `pulse-api` (`ENV=development`, `PULSE_ENABLE_DEV_LOGIN=true`) + Vite (`:5173`). |
+
+The E2E stack requires Docker. It creates a fresh loopback-only database and removes the container on shutdown. It does not use the regular Compose database or an exported `DATABASE_URL`. Mutating scenarios use fresh fixture users on CI retries.
 
 `generate:api` regenerates `src/api/schema.d.ts` from the OpenAPI contract; `make generate-check` fails CI when it is stale. `openapi-typescript` declares a TypeScript 5 peer; `package.json` `overrides` points it at the project's TypeScript 6, which it only uses to print declarations.
 

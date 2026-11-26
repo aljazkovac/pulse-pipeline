@@ -157,7 +157,7 @@ curl -i localhost:8080/api/v1/health
 | `DATABASE_URL` | — (required) | PostgreSQL URL. |
 | `API_PORT` | `8080` | Listen port. The web dev server proxies `/api` here. |
 | `ENV` | — | `development` selects the unprefixed, non-`Secure` cookies for plain HTTP and enables `PULSE_DEV_NOW` / `PULSE_ENABLE_DEV_LOGIN`. |
-| `PULSE_ENABLE_DEV_LOGIN` | `false` | Registers `POST /api/v1/dev/login` only when `ENV=development` (ignored otherwise). |
+| `PULSE_ENABLE_DEV_LOGIN` | `false` | Registers `POST /api/v1/dev/login` only when `ENV=development` and binds the API to IPv4 loopback (ignored otherwise). |
 | `PULSE_DEV_NOW` | — | RFC 3339 instant that pins the API session clock when `ENV=development` (ignored otherwise). |
 | `GOOGLE_WEB_OAUTH_CLIENT_ID` / `GOOGLE_WEB_OAUTH_CLIENT_SECRET` | — | Web-application OAuth client for sign-in. Without the ID the API runs, but the sign-in routes answer `503` and nobody can sign in. |
 | `PULSE_PUBLIC_URL` | — | Origin browsers use (development: `http://localhost:5173`); redirect URIs are derived from it. Required with sign-in; must be HTTPS unless `ENV=development`. |

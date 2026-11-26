@@ -23,6 +23,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -73,6 +74,7 @@ const usage = `usage:
   pulse-worker [run]
   pulse-worker sync -user ID -provider PROVIDER [-from YYYY-MM-DD -to YYYY-MM-DD]
   pulse-worker seed-dev [-email EMAIL] [-tz IANA_ZONE] [-user-id UUID] [-connection synced|empty|revoked|none]
+  pulse-worker seed-dev -fixtures FILE
   pulse-worker connect-google -user ID
   pulse-worker bind-google-identity (-user ID [-replace] | -new-user) [-mailbox-verified]
   pulse-worker revoke-sessions -user ID`
@@ -143,18 +145,23 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout 
 			return err
 		})
 	case "seed-dev":
-		req, err := parseSeedArgs(args)
+		requests, err := seedRequests(args)
 		if err != nil {
 			return err
 		}
 		if cfg.env != "development" {
 			return errors.New("seed-dev only runs with ENV=development")
 		}
-		if req.connection == seedSynced {
-			cfg.enableMock = true
+		for _, req := range requests {
+			cfg.enableMock = cfg.enableMock || req.connection == seedSynced
 		}
 		return withDeps(ctx, cfg, logger, func(d deps) error {
-			return seedDevUser(ctx, d, cfg, req, stdout)
+			for _, req := range requests {
+				if err := seedDevUser(ctx, d, cfg, req, stdout); err != nil {
+					return fmt.Errorf("seeding %s: %w", req.email, err)
+				}
+			}
+			return nil
 		})
 	case "connect-google":
 		userID, err := parseConnectArgs(args)
@@ -491,6 +498,51 @@ type seedRequest struct {
 	connection seedConnection
 }
 
+// seedRequests accepts the regular CLI flags or a manifest of fixed-ID E2E users.
+func seedRequests(args []string) ([]seedRequest, error) {
+	if len(args) != 2 || args[0] != "-fixtures" {
+		req, err := parseSeedArgs(args)
+		if err != nil {
+			return nil, err
+		}
+		return []seedRequest{req}, nil
+	}
+	data, err := os.ReadFile(args[1])
+	if err != nil {
+		return nil, fmt.Errorf("reading seed fixture manifest: %w", err)
+	}
+	var fixtures []struct {
+		ID         string `json:"id"`
+		Email      string `json:"email"`
+		Timezone   string `json:"timezone"`
+		Connection string `json:"connection"`
+	}
+	if err := json.Unmarshal(data, &fixtures); err != nil {
+		return nil, fmt.Errorf("decoding seed fixture manifest: %w", err)
+	}
+	if len(fixtures) == 0 {
+		return nil, errors.New("seed fixture manifest is empty")
+	}
+	requests := make([]seedRequest, 0, len(fixtures))
+	ids, emails := make(map[uuid.UUID]bool), make(map[string]bool)
+	for i, f := range fixtures {
+		req, err := parseSeedArgs([]string{"-user-id", f.ID, "-email", f.Email, "-tz", f.Timezone, "-connection", f.Connection})
+		if err != nil {
+			return nil, fmt.Errorf("fixture %d: %w", i+1, err)
+		}
+		email := strings.ToLower(strings.TrimSpace(req.email))
+		if req.userID == uuid.Nil || email == "" || req.tz == "" || ids[req.userID] || emails[email] {
+			return nil, fmt.Errorf("fixture %d: expected distinct ID and email and a non-empty timezone", i+1)
+		}
+		if _, err := time.LoadLocation(req.tz); err != nil {
+			return nil, fmt.Errorf("fixture %d: invalid timezone: %w", i+1, err)
+		}
+		ids[req.userID], emails[email] = true, true
+		requests = append(requests, req)
+	}
+	return requests, nil
+}
+
 func parseSeedArgs(args []string) (seedRequest, error) {
 	fs := flag.NewFlagSet("seed-dev", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -614,7 +666,7 @@ func parseUserArgs(cmd string, args []string) (uuid.UUID, error) {
 type deps struct {
 	store  *store.Store
 	syncer *sync.Syncer
-	vault  *credentials.Vault      // nil without TOKEN_ENCRYPTION_KEY
+	vault  *credentials.Vault     // nil without TOKEN_ENCRYPTION_KEY
 	google *googlehealth.Provider // nil unless the Google OAuth client is configured
 }
 
