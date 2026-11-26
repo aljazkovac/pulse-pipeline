@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { createServer } from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { allFixtureUsers, E2E_DEV_NOW, E2E_RETRIES } from './fixtureUsers.ts';
+import { allFixtureUsers, E2E_DEV_NOW } from './fixtureUsers.ts';
 
 const postgresName = `pulse-e2e-${randomUUID()}`;
 const database = 'pulse_e2e';
@@ -89,7 +89,7 @@ function sanitizedBackendEnv(databaseUrl: string, overrides: Readonly<Record<str
 }
 
 function seedFixtures(workerBin: string, databaseUrl: string): void {
-  const fixtures = allFixtureUsers(process.env.CI ? E2E_RETRIES : 0);
+  const fixtures = allFixtureUsers();
   log(`seeding ${String(fixtures.length)} fixture users at PULSE_DEV_NOW=${E2E_DEV_NOW}...`);
   const env = sanitizedBackendEnv(databaseUrl, { PULSE_ENABLE_MOCK_PROVIDER: 'true' });
   const dir = mkdtempSync(path.join(tmpdir(), 'pulse-e2e-'));
