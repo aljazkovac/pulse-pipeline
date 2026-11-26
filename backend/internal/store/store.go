@@ -144,6 +144,17 @@ func (s *Store) CreateConnection(ctx context.Context, userID uuid.UUID, provider
 	return connectionInfo(db.GetProviderConnectionRow(row)), nil
 }
 
+// CreateDevMockConnection inserts a fixture connection with its initial status
+// and schedule already in place for the polling worker.
+func (s *Store) CreateDevMockConnection(ctx context.Context, userID uuid.UUID, status domain.ConnectionStatus, nextSyncAt time.Time) error {
+	if err := s.q.CreateDevMockConnection(ctx, db.CreateDevMockConnectionParams{
+		UserID: userID, Status: string(status), NextSyncAt: nextSyncAt.UTC(),
+	}); err != nil {
+		return fmt.Errorf("creating mock fixture connection for user %s: %w", userID, err)
+	}
+	return nil
+}
+
 // GetConnection returns the user's connection to provider, or ErrNotFound.
 func (s *Store) GetConnection(ctx context.Context, userID uuid.UUID, provider domain.Provider) (domain.ConnectionInfo, error) {
 	row, err := s.q.GetProviderConnection(ctx, db.GetProviderConnectionParams{UserID: userID, Provider: string(provider)})
