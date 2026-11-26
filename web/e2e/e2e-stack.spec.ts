@@ -24,25 +24,24 @@ const ALL_STATES: readonly FixtureState[] = [
 test.describe('deterministic E2E stack (ADR-0005 §8)', () => {
   test('fixture matrix isolates every state and viewport project', () => {
     const all = allFixtureUsers();
-    expect(allFixtureUsers(0)).toHaveLength(ALL_STATES.length * 2);
-
     const ids = new Set(all.map((u) => u.id));
     const emails = new Set(all.map((u) => u.email.toLowerCase()));
     expect(ids.size).toBe(all.length);
     expect(emails.size).toBe(all.length);
   });
 
-  test('retries use distinct users for scenarios that mutate server state', ({}, testInfo) => {
-    const project = testInfo.project.name === 'mobile' ? 'mobile' : 'desktop';
-    const seededIds = new Set(allFixtureUsers().map((user) => user.id));
+  test('seeds distinct login accounts for retries of mutating scenarios', async ({ page, projectViewport }) => {
     for (const state of ['syncNow', 'timezonePrompt', 'settings'] as const) {
-      const ids = Array.from({ length: E2E_RETRIES + 1 }, (_, retry) =>
-        fixtureUser(project, state, retry).id,
-      );
-      expect(new Set(ids).size).toBe(ids.length);
-      expect(ids.every((id) => seededIds.has(id))).toBe(true);
+      for (let retry = 1; retry <= E2E_RETRIES; retry++) {
+        const user = fixtureUser(projectViewport, state, retry);
+        const login = await page.request.post('/api/v1/dev/login', { data: { email: user.email } });
+        expect(login.status(), `dev login failed for ${user.email}`).toBe(204);
+        const me = await page.request.get('/api/v1/me');
+        expect(me.status()).toBe(200);
+        expect(await me.json()).toEqual({ email: user.email, timezone: user.timezone });
+      }
     }
-    expect(fixtureUser(project, 'synced', 1)).toBe(fixtureUser(project, 'synced', 0));
+    expect(fixtureUser(projectViewport, 'synced', 1)).toBe(fixtureUser(projectViewport, 'synced', 0));
   });
 
   test('matches target viewport dimensions and pins the browser clock to E2E_DEV_NOW', async ({

@@ -15,6 +15,7 @@
  * and the local day is partially recorded, while preceding days are complete.
  */
 export const E2E_DEV_NOW = '2026-11-15T14:30:00Z';
+/** Maximum seeded retry index, including retries enabled via the local CLI. */
 export const E2E_RETRIES = 2;
 
 export type ViewportProject = 'desktop' | 'mobile';
@@ -24,7 +25,7 @@ export type SeedConnectionState = 'synced' | 'empty' | 'revoked' | 'none';
 /**
  * Acceptance states from `docs/design/phase-2-dashboards.md`. Scenarios that
  * mutate state (`syncNow`, `timezonePrompt`, `settings`) have dedicated users
- * per viewport project so parallel runs and CI retries of those scenarios do not share mutable state.
+ * per viewport project so parallel runs and retries do not share mutable state.
  * Use each mutating state for a single test per viewport.
  */
 export type FixtureState =
@@ -186,12 +187,12 @@ export function fixtureUser(project: ViewportProject, state: FixtureState, retry
   };
 }
 
-export function allFixtureUsers(retries = E2E_RETRIES): readonly FixtureUser[] {
+export function allFixtureUsers(): readonly FixtureUser[] {
   const originals = [...Object.values(FIXTURE_USERS.desktop), ...Object.values(FIXTURE_USERS.mobile)];
   return [
     ...originals,
     ...originals.filter((user) => MUTATING_STATES.has(user.state)).flatMap((user) =>
-      Array.from({ length: retries }, (_, i) => fixtureUser(user.project, user.state, i + 1)),
+      Array.from({ length: E2E_RETRIES }, (_, i) => fixtureUser(user.project, user.state, i + 1)),
     ),
   ];
 }
